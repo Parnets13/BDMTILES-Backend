@@ -8,6 +8,9 @@ import errorHandler from './middleware/errorHandler.js';
 import authRoutes from './routes/authRoutes.js';
 import userRoutes from './routes/userRoutes.js';
 import categoryRoutes from './routes/categoryRoutes.js';
+import productRoutes from './routes/productRoutes.js';
+import masterRoutes from './routes/masterRoutes.js';
+import salesOrderRoutes from './routes/salesOrderRoutes.js';
 
 dotenv.config();
 
@@ -30,6 +33,9 @@ app.get('/api/v1/health', (req, res) => {
 app.use('/api/v1/auth', authRoutes);
 app.use('/api/v1/users', userRoutes);
 app.use('/api/v1/category-setup', categoryRoutes);
+app.use('/api/v1/products', productRoutes);
+app.use('/api/v1/masters', masterRoutes);
+app.use('/api/v1/sales-orders', salesOrderRoutes);
 
 // Static uploads
 app.use('/uploads', express.static('uploads'));
