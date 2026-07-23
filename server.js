@@ -11,6 +11,8 @@ import categoryRoutes from './routes/categoryRoutes.js';
 import productRoutes from './routes/productRoutes.js';
 import masterRoutes from './routes/masterRoutes.js';
 import salesOrderRoutes from './routes/salesOrderRoutes.js';
+import hrmsRoutes from './routes/hrmsRoutes.js';
+import purchaseRoutes from './routes/purchaseRoutes.js';
 
 dotenv.config();
 
@@ -36,6 +38,8 @@ app.use('/api/v1/category-setup', categoryRoutes);
 app.use('/api/v1/products', productRoutes);
 app.use('/api/v1/masters', masterRoutes);
 app.use('/api/v1/sales-orders', salesOrderRoutes);
+app.use('/api/v1/hrms', hrmsRoutes);
+app.use('/api/v1/purchase', purchaseRoutes);
 
 // Static uploads
 app.use('/uploads', express.static('uploads'));
