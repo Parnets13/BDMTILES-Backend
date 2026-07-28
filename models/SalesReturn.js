@@ -1,0 +1,70 @@
+import mongoose from 'mongoose';
+
+const returnItemSchema = new mongoose.Schema({
+  product: { type: mongoose.Schema.Types.ObjectId, ref: 'Product', required: true },
+  productCode: String,
+  productName: String,
+  shade: { type: String, default: '' },
+  batch: { type: String, default: '' },
+  returnQty: { type: Number, required: true, min: 1 },
+  unit: { type: String, default: 'Box' },
+  rate: { type: Number, default: 0 },
+  reason: { type: String, enum: ['damaged', 'wrong_product', 'quality_issue', 'excess', 'shade_mismatch', 'other'], default: 'other' },
+  reasonDetails: String,
+  condition: { type: String, enum: ['resaleable', 'damaged', 'scrap'], default: 'resaleable' },
+  taxableAmount: { type: Number, default: 0 },
+  gstPercentage: { type: Number, default: 18 },
+  gstAmount: { type: Number, default: 0 },
+  totalAmount: { type: Number, default: 0 },
+  warehouse: { type: mongoose.Schema.Types.ObjectId, ref: 'Warehouse' },
+});
+
+const salesReturnSchema = new mongoose.Schema(
+  {
+    returnNumber: { type: String, unique: true, required: true },
+    returnDate: { type: Date, default: Date.now },
+
+    // Reference to original sales order
+    salesOrder: { type: mongoose.Schema.Types.ObjectId, ref: 'SalesOrder' },
+    orderNumber: String,
+
+    // Dealer
+    dealer: { type: mongoose.Schema.Types.ObjectId, ref: 'Dealer', required: true },
+    dealerName: String,
+    dealerCode: String,
+
+    items: [returnItemSchema],
+
+    // Totals
+    subtotal: { type: Number, default: 0 },
+    totalTax: { type: Number, default: 0 },
+    grandTotal: { type: Number, default: 0 },
+
+    // Credit Note
+    creditNoteNumber: String,
+    creditNoteDate: Date,
+    adjustmentType: { type: String, enum: ['refund', 'credit_note', 'replacement'], default: 'credit_note' },
+
+    // Status
+    status: { type: String, enum: ['draft', 'approved', 'stock_updated', 'credit_issued', 'cancelled'], default: 'draft' },
+    approvedBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User' },
+    approvalDate: Date,
+    approvalRemarks: String,
+
+    remarks: { type: String, default: '' },
+
+    // Tally
+    tallySyncStatus: { type: String, enum: ['not_synced', 'pending', 'synced', 'failed'], default: 'not_synced' },
+    tallyVoucherNumber: String,
+
+    createdBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User' },
+  },
+  { timestamps: true }
+);
+
+salesReturnSchema.index({ returnNumber: 1 });
+salesReturnSchema.index({ salesOrder: 1 });
+salesReturnSchema.index({ dealer: 1, returnDate: -1 });
+salesReturnSchema.index({ status: 1 });
+
+export default mongoose.model('SalesReturn', salesReturnSchema);
