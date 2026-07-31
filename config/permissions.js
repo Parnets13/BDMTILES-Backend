@@ -97,6 +97,9 @@ export const AVAILABLE_PERMISSIONS = {
     { id: "dealer.order.requests", name: "Dealer Order Requests" },
     { id: "support.chat", name: "Support Chat" },
   ],
+  "Assets": [
+    { id: "asset.management", name: "Asset Management (Master / Assignment / Maintenance)" },
+  ],
   "Tally": [
     { id: "tally.sync", name: "Tally Sync Management" },
     { id: "tally.reconciliation", name: "Tally Reconciliation" },
@@ -130,6 +133,7 @@ export const ROLE_DEFAULT_PERMISSIONS = {
     'dashboard.view', 'finance.management', 'dealer.ledger', 'supplier.ledger',
     'cheque.management', 'reconciliation', 'expense.management', 'expense.approve',
     'reports.finance', 'reports.gst', 'reports.profit', 'tally.sync',
+    'asset.management',
   ],
   hr_manager: [
     'dashboard.view', 'hrms.management', 'attendance.master', 'leave.management',

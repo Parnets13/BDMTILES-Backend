@@ -28,6 +28,10 @@ import complaintRoutes from './routes/complaintRoutes.js';
 import approvalRoutes from './routes/approvalRoutes.js';
 import reportRoutes from './routes/reportRoutes.js';
 import schemeRoutes from './routes/schemeRoutes.js';
+import dailyWageRoutes from './routes/dailyWageRoutes.js';
+import expenseRoutes from './routes/expenseRoutes.js';
+import purchaseRequisitionRoutes from './routes/purchaseRequisitionRoutes.js';
+import assetRoutes from './routes/assetRoutes.js';
 
 dotenv.config();
 
@@ -70,6 +74,10 @@ app.use('/api/v1/complaints', complaintRoutes);
 app.use('/api/v1/approvals', approvalRoutes);
 app.use('/api/v1/reports', reportRoutes);
 app.use('/api/v1/schemes', schemeRoutes);
+app.use('/api/v1/daily-wages', dailyWageRoutes);
+app.use('/api/v1/expenses', expenseRoutes);
+app.use('/api/v1/purchase-requisitions', purchaseRequisitionRoutes);
+app.use('/api/v1/assets', assetRoutes);
 
 // Static uploads
 app.use('/uploads', express.static('uploads'));
