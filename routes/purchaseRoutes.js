@@ -52,6 +52,27 @@ router.post('/purchase-orders', requirePermission('po.management'), async (req, 
     const data = { ...req.body, createdBy: req.user._id };
     const count = await PurchaseOrder.countDocuments();
     data.poNumber = `PO-${String(count + 1).padStart(5, '0')}`;
+
+    // Validate purchase rate against max (basicPrice + excessPrice)
+    if (data.items?.length) {
+      const rateWarnings = [];
+      for (const item of data.items) {
+        if (item.product) {
+          const prod = await Product.findById(item.product).select('basicPrice excessPrice maxPurchaseRate itemName productCode').lean();
+          if (prod && prod.maxPurchaseRate > 0 && item.rate > prod.maxPurchaseRate) {
+            rateWarnings.push(`${prod.productCode || prod.itemName}: Rate ₹${item.rate} exceeds max ₹${prod.maxPurchaseRate} (Basic ₹${prod.basicPrice} + Excess ₹${prod.excessPrice})`);
+          }
+        }
+      }
+      if (rateWarnings.length > 0) {
+        return res.status(400).json({
+          success: false,
+          message: 'Purchase rate exceeds allowed maximum for some items.',
+          data: { warnings: rateWarnings },
+        });
+      }
+    }
+
     // Calc totals
     if (data.items?.length) {
       let subtotal = 0, totalTax = 0;

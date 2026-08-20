@@ -73,6 +73,71 @@ router.patch('/supplier/:id/settle', requirePermission('scheme.entry'), async (r
   } catch (e) { res.status(500).json({ success: false, message: e.message }); }
 });
 
+// GET /api/v1/schemes/supplier/:id — single scheme detail
+router.get('/supplier/:id', requirePermission('scheme.entry'), async (req, res) => {
+  try {
+    const scheme = await SupplierScheme.findById(req.params.id)
+      .populate('supplier', 'companyName supplierCode')
+      .populate('products.product', 'itemName productCode')
+      .lean();
+    if (!scheme) return res.status(404).json({ success: false, message: 'Not found.' });
+    res.json({ success: true, data: scheme });
+  } catch (e) { res.status(500).json({ success: false, message: e.message }); }
+});
+
+// PUT /api/v1/schemes/supplier/:id — update scheme
+router.put('/supplier/:id', requirePermission('scheme.entry'), async (req, res) => {
+  try {
+    const scheme = await SupplierScheme.findByIdAndUpdate(req.params.id, req.body, { new: true, runValidators: true });
+    if (!scheme) return res.status(404).json({ success: false, message: 'Not found.' });
+    res.json({ success: true, message: 'Scheme updated.', data: scheme });
+  } catch (e) { res.status(500).json({ success: false, message: e.message }); }
+});
+
+// PATCH /api/v1/schemes/supplier/:id/update-achievement — update purchased qty against scheme
+router.patch('/supplier/:id/update-achievement', requirePermission('scheme.entry'), async (req, res) => {
+  try {
+    const { products } = req.body; // [{productId, achievedQty}]
+    const scheme = await SupplierScheme.findById(req.params.id);
+    if (!scheme) return res.status(404).json({ success: false, message: 'Not found.' });
+
+    let totalEarned = 0;
+    if (products?.length) {
+      for (const updProd of products) {
+        const existing = scheme.products.find(p => String(p.product) === updProd.productId);
+        if (existing) {
+          existing.achievedQty = updProd.achievedQty || 0;
+          // Calculate incentive
+          if (existing.incentiveType === 'per_unit') {
+            totalEarned += existing.achievedQty * existing.incentiveRate;
+          } else if (existing.incentiveType === 'percentage') {
+            totalEarned += (existing.achievedQty * existing.targetQty > 0 ? (existing.achievedQty / existing.targetQty) : 0) * existing.incentiveRate;
+          } else {
+            totalEarned += existing.achievedQty >= existing.targetQty ? existing.incentiveRate : 0;
+          }
+        }
+      }
+    }
+
+    scheme.totalIncentiveEarned = Math.round(totalEarned * 100) / 100;
+    await scheme.save();
+    res.json({ success: true, message: 'Achievement updated.', data: scheme });
+  } catch (e) { res.status(500).json({ success: false, message: e.message }); }
+});
+
+// DELETE /api/v1/schemes/supplier/:id
+router.delete('/supplier/:id', requirePermission('scheme.entry'), async (req, res) => {
+  try {
+    const scheme = await SupplierScheme.findById(req.params.id);
+    if (!scheme) return res.status(404).json({ success: false, message: 'Not found.' });
+    if (scheme.status === 'claimed' || scheme.status === 'closed') {
+      return res.status(400).json({ success: false, message: 'Cannot delete claimed/closed scheme.' });
+    }
+    await SupplierScheme.findByIdAndDelete(req.params.id);
+    res.json({ success: true, message: 'Scheme deleted.' });
+  } catch (e) { res.status(500).json({ success: false, message: e.message }); }
+});
+
 // ══════════════════════════════
 // DEALER SCHEMES
 // ══════════════════════════════

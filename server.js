@@ -28,10 +28,24 @@ import complaintRoutes from './routes/complaintRoutes.js';
 import approvalRoutes from './routes/approvalRoutes.js';
 import reportRoutes from './routes/reportRoutes.js';
 import schemeRoutes from './routes/schemeRoutes.js';
-import dailyWageRoutes from './routes/dailyWageRoutes.js';
+import systemRoutes from './routes/systemRoutes.js';
+import customerRoutes from './routes/customerRoutes.js';
 import expenseRoutes from './routes/expenseRoutes.js';
+import sampleRoutes from './routes/sampleRoutes.js';
+import { autoLogMiddleware } from './middleware/activityLogger.js';
+import dailyWageRoutes from './routes/dailyWageRoutes.js';
 import purchaseRequisitionRoutes from './routes/purchaseRequisitionRoutes.js';
 import assetRoutes from './routes/assetRoutes.js';
+import discountMappingRoutes from './routes/discountMappingRoutes.js';
+import invoiceRoutes from './routes/invoiceRoutes.js';
+import stockTransferRoutes from './routes/stockTransferRoutes.js';
+import pickListRoutes from './routes/pickListRoutes.js';
+import dispatchTripRoutes from './routes/dispatchTripRoutes.js';
+import deliveryRoutes from './routes/deliveryRoutes.js';
+import bankReconciliationRoutes from './routes/bankReconciliationRoutes.js';
+import documentRoutes from './routes/documentRoutes.js';
+import taskRoutes from './routes/taskRoutes.js';
+import notificationRoutes from './routes/notificationRoutes.js';
 
 dotenv.config();
 
@@ -49,6 +63,9 @@ app.use(helmet({ crossOriginResourcePolicy: { policy: 'cross-origin' } }));
 app.get('/api/v1/health', (req, res) => {
   res.json({ success: true, message: 'BDMTILES API running', version: '1.0.0' });
 });
+
+// Auto-log all write operations (POST/PUT/PATCH/DELETE)
+app.use('/api/v1', autoLogMiddleware);
 
 // Routes
 app.use('/api/v1/auth', authRoutes);
@@ -74,10 +91,23 @@ app.use('/api/v1/complaints', complaintRoutes);
 app.use('/api/v1/approvals', approvalRoutes);
 app.use('/api/v1/reports', reportRoutes);
 app.use('/api/v1/schemes', schemeRoutes);
-app.use('/api/v1/daily-wages', dailyWageRoutes);
+app.use('/api/v1/system', systemRoutes);
+app.use('/api/v1/customers', customerRoutes);
 app.use('/api/v1/expenses', expenseRoutes);
+app.use('/api/v1/samples', sampleRoutes);
+app.use('/api/v1/daily-wages', dailyWageRoutes);
 app.use('/api/v1/purchase-requisitions', purchaseRequisitionRoutes);
 app.use('/api/v1/assets', assetRoutes);
+app.use('/api/v1/discount-mappings', discountMappingRoutes);
+app.use('/api/v1/invoices', invoiceRoutes);
+app.use('/api/v1/stock-transfers', stockTransferRoutes);
+app.use('/api/v1/pick-lists', pickListRoutes);
+app.use('/api/v1/dispatch-trips', dispatchTripRoutes);
+app.use('/api/v1/deliveries', deliveryRoutes);
+app.use('/api/v1/bank-reconciliation', bankReconciliationRoutes);
+app.use('/api/v1/documents', documentRoutes);
+app.use('/api/v1/tasks', taskRoutes);
+app.use('/api/v1/notifications', notificationRoutes);
 
 // Static uploads
 app.use('/uploads', express.static('uploads'));

@@ -94,9 +94,9 @@ router.delete('/:id', async (req, res) => {
     if (req.params.id === req.user._id.toString()) {
       return res.status(400).json({ success: false, message: 'Cannot delete yourself.' });
     }
-    const user = await User.findByIdAndDelete(req.params.id);
-    if (!user) return res.status(404).json({ success: false, message: 'User not found.' });
-    res.json({ success: true, message: 'User deleted.' });
+    const { safeDelete } = await import('../middleware/safeDelete.js');
+    const result = await safeDelete(User, req.params.id, { user: req.user, module: 'user', titleField: 'name', codeField: 'email' });
+    res.status(result.status || 200).json(result);
   } catch (error) {
     res.status(500).json({ success: false, message: error.message });
   }

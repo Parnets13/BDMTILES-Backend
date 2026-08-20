@@ -4,6 +4,7 @@ const salesOrderItemSchema = new mongoose.Schema({
   product: { type: mongoose.Schema.Types.ObjectId, ref: 'Product', required: true },
   productCode: String,
   productName: String,
+  productImage: { type: String, default: '' },
   shade: { type: String, default: '' },        // Shade tracking (tile-specific)
   batch: { type: String, default: '' },        // Batch tracking (tile-specific)
   quantity: { type: Number, required: true, min: 1 },
@@ -34,7 +35,9 @@ const salesOrderSchema = new mongoose.Schema(
     dealer: { type: mongoose.Schema.Types.ObjectId, ref: 'Dealer' },
     dealerName: String,
     dealerCode: String,
-    orderType: { type: String, enum: ['dealer', 'retail', 'online', 'project'], default: 'dealer' },
+    customerName: String,
+    customerPhone: String,
+    orderType: { type: String, enum: ['dealer', 'wholesaler', 'retail', 'distributor', 'builder', 'online', 'project'], default: 'dealer' },
 
     // Items with shade/batch
     items: [salesOrderItemSchema],
@@ -46,6 +49,7 @@ const salesOrderSchema = new mongoose.Schema(
     totalTax: { type: Number, default: 0 },
     freightCharges: { type: Number, default: 0 },
     loadingCharges: { type: Number, default: 0 },
+    installationCharges: { type: Number, default: 0 },
     otherCharges: { type: Number, default: 0 },
     roundOff: { type: Number, default: 0 },
     grandTotal: { type: Number, default: 0 },

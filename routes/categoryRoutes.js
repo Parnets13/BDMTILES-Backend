@@ -79,9 +79,9 @@ router.delete('/brands/:id', async (req, res) => {
     if (catCount > 0) {
       return res.status(400).json({ success: false, message: `Cannot delete. ${catCount} categories exist under this brand.` });
     }
-    const brand = await Brand.findByIdAndDelete(req.params.id);
-    if (!brand) return res.status(404).json({ success: false, message: 'Brand not found.' });
-    res.json({ success: true, message: 'Brand deleted.' });
+    const { safeDelete } = await import('../middleware/safeDelete.js');
+    const result = await safeDelete(Brand, req.params.id, { user: req.user, module: 'brand', titleField: 'name', skipDependencyCheck: true });
+    res.status(result.status || 200).json(result);
   } catch (error) {
     res.status(500).json({ success: false, message: error.message });
   }
@@ -162,9 +162,9 @@ router.delete('/categories/:id', async (req, res) => {
     if (subCount > 0) {
       return res.status(400).json({ success: false, message: `Cannot delete. ${subCount} subcategories exist.` });
     }
-    const category = await Category.findByIdAndDelete(req.params.id);
-    if (!category) return res.status(404).json({ success: false, message: 'Category not found.' });
-    res.json({ success: true, message: 'Category deleted.' });
+    const { safeDelete } = await import('../middleware/safeDelete.js');
+    const result = await safeDelete(Category, req.params.id, { user: req.user, module: 'category', titleField: 'name', skipDependencyCheck: true });
+    res.status(result.status || 200).json(result);
   } catch (error) {
     res.status(500).json({ success: false, message: error.message });
   }
@@ -235,10 +235,9 @@ router.put('/subcategories/:id', async (req, res) => {
 // DELETE subcategory
 router.delete('/subcategories/:id', async (req, res) => {
   try {
-    // TODO: Check if products exist under this subcategory before deleting
-    const subcategory = await Subcategory.findByIdAndDelete(req.params.id);
-    if (!subcategory) return res.status(404).json({ success: false, message: 'Subcategory not found.' });
-    res.json({ success: true, message: 'Subcategory deleted.' });
+    const { safeDelete } = await import('../middleware/safeDelete.js');
+    const result = await safeDelete(Subcategory, req.params.id, { user: req.user, module: 'subcategory', titleField: 'name', skipDependencyCheck: true });
+    res.status(result.status || 200).json(result);
   } catch (error) {
     res.status(500).json({ success: false, message: error.message });
   }

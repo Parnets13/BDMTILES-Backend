@@ -390,4 +390,145 @@ router.get('/finance-summary', requirePermission('reports.management'), async (r
   } catch (e) { res.status(500).json({ success: false, message: e.message }); }
 });
 
+// ═══════════════════════════════════════════════════════
+// PROFITABILITY REPORT
+// ═══════════════════════════════════════════════════════
+router.get('/profitability', requirePermission('reports.management'), async (req, res) => {
+  try {
+    const { dateFrom, dateTo } = req.query;
+    const match = { status: { $nin: ['cancelled', 'draft'] }, ...dateFilter(dateFrom, dateTo, 'orderDate') };
+
+    const [productProfit, categoryProfit, dealerProfit, overallSummary] = await Promise.all([
+      // Product-wise profit (sales amount - estimated purchase cost)
+      SalesOrder.aggregate([
+        { $match: match }, { $unwind: '$items' },
+        { $group: {
+          _id: '$items.product',
+          productName: { $first: '$items.productName' },
+          productCode: { $first: '$items.productCode' },
+          salesQty: { $sum: '$items.quantity' },
+          salesRevenue: { $sum: '$items.totalAmount' },
+          discountGiven: { $sum: { $ifNull: ['$items.discountAmount', 0] } },
+        }},
+        { $sort: { salesRevenue: -1 } }, { $limit: 20 },
+      ]),
+      // Category-wise margin
+      SalesOrder.aggregate([
+        { $match: match }, { $unwind: '$items' },
+        { $lookup: { from: 'products', localField: 'items.product', foreignField: '_id', as: 'prod' } },
+        { $unwind: { path: '$prod', preserveNullAndEmptyArrays: true } },
+        { $group: {
+          _id: '$prod.category',
+          salesRevenue: { $sum: '$items.totalAmount' },
+          costEstimate: { $sum: { $multiply: ['$items.quantity', { $ifNull: ['$prod.basicPrice', 0] }] } },
+          totalQty: { $sum: '$items.quantity' },
+        }},
+        { $addFields: { grossMargin: { $subtract: ['$salesRevenue', '$costEstimate'] }, marginPercent: { $cond: [{ $gt: ['$salesRevenue', 0] }, { $multiply: [{ $divide: [{ $subtract: ['$salesRevenue', '$costEstimate'] }, '$salesRevenue'] }, 100] }, 0] } } },
+        { $sort: { salesRevenue: -1 } },
+      ]),
+      // Dealer-wise profitability
+      SalesOrder.aggregate([
+        { $match: match },
+        { $group: {
+          _id: '$dealer',
+          dealerName: { $first: '$dealerName' },
+          dealerCode: { $first: '$dealerCode' },
+          revenue: { $sum: '$grandTotal' },
+          orders: { $sum: 1 },
+          discount: { $sum: '$totalDiscount' },
+        }},
+        { $sort: { revenue: -1 } }, { $limit: 20 },
+      ]),
+      // Overall summary
+      SalesOrder.aggregate([
+        { $match: match },
+        { $group: {
+          _id: null,
+          grossSales: { $sum: '$grandTotal' },
+          totalDiscount: { $sum: '$totalDiscount' },
+          totalTax: { $sum: '$totalTax' },
+          totalOrders: { $sum: 1 },
+          freightCharges: { $sum: '$freightCharges' },
+        }},
+      ]),
+    ]);
+
+    res.json({ success: true, data: {
+      summary: overallSummary[0] || {},
+      productProfit, categoryProfit, dealerProfit,
+    }});
+  } catch (e) { res.status(500).json({ success: false, message: e.message }); }
+});
+
+// ═══════════════════════════════════════════════════════
+// DEALER PERFORMANCE REPORT
+// ═══════════════════════════════════════════════════════
+router.get('/dealer-performance', requirePermission('reports.management'), async (req, res) => {
+  try {
+    const { dateFrom, dateTo } = req.query;
+    const match = { status: { $nin: ['cancelled', 'draft'] }, ...dateFilter(dateFrom, dateTo, 'orderDate') };
+
+    const dealerPerformance = await SalesOrder.aggregate([
+      { $match: match },
+      { $group: {
+        _id: '$dealer',
+        dealerName: { $first: '$dealerName' },
+        dealerCode: { $first: '$dealerCode' },
+        salesValue: { $sum: '$grandTotal' },
+        orderCount: { $sum: 1 },
+        avgOrderValue: { $avg: '$grandTotal' },
+        totalDiscount: { $sum: '$totalDiscount' },
+        firstOrder: { $min: '$orderDate' },
+        lastOrder: { $max: '$orderDate' },
+      }},
+      { $sort: { salesValue: -1 } },
+    ]);
+
+    // Get payment data per dealer
+    const paymentMatch = dateFilter(dateFrom, dateTo, 'paymentDate');
+    const dealerPayments = await Payment.aggregate([
+      { $match: { status: 'confirmed', ...paymentMatch } },
+      { $group: { _id: '$dealer', collected: { $sum: '$amount' } } },
+    ]);
+    const paymentMap = {};
+    dealerPayments.forEach(p => { paymentMap[String(p._id)] = p.collected; });
+
+    const enriched = dealerPerformance.map(d => ({
+      ...d,
+      collectionValue: paymentMap[String(d._id)] || 0,
+      collectionRatio: d.salesValue > 0 ? Math.round((paymentMap[String(d._id)] || 0) / d.salesValue * 100) : 0,
+    }));
+
+    res.json({ success: true, data: enriched });
+  } catch (e) { res.status(500).json({ success: false, message: e.message }); }
+});
+
+// ═══════════════════════════════════════════════════════
+// SALES EXECUTIVE PERFORMANCE REPORT
+// ═══════════════════════════════════════════════════════
+router.get('/se-performance', requirePermission('reports.management'), async (req, res) => {
+  try {
+    const { dateFrom, dateTo } = req.query;
+    const match = { status: { $nin: ['cancelled', 'draft'] }, ...dateFilter(dateFrom, dateTo, 'orderDate') };
+
+    const sePerformance = await SalesOrder.aggregate([
+      { $match: { ...match, salesExecutive: { $exists: true, $ne: null } } },
+      { $group: {
+        _id: '$salesExecutive',
+        salesValue: { $sum: '$grandTotal' },
+        orderCount: { $sum: 1 },
+        avgOrderValue: { $avg: '$grandTotal' },
+        uniqueDealers: { $addToSet: '$dealer' },
+      }},
+      { $addFields: { dealerCount: { $size: '$uniqueDealers' } } },
+      { $sort: { salesValue: -1 } },
+      { $lookup: { from: 'users', localField: '_id', foreignField: '_id', as: 'user' } },
+      { $unwind: { path: '$user', preserveNullAndEmptyArrays: true } },
+      { $project: { salesValue: 1, orderCount: 1, avgOrderValue: 1, dealerCount: 1, executiveName: '$user.name' } },
+    ]);
+
+    res.json({ success: true, data: sePerformance });
+  } catch (e) { res.status(500).json({ success: false, message: e.message }); }
+});
+
 export default router;

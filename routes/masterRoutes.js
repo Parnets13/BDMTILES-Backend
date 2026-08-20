@@ -60,9 +60,9 @@ const simpleCrud = (Model, permission) => {
 
   r.delete('/:id', async (req, res) => {
     try {
-      const item = await Model.findByIdAndDelete(req.params.id);
-      if (!item) return res.status(404).json({ success: false, message: 'Not found.' });
-      res.json({ success: true, message: 'Deleted.' });
+      const { safeDelete } = await import('../middleware/safeDelete.js');
+      const result = await safeDelete(Model, req.params.id, { user: req.user, module: Model.modelName?.toLowerCase() || 'master', titleField: 'name', skipDependencyCheck: true });
+      res.status(result.status || 200).json(result);
     } catch (e) { res.status(500).json({ success: false, message: e.message }); }
   });
 
@@ -131,9 +131,9 @@ warehouseRouter.put('/:id', async (req, res) => {
 
 warehouseRouter.delete('/:id', async (req, res) => {
   try {
-    const wh = await Warehouse.findByIdAndDelete(req.params.id);
-    if (!wh) return res.status(404).json({ success: false, message: 'Warehouse not found.' });
-    res.json({ success: true, message: 'Warehouse deleted.' });
+    const { safeDelete } = await import('../middleware/safeDelete.js');
+    const result = await safeDelete(Warehouse, req.params.id, { user: req.user, module: 'warehouse', titleField: 'name' });
+    res.status(result.status || 200).json(result);
   } catch (e) { res.status(500).json({ success: false, message: e.message }); }
 });
 
@@ -190,9 +190,9 @@ routeRouter.put('/:id', async (req, res) => {
 
 routeRouter.delete('/:id', async (req, res) => {
   try {
-    const route = await Route.findByIdAndDelete(req.params.id);
-    if (!route) return res.status(404).json({ success: false, message: 'Route not found.' });
-    res.json({ success: true, message: 'Route deleted.' });
+    const { safeDelete } = await import('../middleware/safeDelete.js');
+    const result = await safeDelete(Route, req.params.id, { user: req.user, module: 'route', titleField: 'name' });
+    res.status(result.status || 200).json(result);
   } catch (e) { res.status(500).json({ success: false, message: e.message }); }
 });
 
@@ -206,7 +206,7 @@ dealerRouter.use(requirePermission('dealer.master'));
 
 dealerRouter.get('/', async (req, res) => {
   try {
-    const { page = 1, limit = 20, search, status, dealerType, region, route: routeId } = req.query;
+    const { page = 1, limit = 20, search, status, dealerType, region, route: routeId, pricingTier } = req.query;
     const p = Math.max(1, parseInt(page));
     const l = Math.min(100, parseInt(limit) || 20);
 
@@ -220,9 +220,21 @@ dealerRouter.get('/', async (req, res) => {
     if (region) filter.assignedRegion = region;
     if (routeId) filter.assignedRoute = routeId;
 
+    // Filter by pricingTier: find DealerType IDs that match the tier, then filter dealers
+    if (pricingTier) {
+      const matchingTypes = await DealerType.find({ pricingTier, status: 'active' }).select('_id').lean();
+      const typeIds = matchingTypes.map(t => t._id);
+      if (typeIds.length > 0) {
+        filter.dealerType = { $in: typeIds };
+      } else {
+        // No matching dealer types — return empty
+        return res.json({ success: true, data: [], pagination: { currentPage: p, totalPages: 0, totalItems: 0, itemsPerPage: l } });
+      }
+    }
+
     const [dealers, total] = await Promise.all([
       Dealer.find(filter).sort({ createdAt: -1 }).skip((p - 1) * l).limit(l)
-        .populate('dealerType', 'name')
+        .populate('dealerType', 'name pricingTier')
         .populate('dealerCategory', 'name')
         .populate('assignedRegion', 'name')
         .populate('assignedRoute', 'name')
@@ -264,8 +276,8 @@ dealerRouter.post('/', async (req, res) => {
   try {
     const data = { ...req.body, createdBy: req.user._id };
     if (!data.dealerCode) {
-      const count = await Dealer.countDocuments();
-      data.dealerCode = `DLR${String(count + 1).padStart(5, '0')}`;
+      const { generateUniqueCode } = await import('../utils/codeGenerator.js');
+      data.dealerCode = await generateUniqueCode(Dealer, 'dealerCode', 'DLR', 5);
     }
     const dealer = await Dealer.create(data);
     res.status(201).json({ success: true, message: 'Dealer created.', data: dealer });
@@ -288,9 +300,14 @@ dealerRouter.put('/:id', async (req, res) => {
 
 dealerRouter.delete('/:id', async (req, res) => {
   try {
-    const dealer = await Dealer.findByIdAndDelete(req.params.id);
-    if (!dealer) return res.status(404).json({ success: false, message: 'Dealer not found.' });
-    res.json({ success: true, message: 'Dealer deleted.' });
+    const { safeDelete } = await import('../middleware/safeDelete.js');
+    const result = await safeDelete(Dealer, req.params.id, {
+      user: req.user,
+      module: 'dealer',
+      titleField: 'businessName',
+      codeField: 'dealerCode',
+    });
+    res.status(result.status || 200).json(result);
   } catch (e) { res.status(500).json({ success: false, message: e.message }); }
 });
 
@@ -354,9 +371,9 @@ supplierRouter.put('/:id', async (req, res) => {
 
 supplierRouter.delete('/:id', async (req, res) => {
   try {
-    const supplier = await Supplier.findByIdAndDelete(req.params.id);
-    if (!supplier) return res.status(404).json({ success: false, message: 'Supplier not found.' });
-    res.json({ success: true, message: 'Supplier deleted.' });
+    const { safeDelete } = await import('../middleware/safeDelete.js');
+    const result = await safeDelete(Supplier, req.params.id, { user: req.user, module: 'supplier', titleField: 'companyName', codeField: 'supplierCode' });
+    res.status(result.status || 200).json(result);
   } catch (e) { res.status(500).json({ success: false, message: e.message }); }
 });
 
@@ -407,9 +424,9 @@ vehicleRouter.put('/:id', async (req, res) => {
 
 vehicleRouter.delete('/:id', async (req, res) => {
   try {
-    const vehicle = await Vehicle.findByIdAndDelete(req.params.id);
-    if (!vehicle) return res.status(404).json({ success: false, message: 'Not found.' });
-    res.json({ success: true, message: 'Vehicle deleted.' });
+    const { safeDelete } = await import('../middleware/safeDelete.js');
+    const result = await safeDelete(Vehicle, req.params.id, { user: req.user, module: 'vehicle', titleField: 'vehicleNumber' });
+    res.status(result.status || 200).json(result);
   } catch (e) { res.status(500).json({ success: false, message: e.message }); }
 });
 

@@ -71,8 +71,10 @@ router.put('/employees/:id', requirePermission('employee.registration'), async (
 
 router.delete('/employees/:id', requirePermission('employee.registration'), async (req, res) => {
   try {
-    await Employee.findByIdAndDelete(req.params.id);
-    res.json({ success: true, message: 'Deleted.' });
+    const { safeDelete } = await import('../middleware/safeDelete.js');
+    const Employee = (await import('../models/Employee.js')).default;
+    const result = await safeDelete(Employee, req.params.id, { user: req.user, module: 'employee', titleField: 'name', codeField: 'empId' });
+    res.status(result.status || 200).json(result);
   } catch (e) { res.status(500).json({ success: false, message: e.message }); }
 });
 

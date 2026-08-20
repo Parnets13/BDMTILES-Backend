@@ -41,13 +41,18 @@ const productSchema = new mongoose.Schema(
     weightPerBox: { type: Number, min: 0, default: 0 },
 
     // Pricing
+    basicPrice: { type: Number, min: 0, default: 0 },       // Base purchase price
+    excessPrice: { type: Number, min: 0, default: 0 },       // Max excess allowed above basic (margin cap)
+    maxPurchaseRate: { type: Number, min: 0, default: 0 },   // Auto: basicPrice + excessPrice
     purchaseRate: { type: Number, min: 0, default: 0 },
     landingCost: { type: Number, min: 0, default: 0 },
     mrp: { type: Number, min: 0, default: 0 },
     retailRate: { type: Number, min: 0, default: 0 },
     dealerRate: { type: Number, min: 0, default: 0 },
     wholesaleRate: { type: Number, min: 0, default: 0 },
+    distributorRate: { type: Number, min: 0, default: 0 },
     projectRate: { type: Number, min: 0, default: 0 },
+    builderRate: { type: Number, min: 0, default: 0 },
     minimumSellingRate: { type: Number, min: 0, default: 0 },
 
     // Stock settings
@@ -56,6 +61,9 @@ const productSchema = new mongoose.Schema(
 
     // Media
     images: [String],
+    videos: [String],           // product video URLs
+    images360: [String],        // 360-degree image URLs
+    cataloguePdf: { type: String, default: '' }, // catalogue PDF URL
 
     // Flags
     status: { type: String, enum: ['active', 'inactive', 'draft'], default: 'active' },
@@ -84,5 +92,28 @@ productSchema.index({ itemName: 'text', productCode: 'text', aliasName: 'text' }
 productSchema.index({ brand: 1, category: 1, subcategory: 1 });
 productSchema.index({ status: 1 });
 productSchema.index({ productCode: 1 });
+
+// Auto-calculate maxPurchaseRate before save
+productSchema.pre('save', function (next) {
+  if (this.basicPrice !== undefined || this.excessPrice !== undefined) {
+    this.maxPurchaseRate = (this.basicPrice || 0) + (this.excessPrice || 0);
+  }
+  next();
+});
+
+// Also handle findOneAndUpdate
+productSchema.pre('findOneAndUpdate', function (next) {
+  const update = this.getUpdate();
+  if (update.basicPrice !== undefined || update.excessPrice !== undefined) {
+    const basic = update.basicPrice ?? update.$set?.basicPrice ?? 0;
+    const excess = update.excessPrice ?? update.$set?.excessPrice ?? 0;
+    if (update.$set) {
+      update.$set.maxPurchaseRate = basic + excess;
+    } else {
+      update.maxPurchaseRate = (update.basicPrice || 0) + (update.excessPrice || 0);
+    }
+  }
+  next();
+});
 
 export default mongoose.model('Product', productSchema);

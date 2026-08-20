@@ -32,10 +32,13 @@ const supplierSchema = new mongoose.Schema(
     // Scheme
     schemeType: { type: String, trim: true, default: '' },
     schemeDetails: { type: String, trim: true, default: '' },
+    schemeValidity: { type: Date },
+    schemeAmountDue: { type: Number, default: 0 },
 
     // Classification
     productCategories: [String],
     transportDetails: { type: String, trim: true, default: '' },
+    performanceRating: { type: Number, min: 0, max: 5, default: 0 },
 
     // Status
     status: { type: String, enum: ['active', 'inactive'], default: 'active' },

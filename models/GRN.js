@@ -32,6 +32,10 @@ const grnSchema = new mongoose.Schema(
     supplierName: String,
     supplierInvoiceNo: { type: String, default: '' },
     vehicleNo: { type: String, default: '' },
+    driverName: { type: String, default: '' },
+    driverMobile: { type: String, default: '' },
+    lrNumber: { type: String, default: '' },  // Lorry Receipt / Transport doc number
+    qcPhotos: [String], // QC inspection photos
 
     items: [grnItemSchema],
 

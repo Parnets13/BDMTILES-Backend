@@ -94,8 +94,8 @@ router.get('/:id', requirePermission('sales.order.create'), async (req, res) => 
 router.post('/', requirePermission('sales.order.create'), async (req, res) => {
   try {
     const body = { ...req.body, createdBy: req.user._id };
-    const count = await Quotation.countDocuments();
-    body.quotationNumber = `QT-${String(count + 1).padStart(5, '0')}`;
+    const { generateUniqueCode } = await import('../utils/codeGenerator.js');
+    body.quotationNumber = await generateUniqueCode(Quotation, 'quotationNumber', 'QT-', 5);
 
     if (body.dealer) {
       const d = await Dealer.findById(body.dealer).lean();
@@ -108,7 +108,7 @@ router.post('/', requirePermission('sales.order.create'), async (req, res) => {
       body.subtotal = subtotal;
       body.totalDiscount = totalDiscount;
       body.totalTax = totalTax;
-      body.grandTotal = Math.round(subtotal + totalTax + (body.freightCharges || 0) + (body.otherCharges || 0));
+      body.grandTotal = Math.round(subtotal + totalTax + (body.freightCharges || 0) + (body.loadingCharges || 0) + (body.installationCharges || 0) + (body.otherCharges || 0));
     }
 
     // Default validity: 30 days from today
@@ -142,10 +142,11 @@ router.post('/:id/convert', requirePermission('sales.order.create'), async (req,
     if (q.status === 'converted') return res.status(400).json({ success: false, message: 'Already converted.' });
     if (q.status === 'cancelled') return res.status(400).json({ success: false, message: 'Cannot convert cancelled quotation.' });
 
-    // Create SO from quotation data
-    const soCount = await SalesOrder.countDocuments();
-    const soNumber = `SO-${String(soCount + 1).padStart(5, '0')}`;
+    // Generate unique SO number (safe against recycle bin conflicts)
+    const { generateUniqueCode } = await import('../utils/codeGenerator.js');
+    const soNumber = await generateUniqueCode(SalesOrder, 'orderNumber', 'SO-', 5);
 
+    // Credit limit check
     let creditLimitExceeded = false;
     let approvalStatus = 'not_required';
     if (q.dealer?.creditLimit > 0) {
@@ -156,22 +157,31 @@ router.post('/:id/convert', requirePermission('sales.order.create'), async (req,
       }
     }
 
+    // Map customer type to SO orderType
+    const typeMap = { dealer: 'dealer', wholesaler: 'wholesaler', retail: 'retail', distributor: 'distributor', builder: 'builder' };
+    const orderType = typeMap[q.customerType] || 'dealer';
+
     const so = await SalesOrder.create({
       orderNumber: soNumber,
       orderDate: new Date(),
-      dealer: q.dealer?._id,
-      dealerName: q.dealerName,
-      dealerCode: q.dealerCode,
+      orderType,
+      dealer: q.dealer?._id || undefined,
+      dealerName: q.dealerName || q.customerName || '',
+      dealerCode: q.dealerCode || '',
+      customerName: q.customerName || '',
+      customerPhone: q.customerPhone || '',
       items: q.items,
       subtotal: q.subtotal,
       totalDiscount: q.totalDiscount,
       totalTax: q.totalTax,
       freightCharges: q.freightCharges || 0,
+      loadingCharges: q.loadingCharges || 0,
+      installationCharges: q.installationCharges || 0,
       otherCharges: q.otherCharges || 0,
       grandTotal: q.grandTotal,
       balanceAmount: q.grandTotal,
       status: 'confirmed',
-      remarks: `Converted from ${q.quotationNumber}`,
+      remarks: `Converted from ${q.quotationNumber}. ${q.remarks || ''}`.trim(),
       tallySyncStatus: 'not_synced',
       creditLimitExceeded,
       approvalStatus,
@@ -192,13 +202,14 @@ router.post('/:id/convert', requirePermission('sales.order.create'), async (req,
 // DELETE /api/v1/quotations/:id — draft/cancelled only
 router.delete('/:id', requirePermission('sales.order.create'), async (req, res) => {
   try {
-    const q = await Quotation.findById(req.params.id);
-    if (!q) return res.status(404).json({ success: false, message: 'Not found.' });
-    if (!['draft', 'cancelled'].includes(q.status)) {
-      return res.status(400).json({ success: false, message: 'Only draft or cancelled quotations can be deleted.' });
-    }
-    await Quotation.findByIdAndDelete(req.params.id);
-    res.json({ success: true, message: 'Quotation deleted.' });
+    const { safeDelete } = await import('../middleware/safeDelete.js');
+    const result = await safeDelete(Quotation, req.params.id, {
+      user: req.user,
+      module: 'quotation',
+      titleField: 'dealerName',
+      codeField: 'quotationNumber',
+    });
+    res.status(result.status || 200).json(result);
   } catch (e) { res.status(500).json({ success: false, message: e.message }); }
 });
 

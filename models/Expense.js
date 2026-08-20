@@ -1,36 +1,58 @@
 import mongoose from 'mongoose';
 
+/**
+ * Expense — Employee expense claims with approval workflow.
+ * Categories: Travel, Fuel, Phone, Lodging, Food, Office, Loading, Unloading,
+ * Vehicle Repair, Warehouse, Marketing, Staff Welfare, Courier, Misc
+ */
 const expenseSchema = new mongoose.Schema(
   {
-    expenseNumber:    { type: String, unique: true },
-    expenseDate:      { type: Date, default: Date.now },
-    category:         { type: mongoose.Schema.Types.ObjectId, ref: 'ExpenseCategory' },
-    categoryName:     { type: String },
-    employee:         { type: mongoose.Schema.Types.ObjectId, ref: 'Employee' },
-    employeeName:     { type: String },
-    description:      { type: String, required: true },
-    amount:           { type: Number, required: true, min: 0 },
-    paymentMode:      { type: String, enum: ['cash', 'bank_transfer', 'credit_card', 'petty_cash'], default: 'cash' },
-    receiptNumber:    { type: String, default: '' },
-    receiptImage:     { type: String, default: '' }, // file path
-    gstAmount:        { type: Number, default: 0 },
-    billable:         { type: Boolean, default: false },
-    project:          { type: String, default: '' },
-    status:           { type: String, enum: ['draft', 'submitted', 'approved', 'rejected', 'paid'], default: 'draft' },
-    approvedBy:       { type: mongoose.Schema.Types.ObjectId, ref: 'User' },
-    approvalNotes:    { type: String, default: '' },
-    approvalDate:     { type: Date },
-    paidDate:         { type: Date },
-    bankAccount:      { type: mongoose.Schema.Types.ObjectId, ref: 'BankAccount' },
-    createdBy:        { type: mongoose.Schema.Types.ObjectId, ref: 'User' },
-    tallySyncStatus:  { type: String, default: 'not_synced' },
+    expenseNumber: { type: String, unique: true, required: true },
+    employee: { type: mongoose.Schema.Types.ObjectId, ref: 'Employee', required: true },
+    employeeName: String,
+    department: String,
+
+    // Expense details
+    category: {
+      type: String,
+      enum: ['travel', 'fuel', 'phone', 'lodging', 'food', 'office', 'loading', 'unloading',
+             'vehicle_repair', 'warehouse', 'marketing', 'staff_welfare', 'courier', 'miscellaneous'],
+      required: true,
+    },
+    amount: { type: Number, required: true, min: 0 },
+    expenseDate: { type: Date, required: true },
+    description: { type: String, required: true },
+
+    // Reference
+    dealerRef: { type: String, default: '' },  // if expense is for a dealer visit
+    tripRef: { type: String, default: '' },    // trip/dispatch reference
+
+    // Evidence
+    billUpload: [String],  // bill/receipt image URLs
+    photoUpload: [String], // additional photos
+    gpsLocation: { lat: Number, lng: Number },
+
+    // Approval
+    approvalManager: { type: mongoose.Schema.Types.ObjectId, ref: 'User' },
+    status: {
+      type: String,
+      enum: ['pending', 'approved', 'rejected', 'reimbursed', 'cancelled'],
+      default: 'pending',
+    },
+    approvedBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User' },
+    approvedAt: Date,
+    rejectionReason: String,
+    reimbursementDate: Date,
+    reimbursementRef: String, // payment reference
+
+    remarks: { type: String, default: '' },
+    createdBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User' },
   },
   { timestamps: true }
 );
 
-expenseSchema.index({ expenseDate: -1 });
-expenseSchema.index({ status: 1 });
-expenseSchema.index({ employee: 1 });
+expenseSchema.index({ expenseNumber: 1 });
+expenseSchema.index({ employee: 1, status: 1 });
+expenseSchema.index({ status: 1, expenseDate: -1 });
 
-const Expense = mongoose.model('Expense', expenseSchema);
-export default Expense;
+export default mongoose.model('Expense', expenseSchema);

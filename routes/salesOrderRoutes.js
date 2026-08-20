@@ -75,6 +75,136 @@ router.get('/stats', requirePermission('sales.order.dashboard'), async (req, res
   } catch (error) { res.status(500).json({ success: false, message: error.message }); }
 });
 
+// GET /api/v1/sales-orders/search-dealers — autocomplete for dealer selection (paginated)
+router.get('/search-dealers', requirePermission('sales.order.create'), async (req, res) => {
+  try {
+    const { q, page = 1, limit = 20, pricingTier } = req.query;
+    const p = Math.max(1, parseInt(page));
+    const l = Math.min(50, parseInt(limit) || 20);
+
+    let filter = { status: 'active' };
+    if (q && q.length >= 2) {
+      const regex = new RegExp(q, 'i');
+      filter.$or = [{ businessName: regex }, { dealerCode: regex }, { mobile: regex }, { ownerName: regex }];
+    }
+
+    // Filter by pricingTier (dealer type's rate tier)
+    if (pricingTier) {
+      const DealerType = (await import('../models/DealerType.js')).default;
+      const matchingTypes = await DealerType.find({ pricingTier, status: 'active' }).select('_id').lean();
+      const typeIds = matchingTypes.map(t => t._id);
+      if (typeIds.length > 0) {
+        filter.dealerType = { $in: typeIds };
+      } else {
+        return res.json({ success: true, data: [] });
+      }
+    }
+
+    const dealers = await Dealer.find(filter)
+      .sort({ businessName: 1 })
+      .skip((p - 1) * l)
+      .limit(l)
+      .select('businessName dealerCode ownerName mobile city creditLimit creditDays currentOutstanding priceTier dealerType')
+      .populate('dealerType', 'name pricingTier')
+      .lean();
+    res.json({ success: true, data: dealers });
+  } catch (error) { res.status(500).json({ success: false, message: error.message }); }
+});
+
+// GET /api/v1/sales-orders/search-products — autocomplete for product selection (paginated)
+router.get('/search-products', requirePermission('sales.order.create'), async (req, res) => {
+  try {
+    const { q, brand, category, page = 1, limit = 20, dealerType = 'dealer' } = req.query;
+    const p = Math.max(1, parseInt(page));
+    const l = Math.min(50, parseInt(limit) || 20);
+    
+    let filter = { status: 'active' };
+    if (q && q.length >= 2) {
+      const regex = new RegExp(q, 'i');
+      filter.$or = [{ itemName: regex }, { productCode: regex }, { aliasName: regex }, { barcode: regex }];
+    }
+    if (brand) filter.brand = brand;
+    if (category) filter.category = category;
+
+    const products = await Product.find(filter)
+      .sort({ itemName: 1 })
+      .skip((p - 1) * l)
+      .limit(l)
+      .select('productCode itemName tileSize finish colour unit mrp dealerRate wholesaleRate retailRate distributorRate builderRate projectRate minimumSellingRate gst piecesPerBox sqftPerBox basicPrice excessPrice images brand category subcategory')
+      .populate('brand', 'name')
+      .lean();
+
+    // Attach live stock qty
+    const Stock = (await import('../models/Stock.js')).default;
+    const productIds = products.map(pr => pr._id);
+    const stockData = await Stock.aggregate([
+      { $match: { product: { $in: productIds } } },
+      { $group: { _id: '$product', availableQty: { $sum: '$availableQty' } } },
+    ]);
+    const stockMap = {};
+    stockData.forEach(s => { stockMap[String(s._id)] = s; });
+
+    // Resolve applicable discounts for all products in batch
+    const DiscountMapping = (await import('../models/DiscountMapping.js')).default;
+    const discountMap = await DiscountMapping.bulkResolveDiscounts(products, dealerType);
+
+    // Rate key based on dealer type
+    const RATE_KEY = {
+      dealer: 'dealerRate', wholesaler: 'wholesaleRate', retail: 'retailRate',
+      distributor: 'distributorRate', builder: 'builderRate',
+    };
+    const rateField = RATE_KEY[dealerType] || 'dealerRate';
+
+    const enriched = products.map(pr => {
+      const baseRate = pr[rateField] || pr.dealerRate || pr.mrp || 0;
+      const rule = discountMap[String(pr._id)];
+      let discountInfo = null;
+
+      if (rule) {
+        let discountAmt = 0;
+        if (rule.discountType === 'slab') {
+          // For search results, show the first slab's discount as preview (qty=1)
+          const firstSlab = (rule.slabs || []).find(s => 1 >= s.minQty && (s.maxQty === 0 || 1 <= s.maxQty));
+          if (firstSlab) {
+            if (firstSlab.discountPercentage > 0) discountAmt += (baseRate * firstSlab.discountPercentage) / 100;
+            if (firstSlab.discountFlat > 0) discountAmt += firstSlab.discountFlat;
+          }
+        } else {
+          if (rule.discountType === 'percentage' || rule.discountType === 'both') {
+            discountAmt += (baseRate * rule.discountPercentage) / 100;
+          }
+          if (rule.discountType === 'flat' || rule.discountType === 'both') {
+            discountAmt += rule.discountFlat;
+          }
+        }
+        const maxAmt = (baseRate * rule.maxDiscountPercentage) / 100;
+        discountAmt = Math.min(discountAmt, maxAmt);
+
+        discountInfo = {
+          ruleId: rule._id,
+          ruleName: rule.ruleName,
+          targetType: rule.targetType,
+          targetName: rule.targetName,
+          discountType: rule.discountType,
+          discountPercentage: rule.discountPercentage,
+          discountFlat: rule.discountFlat,
+          slabs: rule.slabs || [],
+          discountAmount: Math.round(discountAmt * 100) / 100,
+          effectiveRate: Math.round(Math.max(0, baseRate - discountAmt) * 100) / 100,
+        };
+      }
+
+      return {
+        ...pr,
+        stockAvailable: stockMap[String(pr._id)]?.availableQty || 0,
+        discount: discountInfo,
+      };
+    });
+
+    res.json({ success: true, data: enriched });
+  } catch (error) { res.status(500).json({ success: false, message: error.message }); }
+});
+
 // GET /api/v1/sales-orders/:id
 router.get('/:id', requirePermission('sales.order.dashboard'), async (req, res) => {
   try {
@@ -94,9 +224,9 @@ router.post('/', requirePermission('sales.order.create'), async (req, res) => {
   try {
     const data = { ...req.body, createdBy: req.user._id };
 
-    // Auto-generate order number
-    const count = await SalesOrder.countDocuments();
-    data.orderNumber = `SO-${String(count + 1).padStart(5, '0')}`;
+    // Auto-generate order number (checks recycle bin too)
+    const { generateUniqueCode } = await import('../utils/codeGenerator.js');
+    data.orderNumber = await generateUniqueCode(SalesOrder, 'orderNumber', 'SO-', 5);
 
     // Fetch dealer info for denormalization
     if (data.dealer) {
@@ -232,49 +362,14 @@ router.patch('/:id/status', requirePermission('sales.order.dashboard'), async (r
 // DELETE /api/v1/sales-orders/:id — only draft orders
 router.delete('/:id', requirePermission('sales.order.create'), async (req, res) => {
   try {
-    const order = await SalesOrder.findById(req.params.id);
-    if (!order) return res.status(404).json({ success: false, message: 'Order not found.' });
-    if (order.status !== 'draft') {
-      return res.status(400).json({ success: false, message: 'Only draft orders can be deleted. Cancel approved orders instead.' });
-    }
-    await SalesOrder.findByIdAndDelete(req.params.id);
-    res.json({ success: true, message: 'Draft order deleted.' });
-  } catch (error) { res.status(500).json({ success: false, message: error.message }); }
-});
-
-// GET /api/v1/sales-orders/search-dealers — autocomplete for dealer selection
-router.get('/search-dealers', requirePermission('sales.order.create'), async (req, res) => {
-  try {
-    const { q } = req.query;
-    if (!q || q.length < 2) return res.json({ success: true, data: [] });
-    const regex = new RegExp(q, 'i');
-    const dealers = await Dealer.find({
-      status: 'active',
-      $or: [{ businessName: regex }, { dealerCode: regex }, { mobile: regex }, { ownerName: regex }],
-    }).limit(15).select('businessName dealerCode ownerName mobile city creditLimit creditDays currentOutstanding priceTier').lean();
-    res.json({ success: true, data: dealers });
-  } catch (error) { res.status(500).json({ success: false, message: error.message }); }
-});
-
-// GET /api/v1/sales-orders/search-products — autocomplete for product selection
-router.get('/search-products', requirePermission('sales.order.create'), async (req, res) => {
-  try {
-    const { q, brand, category } = req.query;
-    if (!q || q.length < 2) return res.json({ success: true, data: [] });
-    const regex = new RegExp(q, 'i');
-    let filter = {
-      status: 'active',
-      $or: [{ itemName: regex }, { productCode: regex }, { aliasName: regex }, { barcode: regex }],
-    };
-    if (brand) filter.brand = brand;
-    if (category) filter.category = category;
-
-    const products = await Product.find(filter)
-      .limit(20)
-      .select('productCode itemName tileSize finish colour unit mrp dealerRate wholesaleRate retailRate minimumSellingRate gst piecesPerBox sqftPerBox')
-      .populate('brand', 'name')
-      .lean();
-    res.json({ success: true, data: products });
+    const { safeDelete } = await import('../middleware/safeDelete.js');
+    const result = await safeDelete(SalesOrder, req.params.id, {
+      user: req.user,
+      module: 'sales_order',
+      titleField: 'dealerName',
+      codeField: 'orderNumber',
+    });
+    res.status(result.status || 200).json(result);
   } catch (error) { res.status(500).json({ success: false, message: error.message }); }
 });
 
