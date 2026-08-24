@@ -292,6 +292,12 @@ router.post('/', requirePermission('sales.order.create'), async (req, res) => {
     data.tallySyncStatus = 'not_synced';
 
     const order = await SalesOrder.create(data);
+
+    // Increment dealer outstanding when confirmed order is created
+    if (order.status === 'confirmed' && order.dealer && order.grandTotal > 0) {
+      await Dealer.findByIdAndUpdate(order.dealer, { $inc: { currentOutstanding: order.grandTotal } });
+    }
+
     res.status(201).json({ success: true, message: 'Sales Order created.', data: order });
   } catch (error) {
     if (error.code === 11000) return res.status(400).json({ success: false, message: 'Order number exists.' });

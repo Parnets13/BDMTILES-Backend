@@ -4,42 +4,110 @@ const followupSchema = new mongoose.Schema({
   date: { type: Date, default: Date.now },
   notes: String,
   nextFollowupDate: Date,
-  outcome: { type: String, enum: ['interested', 'not_interested', 'callback', 'converted', 'no_response'], default: 'callback' },
+  outcome: { type: String, enum: ['interested', 'not_interested', 'callback', 'converted', 'no_response', 'visit_scheduled', 'quotation_sent'], default: 'callback' },
   doneBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User' },
+  doneByName: String,
+});
+
+const assignmentHistorySchema = new mongoose.Schema({
+  assignedTo: { type: mongoose.Schema.Types.ObjectId, ref: 'User' },
+  assignedToName: String,
+  assignedBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User' },
+  assignedByName: String,
+  assignedAt: { type: Date, default: Date.now },
+  response: { type: String, enum: ['pending', 'accepted', 'declined', 'reassigned', 'timeout'], default: 'pending' },
+  respondedAt: Date,
+  declineReason: String,
+  seStatus: String, // SE's status at time of assignment
 });
 
 const leadSchema = new mongoose.Schema(
   {
     leadNumber: { type: String, unique: true, required: true },
+
+    // Customer Info
     name: { type: String, required: true },
     phone: { type: String, required: true },
+    alternatePhone: String,
     email: String,
     businessName: String,
     city: String,
+    state: String,
     address: String,
-    source: { type: String, enum: ['walk_in', 'referral', 'online', 'cold_call', 'exhibition', 'social_media', 'other'], default: 'other' },
-    interestedIn: [String], // product categories
+    pinCode: String,
+
+    // Customer Type — how they came to us
+    customerType: {
+      type: String,
+      enum: ['walk_in', 'phone_enquiry', 'referral', 'online_enquiry', 'whatsapp', 'exhibition', 'architect_referral', 'dealer_referral', 'google_ads', 'facebook', 'instagram', 'existing_customer', 'other'],
+      default: 'walk_in',
+    },
+    referredBy: String, // name of person who referred
+
+    // Interest
+    interestedIn: [String], // product categories/brands
+    interestedProducts: [String], // specific product names/codes
+    estimatedArea: { type: Number, default: 0 }, // sqft
     estimatedValue: { type: Number, default: 0 },
+    projectType: { type: String, enum: ['residential', 'commercial', 'hospitality', 'industrial', 'renovation', 'other'], default: 'residential' },
+
+    // Priority & Status
     priority: { type: String, enum: ['low', 'medium', 'high', 'hot'], default: 'medium' },
     status: {
       type: String,
-      enum: ['new', 'contacted', 'qualified', 'proposal_sent', 'negotiation', 'won', 'lost', 'on_hold'],
+      enum: ['new', 'assigned', 'accepted', 'contacted', 'qualified', 'proposal_sent', 'negotiation', 'site_visit', 'won', 'lost', 'on_hold'],
       default: 'new',
     },
     lostReason: String,
+
+    // SE Assignment — current
+    assignedTo: { type: mongoose.Schema.Types.ObjectId, ref: 'User' },
+    assignedToName: String,
+    assignmentStatus: { type: String, enum: ['unassigned', 'pending', 'accepted', 'declined', 'reassigned'], default: 'unassigned' },
+    assignedAt: Date,
+    acceptedAt: Date,
+    declinedAt: Date,
+    declineReason: String,
+
+    // Assignment History (tracks all assignments/reassignments)
+    assignmentHistory: [assignmentHistorySchema],
+
+    // Follow-ups
     followups: [followupSchema],
     nextFollowupDate: Date,
-    assignedTo: { type: mongoose.Schema.Types.ObjectId, ref: 'User' },
+    lastContactDate: Date,
+    totalFollowups: { type: Number, default: 0 },
+
+    // Conversion
     convertedToDealer: { type: mongoose.Schema.Types.ObjectId, ref: 'Dealer' },
+    convertedToCustomer: { type: mongoose.Schema.Types.ObjectId, ref: 'Customer' },
     convertedAt: Date,
+    conversionValue: { type: Number, default: 0 }, // actual order value
+
+    // Incentive Tracking
+    incentiveEligible: { type: Boolean, default: false },
+    incentiveAmount: { type: Number, default: 0 },
+    incentivePaid: { type: Boolean, default: false },
+    incentivePaidDate: Date,
+
+    // Quotation linked
+    quotation: { type: mongoose.Schema.Types.ObjectId, ref: 'Quotation' },
+    quotationNumber: String,
+
+    // Metadata
     remarks: String,
+    tags: [String],
     createdBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User' },
+    createdByName: String,
   },
   { timestamps: true }
 );
 
 leadSchema.index({ leadNumber: 1 });
 leadSchema.index({ status: 1, nextFollowupDate: 1 });
-leadSchema.index({ assignedTo: 1 });
+leadSchema.index({ assignedTo: 1, assignmentStatus: 1 });
+leadSchema.index({ customerType: 1 });
+leadSchema.index({ createdAt: -1 });
+leadSchema.index({ assignmentStatus: 1, createdAt: -1 }); // for queue: unassigned first
 
 export default mongoose.model('Lead', leadSchema);

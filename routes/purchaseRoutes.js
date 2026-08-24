@@ -114,11 +114,9 @@ router.patch('/purchase-orders/:id/status', requirePermission('po.management'), 
 
 router.delete('/purchase-orders/:id', requirePermission('po.management'), async (req, res) => {
   try {
-    const po = await PurchaseOrder.findById(req.params.id);
-    if (!po) return res.status(404).json({ success: false, message: 'Not found.' });
-    if (po.status !== 'draft') return res.status(400).json({ success: false, message: 'Only draft POs can be deleted.' });
-    await PurchaseOrder.findByIdAndDelete(req.params.id);
-    res.json({ success: true, message: 'PO deleted.' });
+    const { safeDelete } = await import('../middleware/safeDelete.js');
+    const result = await safeDelete(PurchaseOrder, req.params.id, { user: req.user, module: 'purchase', titleField: 'supplierName', codeField: 'poNumber' });
+    res.status(result.status || 200).json(result);
   } catch (e) { res.status(500).json({ success: false, message: e.message }); }
 });
 
@@ -141,20 +139,20 @@ router.get('/grn', requirePermission('grn.entry'), async (req, res) => {
   } catch (e) { res.status(500).json({ success: false, message: e.message }); }
 });
 
-router.get('/grn/:id', requirePermission('grn.entry'), async (req, res) => {
-  try {
-    const grn = await GRN.findById(req.params.id).populate('supplier', 'companyName').populate('items.product', 'productCode itemName').populate('items.warehouse', 'name').lean();
-    if (!grn) return res.status(404).json({ success: false, message: 'GRN not found.' });
-    res.json({ success: true, data: grn });
-  } catch (e) { res.status(500).json({ success: false, message: e.message }); }
-});
-
-// Get approved POs for GRN creation
+// Get approved POs for GRN creation — MUST be before /grn/:id to avoid route conflict
 router.get('/grn/available-pos', requirePermission('grn.entry'), async (req, res) => {
   try {
     const pos = await PurchaseOrder.find({ status: { $in: ['approved', 'sent', 'partial_received'] } })
       .select('poNumber supplierName poDate items grandTotal status').populate('supplier', 'companyName').lean();
     res.json({ success: true, data: pos });
+  } catch (e) { res.status(500).json({ success: false, message: e.message }); }
+});
+
+router.get('/grn/:id', requirePermission('grn.entry'), async (req, res) => {
+  try {
+    const grn = await GRN.findById(req.params.id).populate('supplier', 'companyName').populate('items.product', 'productCode itemName').populate('items.warehouse', 'name').lean();
+    if (!grn) return res.status(404).json({ success: false, message: 'GRN not found.' });
+    res.json({ success: true, data: grn });
   } catch (e) { res.status(500).json({ success: false, message: e.message }); }
 });
 
@@ -192,6 +190,11 @@ router.patch('/grn/:id/approve', requirePermission('grn.entry'), async (req, res
     await grn.save();
     // Update stock
     await updateStockFromGRN(grn);
+    // Increment supplier outstanding (they now owe us goods = we owe them money)
+    if (grn.supplier) {
+      const totalGRNValue = grn.items.reduce((sum, item) => sum + ((item.acceptedQty || 0) * (item.rate || 0)), 0);
+      await Supplier.findByIdAndUpdate(grn.supplier, { $inc: { currentOutstanding: totalGRNValue } });
+    }
     res.json({ success: true, message: 'GRN approved. Stock updated.', data: grn });
   } catch (e) { res.status(500).json({ success: false, message: e.message }); }
 });
@@ -305,6 +308,246 @@ router.post('/stock/transfer', requirePermission('stock.transfer'), async (req, 
       { upsert: true, new: true }
     );
     res.json({ success: true, message: `${quantity} units transferred.` });
+  } catch (e) { res.status(500).json({ success: false, message: e.message }); }
+});
+
+// ═══════════════════════════════════════
+// STOCK ALERTS (Low Stock)
+// ═══════════════════════════════════════
+router.get('/stock/alerts', requirePermission('stock.view'), async (req, res) => {
+  try {
+    const { threshold = 10, warehouse } = req.query;
+    const minQty = parseInt(threshold) || 10;
+    let filter = { availableQty: { $lte: minQty, $gte: 0 } };
+    if (warehouse) filter.warehouse = warehouse;
+
+    const lowStockItems = await Stock.find(filter)
+      .sort({ availableQty: 1 })
+      .limit(100)
+      .populate('product', 'productCode itemName tileSize images mrp reorderLevel')
+      .populate('warehouse', 'name')
+      .lean();
+
+    // Also find zero-stock items
+    const zeroStock = await Stock.countDocuments({ ...filter, availableQty: 0 });
+    const criticalStock = await Stock.countDocuments({ ...filter, availableQty: { $lte: 5, $gte: 1 } });
+
+    res.json({
+      success: true,
+      data: {
+        items: lowStockItems,
+        summary: { total: lowStockItems.length, zeroStock, criticalStock, threshold: minQty },
+      },
+    });
+  } catch (e) { res.status(500).json({ success: false, message: e.message }); }
+});
+
+// ═══════════════════════════════════════
+// PHYSICAL AUDIT (Stock Count)
+// ═══════════════════════════════════════
+
+// GET /api/v1/purchase/audit/pending — get products to audit for a warehouse
+router.get('/audit/pending', requirePermission('stock.adjustment'), async (req, res) => {
+  try {
+    const { warehouse } = req.query;
+    if (!warehouse) return res.status(400).json({ success: false, message: 'Warehouse is required.' });
+
+    const stocks = await Stock.find({ warehouse, availableQty: { $gt: 0 } })
+      .populate('product', 'productCode itemName tileSize images brand')
+      .populate('warehouse', 'name')
+      .sort({ 'product.itemName': 1 })
+      .lean();
+
+    res.json({ success: true, data: stocks });
+  } catch (e) { res.status(500).json({ success: false, message: e.message }); }
+});
+
+// POST /api/v1/purchase/audit/submit — submit physical count and calculate discrepancy
+router.post('/audit/submit', requirePermission('stock.adjustment'), async (req, res) => {
+  try {
+    const { warehouse, counts, auditedBy, remarks } = req.body;
+    // counts: [{ stockId, physicalCount }]
+    if (!warehouse || !counts?.length) {
+      return res.status(400).json({ success: false, message: 'Warehouse and counts required.' });
+    }
+
+    const results = [];
+    let totalDiscrepancy = 0;
+    let adjustedCount = 0;
+
+    for (const count of counts) {
+      const stock = await Stock.findById(count.stockId);
+      if (!stock) continue;
+
+      const systemQty = stock.availableQty;
+      const physicalQty = parseInt(count.physicalCount) || 0;
+      const discrepancy = physicalQty - systemQty;
+
+      if (discrepancy !== 0) {
+        // Auto-adjust stock to match physical count
+        stock.availableQty = physicalQty;
+        stock.totalQty = stock.totalQty + discrepancy;
+        await stock.save();
+        adjustedCount++;
+        totalDiscrepancy += Math.abs(discrepancy);
+      }
+
+      results.push({
+        stockId: stock._id,
+        product: stock.product,
+        systemQty,
+        physicalQty,
+        discrepancy,
+        adjusted: discrepancy !== 0,
+      });
+    }
+
+    res.json({
+      success: true,
+      message: `Audit complete. ${adjustedCount} items adjusted. Total discrepancy: ${totalDiscrepancy} units.`,
+      data: {
+        totalItems: counts.length,
+        adjustedItems: adjustedCount,
+        totalDiscrepancy,
+        results,
+      },
+    });
+  } catch (e) { res.status(500).json({ success: false, message: e.message }); }
+});
+
+// ═══════════════════════════════════════
+// REORDER SUGGESTIONS (Out-of-stock → PO)
+// ═══════════════════════════════════════
+
+// GET /api/v1/purchase/stock/reorder-suggestions — products below reorder level with suggested PO
+router.get('/stock/reorder-suggestions', requirePermission('stock.view'), async (req, res) => {
+  try {
+    const { warehouse } = req.query;
+
+    // 1. Get all products with reorderLevel > 0
+    const products = await Product.find({ reorderLevel: { $gt: 0 }, status: 'active' })
+      .select('productCode itemName brand category tileSize reorderLevel minStockLevel images basicPrice')
+      .populate('brand', 'name')
+      .lean();
+
+    if (!products.length) return res.json({ success: true, data: [] });
+
+    // 2. Get current stock per product (aggregated across all warehouses or specific)
+    const stockFilter = warehouse ? { warehouse } : {};
+    const stockAgg = await Stock.aggregate([
+      { $match: stockFilter },
+      { $group: { _id: '$product', currentStock: { $sum: '$availableQty' }, lastRate: { $max: '$purchaseRate' } } },
+    ]);
+    const stockMap = {};
+    stockAgg.forEach(s => { stockMap[String(s._id)] = s; });
+
+    // 3. Find products below reorder level
+    const suggestions = [];
+    for (const prod of products) {
+      const stock = stockMap[String(prod._id)] || { currentStock: 0, lastRate: 0 };
+      if (stock.currentStock <= prod.reorderLevel) {
+        // Suggested quantity = reorderLevel × 2 - current stock (replenish to 2× reorder level)
+        const suggestedQty = Math.max(prod.reorderLevel * 2 - stock.currentStock, prod.minStockLevel || 10);
+
+        // Find last supplier from GRN
+        const lastGRN = await GRN.findOne({ 'items.product': prod._id, status: { $in: ['approved', 'posted'] } })
+          .sort({ createdAt: -1 }).select('supplier supplierName').lean();
+
+        suggestions.push({
+          product: prod._id,
+          productCode: prod.productCode,
+          productName: prod.itemName,
+          productImage: prod.images?.[0] || '',
+          brand: prod.brand?.name || '',
+          tileSize: prod.tileSize || '',
+          reorderLevel: prod.reorderLevel,
+          currentStock: stock.currentStock,
+          deficit: prod.reorderLevel - stock.currentStock,
+          suggestedQty,
+          lastPurchaseRate: stock.lastRate || prod.basicPrice || 0,
+          suggestedSupplier: lastGRN?.supplier || null,
+          suggestedSupplierName: lastGRN?.supplierName || 'No supplier history',
+          isZeroStock: stock.currentStock <= 0,
+          urgency: stock.currentStock <= 0 ? 'critical' : stock.currentStock <= prod.reorderLevel / 2 ? 'high' : 'medium',
+        });
+      }
+    }
+
+    // Sort by urgency (critical first)
+    const urgencyOrder = { critical: 0, high: 1, medium: 2 };
+    suggestions.sort((a, b) => urgencyOrder[a.urgency] - urgencyOrder[b.urgency]);
+
+    res.json({
+      success: true,
+      data: suggestions,
+      summary: {
+        total: suggestions.length,
+        critical: suggestions.filter(s => s.urgency === 'critical').length,
+        high: suggestions.filter(s => s.urgency === 'high').length,
+        medium: suggestions.filter(s => s.urgency === 'medium').length,
+      },
+    });
+  } catch (e) { res.status(500).json({ success: false, message: e.message }); }
+});
+
+// POST /api/v1/purchase/stock/create-po-from-suggestions — one-click PO creation from suggestions
+router.post('/stock/create-po-from-suggestions', requirePermission('po.management'), async (req, res) => {
+  try {
+    const { supplier, items, remarks } = req.body;
+    // items: [{ product, productName, productCode, quantity, rate, gstPercentage }]
+
+    if (!supplier) return res.status(400).json({ success: false, message: 'Supplier is required.' });
+    if (!items?.length) return res.status(400).json({ success: false, message: 'At least one item is required.' });
+
+    const { generateUniqueCode } = await import('../utils/codeGenerator.js');
+    const poNumber = await generateUniqueCode(PurchaseOrder, 'poNumber', 'PO-', 5);
+
+    // Get supplier name
+    const sup = await Supplier.findById(supplier).lean();
+    const supplierName = sup?.companyName || '';
+
+    // Calculate totals
+    let subtotal = 0, totalTax = 0;
+    const processedItems = items.map(item => {
+      const base = (item.quantity || 0) * (item.rate || 0);
+      const gst = (base * (item.gstPercentage || 18)) / 100;
+      subtotal += base;
+      totalTax += gst;
+      return {
+        product: item.product,
+        productName: item.productName || '',
+        productCode: item.productCode || '',
+        quantity: item.quantity || 0,
+        rate: item.rate || 0,
+        gstPercentage: item.gstPercentage || 18,
+        gstAmount: Math.round(gst * 100) / 100,
+        totalAmount: Math.round((base + gst) * 100) / 100,
+        pendingQty: item.quantity || 0,
+      };
+    });
+
+    const grandTotal = Math.round(subtotal + totalTax);
+
+    const po = await PurchaseOrder.create({
+      poNumber,
+      poDate: new Date(),
+      supplier,
+      supplierName,
+      items: processedItems,
+      subtotal: Math.round(subtotal * 100) / 100,
+      totalTax: Math.round(totalTax * 100) / 100,
+      grandTotal,
+      status: 'draft',
+      remarks: remarks || 'Auto-generated from stock reorder suggestions',
+      tallySyncStatus: 'not_synced',
+      createdBy: req.user._id,
+    });
+
+    res.status(201).json({
+      success: true,
+      message: `Purchase Order ${poNumber} created from reorder suggestions.`,
+      data: po,
+    });
   } catch (e) { res.status(500).json({ success: false, message: e.message }); }
 });
 

@@ -66,14 +66,16 @@ router.get('/:id', requirePermission('cheque.management'), async (req, res) => {
 // POST /api/v1/cheques — add cheque
 router.post('/', requirePermission('cheque.management'), async (req, res) => {
   try {
-    const data = { ...req.body, createdBy: req.user._id };
+    const data = { ...req.body, createdBy: req.user._id, createdByName: req.user.name };
     if (data.dealer) {
       const d = await Dealer.findById(data.dealer).lean();
-      if (d) data.partyName = d.businessName;
+      if (d) { data.partyName = d.businessName; data.partyPhone = d.mobile || ''; }
     } else if (data.supplier) {
       const s = await Supplier.findById(data.supplier).lean();
-      if (s) data.partyName = s.companyName;
+      if (s) { data.partyName = s.companyName; data.partyPhone = s.mobile || ''; }
     }
+    // Initialize timeline
+    data.timeline = [{ action: 'received', performedBy: req.user._id, performedByName: req.user.name, notes: 'Cheque received and recorded' }];
     const cheque = await Cheque.create(data);
     res.status(201).json({ success: true, message: 'Cheque recorded.', data: cheque });
   } catch (e) { res.status(500).json({ success: false, message: e.message }); }
@@ -84,11 +86,14 @@ router.patch('/:id/deposit', requirePermission('cheque.management'), async (req,
   try {
     const cheque = await Cheque.findById(req.params.id);
     if (!cheque) return res.status(404).json({ success: false, message: 'Not found.' });
-    if (cheque.status !== 'received') return res.status(400).json({ success: false, message: 'Only "received" cheques can be deposited.' });
+    if (!['received', 're_deposited'].includes(cheque.status)) return res.status(400).json({ success: false, message: 'Only received/re-deposited cheques can be deposited.' });
     cheque.status = 'deposited';
     cheque.depositedDate = req.body.depositedDate || new Date();
     cheque.depositedBank = req.body.depositedBank || '';
     cheque.depositedBranch = req.body.depositedBranch || '';
+    cheque.depositedAccountNumber = req.body.depositedAccountNumber || '';
+    cheque.depositSlipNumber = req.body.depositSlipNumber || '';
+    cheque.timeline.push({ action: 'deposited', performedBy: req.user._id, performedByName: req.user.name, notes: `Deposited at ${req.body.depositedBank || 'bank'}` });
     await cheque.save();
     res.json({ success: true, message: 'Cheque deposited.', data: cheque });
   } catch (e) { res.status(500).json({ success: false, message: e.message }); }
@@ -102,6 +107,8 @@ router.patch('/:id/clear', requirePermission('cheque.management'), async (req, r
     if (cheque.status !== 'deposited') return res.status(400).json({ success: false, message: 'Only deposited cheques can be cleared.' });
     cheque.status = 'cleared';
     cheque.clearedDate = req.body.clearedDate || new Date();
+    cheque.clearanceReference = req.body.clearanceReference || '';
+    cheque.timeline.push({ action: 'cleared', performedBy: req.user._id, performedByName: req.user.name, notes: `Cleared on ${new Date().toLocaleDateString('en-IN')}` });
     await cheque.save();
     res.json({ success: true, message: 'Cheque cleared.', data: cheque });
   } catch (e) { res.status(500).json({ success: false, message: e.message }); }
@@ -116,12 +123,43 @@ router.patch('/:id/bounce', requirePermission('cheque.management'), async (req, 
     cheque.bounceDate = new Date();
     cheque.bounceReason = req.body.reason || '';
     cheque.bounceCharges = req.body.charges || 0;
+    cheque.bounceCount = (cheque.bounceCount || 0) + 1;
+    cheque.timeline.push({ action: 'bounced', performedBy: req.user._id, performedByName: req.user.name, notes: `Bounced: ${req.body.reason || 'No reason'} · Charges: ₹${req.body.charges || 0}` });
     await cheque.save();
     // Update dealer outstanding — amount comes back + charges
     if (cheque.chequeType === 'received' && cheque.dealer) {
       await Dealer.findByIdAndUpdate(cheque.dealer, { $inc: { currentOutstanding: cheque.amount + (cheque.bounceCharges || 0) } });
     }
     res.json({ success: true, message: 'Cheque marked bounced.', data: cheque });
+  } catch (e) { res.status(500).json({ success: false, message: e.message }); }
+});
+
+// PATCH /api/v1/cheques/:id/re-deposit — re-deposit a bounced cheque
+router.patch('/:id/re-deposit', requirePermission('cheque.management'), async (req, res) => {
+  try {
+    const cheque = await Cheque.findById(req.params.id);
+    if (!cheque) return res.status(404).json({ success: false, message: 'Not found.' });
+    if (cheque.status !== 'bounced') return res.status(400).json({ success: false, message: 'Only bounced cheques can be re-deposited.' });
+    cheque.status = 're_deposited';
+    cheque.reDepositDate = new Date();
+    cheque.reDepositCount = (cheque.reDepositCount || 0) + 1;
+    cheque.timeline.push({ action: 're_deposited', performedBy: req.user._id, performedByName: req.user.name, notes: `Re-deposited (attempt ${cheque.reDepositCount})` });
+    await cheque.save();
+    res.json({ success: true, message: 'Cheque re-deposited.', data: cheque });
+  } catch (e) { res.status(500).json({ success: false, message: e.message }); }
+});
+
+// PATCH /api/v1/cheques/:id/return — return cheque to party
+router.patch('/:id/return', requirePermission('cheque.management'), async (req, res) => {
+  try {
+    const cheque = await Cheque.findById(req.params.id);
+    if (!cheque) return res.status(404).json({ success: false, message: 'Not found.' });
+    cheque.status = 'returned';
+    cheque.returnedDate = new Date();
+    cheque.returnReason = req.body.reason || '';
+    cheque.timeline.push({ action: 'returned', performedBy: req.user._id, performedByName: req.user.name, notes: `Returned to ${cheque.partyName}: ${req.body.reason || ''}` });
+    await cheque.save();
+    res.json({ success: true, message: 'Cheque returned.', data: cheque });
   } catch (e) { res.status(500).json({ success: false, message: e.message }); }
 });
 

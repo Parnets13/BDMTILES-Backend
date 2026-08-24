@@ -134,12 +134,14 @@ router.post('/attendance/punch-out', requirePermission('attendance.master'), asy
 
 router.post('/attendance/mark', requirePermission('attendance.master'), async (req, res) => {
   try {
-    const { employee, date, status, remarks } = req.body;
+    const { employee, date, status, remarks, punchIn, punchOut } = req.body;
     const d = new Date(date); d.setHours(0,0,0,0);
     let record = await Attendance.findOne({ employee, date: d });
     if (!record) record = new Attendance({ employee, date: d });
     record.status = status;
     record.remarks = remarks || '';
+    if (punchIn) record.punchIn = punchIn;
+    if (punchOut) record.punchOut = punchOut;
     record.markedBy = req.user._id;
     record.source = 'Manual';
     await record.save();

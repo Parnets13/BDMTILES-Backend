@@ -32,7 +32,8 @@ export const protect = async (req, res, next) => {
 };
 
 export const requirePermission = (permission) => (req, res, next) => {
-  if (req.user.role === 'super_admin') return next();
+  // Super Admin and Owner have full unrestricted access
+  if (req.user.role === 'super_admin' || req.user.role === 'owner') return next();
 
   const perms = req.user.permissions || [];
   const mod = permission.split('.')[0];
@@ -42,4 +43,37 @@ export const requirePermission = (permission) => (req, res, next) => {
     return res.status(403).json({ success: false, message: `Access denied: ${permission}` });
   }
   next();
+};
+
+
+/**
+ * Data access filter — applies time-based restrictions based on NotificationSettings.dataAccess
+ * Usage in routes: const dateFilter = await getDataAccessFilter(req.user, 'lead');
+ * Returns a MongoDB filter object like { createdAt: { $gte: ... } } or {} (no restriction)
+ */
+export const getDataAccessFilter = async (user, module) => {
+  // Super admin and owner always see everything
+  if (['super_admin', 'owner'].includes(user.role)) return {};
+
+  try {
+    const NotificationSettings = (await import('../models/NotificationSettings.js')).default;
+    const settings = await NotificationSettings.findOne({ module }).lean();
+
+    if (!settings || !settings.dataAccess?.restrictByTime) return {};
+
+    // Check if user's role is exempt
+    if (settings.dataAccess.exemptRoles?.includes(user.role)) return {};
+
+    // Apply time window restriction
+    const days = settings.dataAccess.accessWindowDays;
+    if (days > 0) {
+      const cutoff = new Date();
+      cutoff.setDate(cutoff.getDate() - days);
+      return { createdAt: { $gte: cutoff } };
+    }
+  } catch (e) {
+    console.error('getDataAccessFilter error:', e.message);
+  }
+
+  return {};
 };

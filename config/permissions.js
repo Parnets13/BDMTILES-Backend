@@ -118,48 +118,130 @@ export const AVAILABLE_PERMISSIONS = {
 };
 
 /**
- * Default permissions per role (assigned on user creation)
+ * Default permissions per role (assigned on user creation).
+ * Super Admin and Owner get ALL access via auth middleware bypass.
+ * These presets are applied when creating a user with that role.
  */
 export const ROLE_DEFAULT_PERMISSIONS = {
-  super_admin: ['*'],  // All access
-  admin: ['*'],
-  owner: ['dashboard.view', 'reports.*', 'activity.logs', 'audit.trail'],
+  super_admin: ['*'],  // All access — bypasses permission check in middleware
+  owner: ['*'],        // All access — bypasses permission check in middleware
+  admin: [
+    'dashboard.view', 'system.management', 'users.manage',
+    'product.master', 'products.create', 'products.update', 'products.delete',
+    'category.setup', 'dealer.master', 'dealer.type', 'dealer.category',
+    'supplier.master', 'employee.master', 'warehouse.master', 'vehicle.master',
+    'region.master', 'route.master', 'expense.category', 'price.list',
+    'lead.management', 'followup.management', 'quotation.management',
+    'sales.order.dashboard', 'sales.order.create', 'sales.order.approve',
+    'dealer.discounts', 'po.management', 'grn.entry', 'invoice', 'payment',
+    'credit.note', 'debit.note', 'recycle.bin',
+    'stock.view', 'stock.transfer', 'stock.adjustment',
+    'dispatch.management', 'delivery.management', 'delivery.assignment',
+    'finance.management', 'dealer.ledger', 'supplier.ledger',
+    'cheque.management', 'reconciliation', 'expense.management', 'expense.approve',
+    'hrms.management', 'attendance.master', 'leave.management', 'salary.management', 'employee.registration',
+    'reports.sales', 'reports.purchase', 'reports.inventory', 'reports.finance',
+    'reports.profit', 'reports.gst', 'reports.hr', 'activity.logs', 'audit.trail',
+    'supplier.scheme', 'dealer.scheme', 'asset.management',
+  ],
+  sub_admin: [
+    'dashboard.view', 'product.master', 'category.setup',
+    'dealer.master', 'supplier.master',
+    'sales.order.dashboard', 'sales.order.create', 'sales.order.approve',
+    'po.management', 'grn.entry', 'invoice', 'payment',
+    'stock.view', 'stock.transfer',
+    'dispatch.management', 'delivery.management',
+    'finance.management', 'dealer.ledger', 'supplier.ledger',
+    'reports.sales', 'reports.purchase', 'reports.inventory',
+  ],
   sales_manager: [
-    'dashboard.view', 'product.master', 'dealer.master', 'sales.order.dashboard',
-    'sales.order.create', 'sales.order.approve', 'dealer.discounts',
-    'invoice', 'payment', 'reports.sales', 'reports.profit',
-    'sales.executive.app', 'dealer.order.requests', 'support.chat',
+    'dashboard.view', 'product.master', 'dealer.master', 'dealer.type', 'dealer.category',
+    'lead.management', 'followup.management', 'quotation.management',
+    'sales.order.dashboard', 'sales.order.create', 'sales.order.approve',
+    'sales.order.dealer', 'sales.order.wholesaler', 'sales.order.retail',
+    'sales.order.distributor', 'sales.order.builder',
+    'quotation.dealer', 'quotation.wholesaler', 'quotation.retail',
+    'dealer.discounts', 'invoice', 'payment', 'credit.note',
+    'reports.sales', 'reports.profit',
+    'sales.executive.app', 'dealer.order.requests',
   ],
   purchase_manager: [
-    'dashboard.view', 'product.master', 'supplier.master', 'category.setup',
-    'po.management', 'grn.entry', 'invoice', 'payment',
-    'stock.view', 'reports.purchase', 'reports.inventory',
+    'dashboard.view', 'product.master', 'products.create', 'products.update',
+    'category.setup', 'supplier.master', 'price.list',
+    'po.management', 'grn.entry', 'invoice', 'payment', 'debit.note',
+    'stock.view', 'stock.transfer', 'stock.adjustment',
+    'reports.purchase', 'reports.inventory',
+    'supplier.scheme',
   ],
   warehouse_manager: [
     'dashboard.view', 'stock.view', 'stock.transfer', 'stock.adjustment',
-    'picking.management', 'sorting.management', 'dispatch.management',
-    'warehouse.master', 'reports.inventory',
+    'picking.management', 'sorting.management',
+    'dispatch.management', 'delivery.management', 'delivery.assignment',
+    'warehouse.master', 'vehicle.master',
+    'reports.inventory',
   ],
   finance_manager: [
-    'dashboard.view', 'finance.management', 'dealer.ledger', 'supplier.ledger',
-    'cheque.management', 'reconciliation', 'expense.management', 'expense.approve',
-    'reports.finance', 'reports.gst', 'reports.profit', 'tally.sync',
+    'dashboard.view', 'finance.management',
+    'dealer.ledger', 'supplier.ledger', 'cheque.management',
+    'reconciliation', 'expense.management', 'expense.approve',
+    'payment', 'invoice', 'credit.note', 'debit.note',
+    'reports.finance', 'reports.gst', 'reports.profit', 'reports.sales',
+    'tally.sync', 'tally.reconciliation',
     'asset.management',
   ],
   hr_manager: [
-    'dashboard.view', 'hrms.management', 'attendance.master', 'leave.management',
-    'salary.management', 'employee.registration', 'reports.hr',
+    'dashboard.view', 'hrms.management',
+    'attendance.master', 'leave.management', 'salary.management',
+    'employee.registration', 'employee.master',
+    'expense.management', 'expense.approve',
+    'reports.hr',
   ],
   sales_executive: [
     'dashboard.view', 'product.master', 'dealer.master',
-    'sales.order.create', 'sales.executive.app',
+    'lead.management', 'followup.management',
+    'sales.order.create', 'sales.order.dashboard',
+    'quotation.management',
+    'sales.executive.app',
   ],
   delivery_executive: [
+    'dashboard.view',
     'delivery.executive.app',
+    'delivery.management', 'delivery.tracking',
   ],
-  picking_staff: ['picking.management'],
-  sorting_staff: ['sorting.management'],
-  dealer: ['dealer.order.requests', 'support.chat'],
+  picking_staff: [
+    'dashboard.view',
+    'picking.management', 'sorting.management',
+    'stock.view',
+  ],
+  sorting_staff: [
+    'dashboard.view',
+    'sorting.management', 'picking.management',
+    'stock.view',
+    'dispatch.management',
+  ],
+  dealer: [
+    'dealer.order.requests', 'support.chat',
+  ],
+};
+
+/**
+ * Role display names and descriptions for the UI
+ */
+export const ROLE_INFO = {
+  super_admin: { name: 'Super Admin', description: 'Full unrestricted access to everything', color: '#ff4d4f' },
+  owner: { name: 'Owner', description: 'Full access — business owner', color: '#722ed1' },
+  admin: { name: 'Admin', description: 'All modules except system-critical settings', color: '#1890ff' },
+  sub_admin: { name: 'Sub Admin', description: 'Core operations without HR/finance deep access', color: '#13c2c2' },
+  sales_manager: { name: 'Sales Manager', description: 'Sales orders, quotations, leads, dealer management', color: '#fa8c16' },
+  purchase_manager: { name: 'Purchase Manager', description: 'PO, GRN, supplier management, stock', color: '#52c41a' },
+  warehouse_manager: { name: 'Warehouse Manager', description: 'Stock, picking, sorting, dispatch, delivery', color: '#2f54eb' },
+  finance_manager: { name: 'Finance & Accounts', description: 'Ledger, payments, cheques, reconciliation, GST', color: '#eb2f96' },
+  hr_manager: { name: 'HR Manager', description: 'Employees, attendance, leave, salary, expenses', color: '#faad14' },
+  sales_executive: { name: 'Sales Executive', description: 'Field sales, leads, quotations, orders', color: '#ff7a45' },
+  delivery_executive: { name: 'Delivery Executive', description: 'Delivery assignments and tracking', color: '#36cfc9' },
+  picking_staff: { name: 'Picking/Sorting Staff', description: 'Warehouse picking, sorting, stock view', color: '#9254de' },
+  sorting_staff: { name: 'Sorting Staff', description: 'Sorting, dispatch preparation', color: '#597ef7' },
+  dealer: { name: 'Dealer (App)', description: 'Dealer portal — orders and support', color: '#73d13d' },
 };
 
 /**
@@ -168,4 +250,5 @@ export const ROLE_DEFAULT_PERMISSIONS = {
 export const getPermissionsConfig = () => ({
   permissions: AVAILABLE_PERMISSIONS,
   rolePermissions: ROLE_DEFAULT_PERMISSIONS,
+  roleInfo: ROLE_INFO,
 });

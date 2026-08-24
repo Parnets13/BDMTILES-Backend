@@ -160,10 +160,24 @@ router.patch('/:id/dispatch', async (req, res) => {
     // Update all orders delivery status
     trip.orders.forEach(o => { o.deliveryStatus = 'in_transit'; });
 
-    // Update related Sales Orders to 'dispatched'
+    // Update related Sales Orders to 'dispatched' and deduct stock
     for (const order of trip.orders) {
       if (order.salesOrder) {
+        const so = await SalesOrder.findById(order.salesOrder).populate('items.product', '_id').lean();
         await SalesOrder.findByIdAndUpdate(order.salesOrder, { status: 'dispatched' });
+
+        // Deduct stock for each item in the SO
+        if (so?.items?.length) {
+          const Stock = (await import('../models/Stock.js')).default;
+          for (const item of so.items) {
+            if (item.product && item.quantity > 0) {
+              await Stock.findOneAndUpdate(
+                { product: item.product._id || item.product, warehouse: item.warehouse, availableQty: { $gte: item.quantity } },
+                { $inc: { availableQty: -item.quantity, totalQty: -item.quantity } }
+              );
+            }
+          }
+        }
       }
     }
 

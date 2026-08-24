@@ -149,6 +149,11 @@ router.patch('/:id/approve', requirePermission('debit.note'), async (req, res) =
     pr.status = 'stock_deducted';
     await pr.save();
 
+    // Update supplier outstanding (reduce — we owe them less now)
+    if (pr.supplier && pr.grandTotal > 0) {
+      await Supplier.findByIdAndUpdate(pr.supplier, { $inc: { currentOutstanding: -pr.grandTotal } });
+    }
+
     // Mark as debit issued
     pr.status = 'debit_issued';
     await pr.save();

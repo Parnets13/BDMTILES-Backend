@@ -1,7 +1,7 @@
 import { Router } from 'express';
 import User from '../models/User.js';
 import { protect, requirePermission } from '../middleware/auth.js';
-import { AVAILABLE_PERMISSIONS, ROLE_DEFAULT_PERMISSIONS } from '../config/permissions.js';
+import { AVAILABLE_PERMISSIONS, ROLE_DEFAULT_PERMISSIONS, ROLE_INFO } from '../config/permissions.js';
 
 const router = Router();
 router.use(protect);
@@ -9,7 +9,7 @@ router.use(requirePermission('users.manage'));
 
 // GET /api/v1/users/permissions-config
 router.get('/permissions-config', (req, res) => {
-  res.json({ success: true, permissions: AVAILABLE_PERMISSIONS, rolePermissions: ROLE_DEFAULT_PERMISSIONS });
+  res.json({ success: true, permissions: AVAILABLE_PERMISSIONS, rolePermissions: ROLE_DEFAULT_PERMISSIONS, roleInfo: ROLE_INFO });
 });
 
 // GET /api/v1/users

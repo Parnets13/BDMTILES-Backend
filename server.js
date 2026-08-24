@@ -46,6 +46,11 @@ import bankReconciliationRoutes from './routes/bankReconciliationRoutes.js';
 import documentRoutes from './routes/documentRoutes.js';
 import taskRoutes from './routes/taskRoutes.js';
 import notificationRoutes from './routes/notificationRoutes.js';
+import incentiveRoutes from './routes/incentiveRoutes.js';
+
+import dns from 'dns';
+
+dns.setServers(['8.8.8.8', '8.8.4.4']);
 
 dotenv.config();
 
@@ -108,6 +113,7 @@ app.use('/api/v1/bank-reconciliation', bankReconciliationRoutes);
 app.use('/api/v1/documents', documentRoutes);
 app.use('/api/v1/tasks', taskRoutes);
 app.use('/api/v1/notifications', notificationRoutes);
+app.use('/api/v1/incentives', incentiveRoutes);
 
 // Static uploads
 app.use('/uploads', express.static('uploads'));

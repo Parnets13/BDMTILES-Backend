@@ -39,6 +39,10 @@ const invoiceSchema = new mongoose.Schema(
       default: 'tax_invoice',
     },
 
+    // GST classification
+    gstType: { type: String, enum: ['output', 'input'], default: 'output' }, // output = sales to dealer/customer, input = purchase from supplier
+    isInterState: { type: Boolean, default: false }, // true = IGST, false = CGST+SGST
+
     // Source reference
     salesOrder: { type: mongoose.Schema.Types.ObjectId, ref: 'SalesOrder' },
     orderNumber: String,

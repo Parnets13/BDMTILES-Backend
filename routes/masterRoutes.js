@@ -9,15 +9,16 @@ import Warehouse from '../models/Warehouse.js';
 import ExpenseCategory from '../models/ExpenseCategory.js';
 import Vehicle from '../models/Vehicle.js';
 import User from '../models/User.js';
+import Expense from '../models/Expense.js';
 import { protect, requirePermission } from '../middleware/auth.js';
 
 const router = Router();
 router.use(protect);
 
 // ═══════════════════════════════════════
-// GENERIC CRUD HELPER
+// GENERIC CRUD HELPER (with dependency check)
 // ═══════════════════════════════════════
-const simpleCrud = (Model, permission) => {
+const simpleCrud = (Model, permission, dependencyCheck) => {
   const r = Router();
   r.use(requirePermission(permission));
 
@@ -60,6 +61,11 @@ const simpleCrud = (Model, permission) => {
 
   r.delete('/:id', async (req, res) => {
     try {
+      // Check dependencies before allowing delete
+      if (dependencyCheck) {
+        const depError = await dependencyCheck(req.params.id);
+        if (depError) return res.status(400).json({ success: false, message: depError });
+      }
       const { safeDelete } = await import('../middleware/safeDelete.js');
       const result = await safeDelete(Model, req.params.id, { user: req.user, module: Model.modelName?.toLowerCase() || 'master', titleField: 'name', skipDependencyCheck: true });
       res.status(result.status || 200).json(result);
@@ -69,11 +75,38 @@ const simpleCrud = (Model, permission) => {
   return r;
 };
 
-// Simple masters
-router.use('/dealer-types', simpleCrud(DealerType, 'dealer.type'));
-router.use('/dealer-categories', simpleCrud(DealerCategory, 'dealer.category'));
-router.use('/regions', simpleCrud(Region, 'region.master'));
-router.use('/expense-categories', simpleCrud(ExpenseCategory, 'expense.category'));
+// Simple masters with dependency checks
+router.use('/dealer-types', simpleCrud(DealerType, 'dealer.type', async (id) => {
+  const count = await Dealer.countDocuments({ dealerType: id });
+  if (count > 0) return `Cannot delete. ${count} dealer(s) are using this dealer type.`;
+  return null;
+}));
+
+router.use('/dealer-categories', simpleCrud(DealerCategory, 'dealer.category', async (id) => {
+  const count = await Dealer.countDocuments({ dealerCategory: id });
+  if (count > 0) return `Cannot delete. ${count} dealer(s) are using this category.`;
+  return null;
+}));
+
+router.use('/regions', simpleCrud(Region, 'region.master', async (id) => {
+  const [routeCount, warehouseCount, dealerCount] = await Promise.all([
+    Route.countDocuments({ region: id }),
+    Warehouse.countDocuments({ region: id }),
+    Dealer.countDocuments({ assignedRegion: id }),
+  ]);
+  const errors = [];
+  if (routeCount > 0) errors.push(`${routeCount} route(s)`);
+  if (warehouseCount > 0) errors.push(`${warehouseCount} warehouse(s)`);
+  if (dealerCount > 0) errors.push(`${dealerCount} dealer(s)`);
+  if (errors.length > 0) return `Cannot delete. Used by: ${errors.join(', ')}.`;
+  return null;
+}));
+
+router.use('/expense-categories', simpleCrud(ExpenseCategory, 'expense.category', async (id) => {
+  const count = await Expense.countDocuments({ category: id });
+  if (count > 0) return `Cannot delete. ${count} expense(s) are using this category.`;
+  return null;
+}));
 
 // ═══════════════════════════════════════
 // WAREHOUSES (full CRUD with populate)

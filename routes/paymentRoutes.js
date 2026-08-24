@@ -80,10 +80,10 @@ router.post('/', requirePermission('payment'), async (req, res) => {
   try {
     const data = { ...req.body, createdBy: req.user._id };
 
-    // Auto-generate payment number
-    const count = await Payment.countDocuments();
-    const prefix = data.paymentType === 'dealer_receipt' ? 'RCP' : 'PAY';
-    data.paymentNumber = `${prefix}-${String(count + 1).padStart(5, '0')}`;
+    // Auto-generate payment number (safe against recycled records)
+    const { generateUniqueCode } = await import('../utils/codeGenerator.js');
+    const prefix = data.paymentType === 'dealer_receipt' ? 'RCP-' : 'PAY-';
+    data.paymentNumber = await generateUniqueCode(Payment, 'paymentNumber', prefix, 5);
 
     // Set party name
     if (data.dealer) {
@@ -140,6 +140,12 @@ router.patch('/:id/confirm', requirePermission('payment'), async (req, res) => {
     // Update dealer outstanding
     if (payment.paymentType === 'dealer_receipt' && payment.dealer) {
       await Dealer.findByIdAndUpdate(payment.dealer, { $inc: { currentOutstanding: -payment.amount } });
+    }
+
+    // Update supplier outstanding
+    if (payment.paymentType === 'supplier_payment' && payment.supplier) {
+      const Supplier = (await import('../models/Supplier.js')).default;
+      await Supplier.findByIdAndUpdate(payment.supplier, { $inc: { currentOutstanding: -payment.amount } });
     }
 
     // Update SO payment status

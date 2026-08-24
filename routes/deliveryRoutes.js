@@ -142,6 +142,29 @@ router.patch('/:id/complete', async (req, res) => {
       delivery.paymentMode = paymentMode || 'cash';
       delivery.chequeNumber = chequeNumber || '';
       delivery.utrNumber = utrNumber || '';
+
+      // Create a Payment record for reconciliation
+      if (collectedAmount > 0 && delivery.dealer) {
+        const Payment = (await import('../models/Payment.js')).default;
+        const Dealer = (await import('../models/Dealer.js')).default;
+        const { generateUniqueCode } = await import('../utils/codeGenerator.js');
+        const paymentNumber = await generateUniqueCode(Payment, 'paymentNumber', 'RCP-', 5);
+        await Payment.create({
+          paymentNumber,
+          paymentType: 'dealer_receipt',
+          dealer: delivery.dealer,
+          amount: collectedAmount,
+          paymentMode: paymentMode || 'cash',
+          paymentDate: new Date(),
+          status: 'confirmed',
+          remarks: `Collected at delivery ${delivery.deliveryNumber}`,
+          chequeNumber: chequeNumber || '',
+          utrNumber: utrNumber || '',
+          tallySyncStatus: 'not_synced',
+        });
+        // Update dealer outstanding
+        await Dealer.findByIdAndUpdate(delivery.dealer, { $inc: { currentOutstanding: -collectedAmount } });
+      }
     }
 
     // Status

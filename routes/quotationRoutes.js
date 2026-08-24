@@ -195,6 +195,11 @@ router.post('/:id/convert', requirePermission('sales.order.create'), async (req,
       convertedAt: new Date(),
     });
 
+    // Increment dealer outstanding for the new confirmed SO
+    if (so.dealer && so.grandTotal > 0) {
+      await Dealer.findByIdAndUpdate(so.dealer, { $inc: { currentOutstanding: so.grandTotal } });
+    }
+
     res.json({ success: true, message: `Converted to ${soNumber}.`, data: { quotation: q, salesOrder: so } });
   } catch (e) { res.status(500).json({ success: false, message: e.message }); }
 });

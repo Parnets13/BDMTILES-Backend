@@ -116,8 +116,10 @@ router.post('/generate-from-so/:soId', requirePermission('sales.order.dashboard'
       const taxable = baseAmount - discountAmt - (item.schemeDiscount || 0);
       const gstPct = item.gstPercentage || 18;
       const gstAmt = (taxable * gstPct) / 100;
-      const cgst = gstAmt / 2;
-      const sgst = gstAmt / 2;
+
+      // Determine CGST/SGST vs IGST based on inter-state flag (set later)
+      // For now calculate both — we'll choose which to use based on state comparison
+      const halfGst = gstAmt / 2;
 
       return {
         product: prod._id || item.product,
@@ -139,18 +141,33 @@ router.post('/generate-from-so/:soId', requirePermission('sales.order.dashboard'
         schemeDiscount: item.schemeDiscount || 0,
         taxableAmount: Math.round(taxable * 100) / 100,
         gstPercentage: gstPct,
-        cgst: Math.round(cgst * 100) / 100,
-        sgst: Math.round(sgst * 100) / 100,
-        igst: 0,
+        cgst: Math.round(halfGst * 100) / 100,
+        sgst: Math.round(halfGst * 100) / 100,
+        igst: 0, // Will be set if inter-state
         gstAmount: Math.round(gstAmt * 100) / 100,
         totalAmount: Math.round((taxable + gstAmt) * 100) / 100,
       };
     });
 
+    // Determine if inter-state (buyer state different from seller state)
+    const sellerState = 'Karnataka'; // TODO: Load from company settings
+    const buyerState = so.dealer?.state || '';
+    const isInterState = buyerState && buyerState.toLowerCase() !== sellerState.toLowerCase();
+
+    // If inter-state, convert CGST+SGST to IGST
+    if (isInterState) {
+      items.forEach(item => {
+        item.igst = item.gstAmount;
+        item.cgst = 0;
+        item.sgst = 0;
+      });
+    }
+
     const taxableTotal = items.reduce((s, i) => s + i.taxableAmount, 0);
     const totalCgst = items.reduce((s, i) => s + i.cgst, 0);
     const totalSgst = items.reduce((s, i) => s + i.sgst, 0);
-    const totalTax = totalCgst + totalSgst;
+    const totalIgst = items.reduce((s, i) => s + i.igst, 0);
+    const totalTax = totalCgst + totalSgst + totalIgst;
     const totalDiscount = items.reduce((s, i) => s + i.discountAmount, 0);
     const totalSchemeDiscount = items.reduce((s, i) => s + i.schemeDiscount, 0);
 
@@ -163,6 +180,8 @@ router.post('/generate-from-so/:soId', requirePermission('sales.order.dashboard'
       invoiceNumber,
       invoiceDate: new Date(),
       invoiceType: 'tax_invoice',
+      gstType: 'output', // Sales invoice = Output GST
+      isInterState,
       salesOrder: so._id,
       orderNumber: so.orderNumber,
 
@@ -189,7 +208,7 @@ router.post('/generate-from-so/:soId', requirePermission('sales.order.dashboard'
       taxableTotal: Math.round(taxableTotal * 100) / 100,
       totalCgst: Math.round(totalCgst * 100) / 100,
       totalSgst: Math.round(totalSgst * 100) / 100,
-      totalIgst: 0,
+      totalIgst: Math.round(totalIgst * 100) / 100,
       totalTax: Math.round(totalTax * 100) / 100,
       freightCharges: so.freightCharges || 0,
       loadingCharges: so.loadingCharges || 0,
