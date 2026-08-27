@@ -1,23 +1,98 @@
 import { Router } from 'express';
+import mongoose from 'mongoose';
 import SalesReturn from '../models/SalesReturn.js';
 import SalesOrder from '../models/SalesOrder.js';
 import Stock from '../models/Stock.js';
-import Dealer from '../models/Dealer.js';
 import { protect, requirePermission } from '../middleware/auth.js';
+import { assertWarehousesInBranch, requireBranch } from '../utils/branchScope.js';
+import { generateBranchNumber } from '../utils/branchSequence.js';
+import { requestFingerprint as fingerprintRequest } from '../utils/idempotency.js';
+import { postSubledgerEntry } from '../utils/subledgerPosting.js';
 
 const router = Router();
 router.use(protect);
+router.use(requireBranch);
 
-// GET /api/v1/sales-returns — list
+const lineKey = (item) => `${String(item.product)}|${item.shade || ''}|${item.batch || ''}`;
+const stockKey = (item) => `${lineKey(item)}|${String(item.warehouse)}|${item.condition}`;
+const routeError = (status, message) => Object.assign(new Error(message), { status });
+
+function sourceQuantities(order) {
+  const quantities = new Map();
+  const sourceLines = new Map();
+  for (const item of order.items || []) {
+    const key = lineKey(item);
+    quantities.set(key, (quantities.get(key) || 0) + Number(item.quantity || 0));
+    if (!sourceLines.has(key)) sourceLines.set(key, item);
+  }
+  return { quantities, sourceLines };
+}
+
+async function validateReturnItems(data, order, options = {}) {
+  if (!Array.isArray(data.items) || data.items.length === 0) {
+    throw routeError(422, 'At least one return item is required.');
+  }
+  const { quantities: orderedQuantities, sourceLines } = sourceQuantities(order);
+  const requested = new Map();
+  const normalizedItems = [];
+
+  for (let index = 0; index < data.items.length; index += 1) {
+    const item = data.items[index];
+    const returnQty = Number(item.returnQty);
+    if (!item.product || !Number.isFinite(returnQty) || returnQty <= 0) {
+      throw routeError(422, `items[${index}] requires a product and a finite returnQty greater than zero.`);
+    }
+    const key = lineKey(item);
+    const source = sourceLines.get(key);
+    if (!source) throw routeError(422, `items[${index}] is not present on the selected sales order.`);
+    requested.set(key, (requested.get(key) || 0) + returnQty);
+    normalizedItems.push({
+      ...item,
+      product: source.product,
+      productCode: source.productCode || item.productCode || '',
+      productName: source.productName || item.productName || '',
+      shade: source.shade || '',
+      batch: source.batch || '',
+      unit: source.unit || item.unit || 'Box',
+      rate: Number(source.rate || 0),
+      gstPercentage: Number(source.gstPercentage ?? 18),
+      returnQty,
+    });
+  }
+
+  const previous = new Map();
+  let query = SalesReturn.find({
+    branch: data.branch,
+    salesOrder: order._id,
+    status: { $ne: 'cancelled' },
+    ...(options.excludeId ? { _id: { $ne: options.excludeId } } : {}),
+  }).select('items').lean();
+  if (options.session) query = query.session(options.session);
+  for (const existing of await query) {
+    for (const item of existing.items || []) {
+      const key = lineKey(item);
+      previous.set(key, (previous.get(key) || 0) + Number(item.returnQty || 0));
+    }
+  }
+
+  for (const [key, quantity] of requested) {
+    if ((previous.get(key) || 0) + quantity > (orderedQuantities.get(key) || 0)) {
+      throw routeError(422, 'Return quantity exceeds the remaining quantity on the selected sales order.');
+    }
+  }
+  return normalizedItems;
+}
+
 router.get('/', requirePermission('credit.note'), async (req, res) => {
   try {
     const { page = 1, limit = 20, search, status, dealer } = req.query;
-    const p = Math.max(1, parseInt(page));
-    const l = Math.min(100, parseInt(limit) || 20);
-    let filter = {};
+    const p = Math.max(1, Number.parseInt(page, 10) || 1);
+    const l = Math.min(100, Number.parseInt(limit, 10) || 20);
+    const filter = { branch: req.branchId };
     if (search) {
-      const r = new RegExp(search, 'i');
-      filter.$or = [{ returnNumber: r }, { dealerName: r }, { orderNumber: r }];
+      const escaped = String(search).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+      const regex = new RegExp(escaped, 'i');
+      filter.$or = [{ returnNumber: regex }, { dealerName: regex }, { orderNumber: regex }];
     }
     if (status) filter.status = status;
     if (dealer) filter.dealer = dealer;
@@ -29,153 +104,226 @@ router.get('/', requirePermission('credit.note'), async (req, res) => {
         .lean(),
       SalesReturn.countDocuments(filter),
     ]);
-    res.json({ success: true, data: returns, pagination: { currentPage: p, totalPages: Math.ceil(total / l), totalItems: total, itemsPerPage: l } });
-  } catch (e) { res.status(500).json({ success: false, message: e.message }); }
+    return res.json({ success: true, data: returns, pagination: { currentPage: p, totalPages: Math.ceil(total / l), totalItems: total, itemsPerPage: l } });
+  } catch (error) {
+    return res.status(error.status || 500).json({ success: false, message: error.message });
+  }
 });
 
-// GET /api/v1/sales-returns/stats
 router.get('/stats', requirePermission('credit.note'), async (req, res) => {
   try {
-    const [total, draft, approved, creditIssued, cancelled] = await Promise.all([
-      SalesReturn.countDocuments(),
-      SalesReturn.countDocuments({ status: 'draft' }),
-      SalesReturn.countDocuments({ status: 'approved' }),
-      SalesReturn.countDocuments({ status: 'credit_issued' }),
-      SalesReturn.countDocuments({ status: 'cancelled' }),
+    const scope = { branch: req.branchId };
+    const [total, draft, approved, creditIssued, cancelled, totalValue] = await Promise.all([
+      SalesReturn.countDocuments(scope),
+      SalesReturn.countDocuments({ ...scope, status: 'draft' }),
+      SalesReturn.countDocuments({ ...scope, status: 'approved' }),
+      SalesReturn.countDocuments({ ...scope, status: 'credit_issued' }),
+      SalesReturn.countDocuments({ ...scope, status: 'cancelled' }),
+      SalesReturn.aggregate([
+        { $match: { ...scope, status: { $nin: ['cancelled', 'draft'] } } },
+        { $group: { _id: null, total: { $sum: '$grandTotal' } } },
+      ]),
     ]);
-    const totalValue = await SalesReturn.aggregate([
-      { $match: { status: { $nin: ['cancelled', 'draft'] } } },
-      { $group: { _id: null, total: { $sum: '$grandTotal' } } },
-    ]);
-    res.json({ success: true, data: { total, draft, approved, creditIssued, cancelled, totalReturnValue: totalValue[0]?.total || 0 } });
-  } catch (e) { res.status(500).json({ success: false, message: e.message }); }
+    return res.json({ success: true, data: { total, draft, approved, creditIssued, cancelled, totalReturnValue: totalValue[0]?.total || 0 } });
+  } catch (error) {
+    return res.status(500).json({ success: false, message: error.message });
+  }
 });
 
-// GET /api/v1/sales-returns/:id
+router.get('/orders-for-dealer/:dealerId', requirePermission('credit.note'), async (req, res) => {
+  try {
+    const orders = await SalesOrder.find({
+      branch: req.branchId,
+      dealer: req.params.dealerId,
+      status: { $in: ['dispatched', 'delivered'] },
+    }).select('orderNumber orderDate grandTotal items status').sort({ orderDate: -1 }).limit(50).lean();
+    return res.json({ success: true, data: orders });
+  } catch (error) {
+    return res.status(500).json({ success: false, message: error.message });
+  }
+});
+
 router.get('/:id', requirePermission('credit.note'), async (req, res) => {
   try {
-    const sr = await SalesReturn.findById(req.params.id)
+    const salesReturn = await SalesReturn.findOne({ _id: req.params.id, branch: req.branchId })
       .populate('dealer', 'businessName dealerCode mobile city')
       .populate('salesOrder', 'orderNumber orderDate grandTotal items')
       .populate('items.product', 'productCode itemName tileSize')
       .populate('items.warehouse', 'name')
       .lean();
-    if (!sr) return res.status(404).json({ success: false, message: 'Sales Return not found.' });
-    res.json({ success: true, data: sr });
-  } catch (e) { res.status(500).json({ success: false, message: e.message }); }
+    if (!salesReturn) return res.status(404).json({ success: false, message: 'Sales Return not found.' });
+    return res.json({ success: true, data: salesReturn });
+  } catch (error) {
+    return res.status(500).json({ success: false, message: error.message });
+  }
 });
 
-// POST /api/v1/sales-returns — create
 router.post('/', requirePermission('credit.note'), async (req, res) => {
+  const rawIdempotencyKey = String(req.get('Idempotency-Key') || '').trim();
+  if (!rawIdempotencyKey || rawIdempotencyKey.length > 200) {
+    return res.status(422).json({ success: false, message: 'A valid Idempotency-Key header is required.' });
+  }
+  const sourceKey = `${String(req.branchId)}:${rawIdempotencyKey}`;
+  const requestFingerprint = fingerprintRequest(req.body);
   try {
-    const data = { ...req.body, createdBy: req.user._id };
-
-    // Auto-generate return number
-    const count = await SalesReturn.countDocuments();
-    data.returnNumber = `SR-${String(count + 1).padStart(5, '0')}`;
-
-    // Fetch dealer info
-    if (data.dealer) {
-      const dealer = await Dealer.findById(data.dealer).lean();
-      if (dealer) {
-        data.dealerName = dealer.businessName;
-        data.dealerCode = dealer.dealerCode;
+    const existingReturn = await SalesReturn.findOne({ branch: req.branchId, sourceKey });
+    if (existingReturn) {
+      if (existingReturn.requestFingerprint && existingReturn.requestFingerprint !== requestFingerprint) {
+        throw routeError(409, 'This Idempotency-Key was already used with a different request payload.');
       }
+      return res.json({ success: true, message: 'Sales Return already recorded.', data: existingReturn });
+    }
+    const dealer = await Dealer.findById(req.body.dealer).lean();
+    if (!dealer) throw routeError(404, 'Dealer not found.');
+    if (!req.body.salesOrder) throw routeError(422, 'Sales order is required.');
+    const order = await SalesOrder.findOne({ _id: req.body.salesOrder, branch: req.branchId }).lean();
+    if (!order) throw routeError(404, 'Sales order not found in the active branch.');
+    if (String(order.dealer) !== String(dealer._id)) throw routeError(422, 'Sales order does not belong to the selected dealer.');
+    if (!['dispatched', 'delivered'].includes(order.status)) {
+      throw routeError(422, 'Only dispatched or delivered sales orders can be returned.');
     }
 
-    // Fetch SO info
-    if (data.salesOrder) {
-      const so = await SalesOrder.findById(data.salesOrder).lean();
-      if (so) data.orderNumber = so.orderNumber;
-    }
+    const data = {
+      ...req.body,
+      branch: req.branchId,
+      dealer: dealer._id,
+      dealerName: dealer.businessName,
+      dealerCode: dealer.dealerCode,
+      salesOrder: order._id,
+      orderNumber: order.orderNumber,
+      sourceKey,
+      requestFingerprint,
+      status: 'draft',
+      approvedBy: undefined,
+      approvalDate: undefined,
+      approvalRemarks: undefined,
+      createdBy: req.user._id,
+      tallySyncStatus: 'not_synced',
+    };
+    data.items = await validateReturnItems(data, order);
+    await assertWarehousesInBranch(data.items.map((item) => item.warehouse), req.branchId);
 
-    // Calculate totals
-    if (data.items?.length) {
-      let subtotal = 0, totalTax = 0;
-      data.items = data.items.map(item => {
-        const taxable = item.returnQty * item.rate;
-        const gst = (taxable * (item.gstPercentage || 18)) / 100;
-        subtotal += taxable;
-        totalTax += gst;
-        return { ...item, taxableAmount: taxable, gstAmount: gst, totalAmount: taxable + gst };
-      });
-      data.subtotal = Math.round(subtotal * 100) / 100;
-      data.totalTax = Math.round(totalTax * 100) / 100;
-      data.grandTotal = Math.round(subtotal + totalTax);
-    }
-
-    // Auto-generate credit note number
-    data.creditNoteNumber = `CN-${String(count + 1).padStart(5, '0')}`;
+    let subtotal = 0;
+    let totalTax = 0;
+    data.items = data.items.map((item) => {
+      const taxableAmount = item.returnQty * item.rate;
+      const gstAmount = (taxableAmount * item.gstPercentage) / 100;
+      subtotal += taxableAmount;
+      totalTax += gstAmount;
+      return { ...item, taxableAmount, gstAmount, totalAmount: taxableAmount + gstAmount };
+    });
+    data.subtotal = Math.round(subtotal * 100) / 100;
+    data.totalTax = Math.round(totalTax * 100) / 100;
+    data.grandTotal = Math.round((subtotal + totalTax) * 100) / 100;
+    data.returnNumber = await generateBranchNumber(req.branchId, 'salesReturn', data.returnDate || new Date());
+    data.creditNoteNumber = await generateBranchNumber(req.branchId, 'creditNote', data.returnDate || new Date());
     data.creditNoteDate = new Date();
-    data.tallySyncStatus = 'not_synced';
 
-    const sr = await SalesReturn.create(data);
-    res.status(201).json({ success: true, message: 'Sales Return created.', data: sr });
-  } catch (e) { res.status(500).json({ success: false, message: e.message }); }
-});
-
-// PATCH /api/v1/sales-returns/:id/approve — approve & update stock
-router.patch('/:id/approve', requirePermission('credit.note'), async (req, res) => {
-  try {
-    const sr = await SalesReturn.findById(req.params.id);
-    if (!sr) return res.status(404).json({ success: false, message: 'Not found.' });
-    if (sr.status !== 'draft') return res.status(400).json({ success: false, message: 'Only draft returns can be approved.' });
-
-    sr.status = 'approved';
-    sr.approvedBy = req.user._id;
-    sr.approvalDate = new Date();
-    sr.approvalRemarks = req.body.remarks || '';
-    await sr.save();
-
-    // Update stock — add back resaleable items
-    for (const item of sr.items) {
-      if (item.condition === 'resaleable' && item.returnQty > 0) {
-        await Stock.findOneAndUpdate(
-          { product: item.product, warehouse: item.warehouse, shade: item.shade || '', batch: item.batch || '' },
-          { $inc: { totalQty: item.returnQty, availableQty: item.returnQty } },
-          { upsert: true, new: true }
-        );
-      } else if (item.condition === 'damaged' && item.returnQty > 0) {
-        await Stock.findOneAndUpdate(
-          { product: item.product, warehouse: item.warehouse, shade: item.shade || '', batch: item.batch || '' },
-          { $inc: { totalQty: item.returnQty, damagedQty: item.returnQty } },
-          { upsert: true, new: true }
-        );
+    const salesReturn = await SalesReturn.create(data);
+    return res.status(201).json({ success: true, message: 'Sales Return created.', data: salesReturn });
+  } catch (error) {
+    if (error.code === 11000) {
+      const existingReturn = await SalesReturn.findOne({ branch: req.branchId, sourceKey });
+      if (existingReturn) {
+        if (existingReturn.requestFingerprint && existingReturn.requestFingerprint !== requestFingerprint) {
+          return res.status(409).json({ success: false, message: 'This Idempotency-Key was already used with a different request payload.' });
+        }
+        return res.json({ success: true, message: 'Sales Return already recorded.', data: existingReturn });
       }
     }
-
-    sr.status = 'stock_updated';
-    await sr.save();
-
-    // Update dealer outstanding (reduce)
-    if (sr.dealer && sr.adjustmentType === 'credit_note') {
-      await Dealer.findByIdAndUpdate(sr.dealer, { $inc: { currentOutstanding: -sr.grandTotal } });
-    }
-
-    sr.status = 'credit_issued';
-    await sr.save();
-
-    res.json({ success: true, message: 'Sales Return approved. Stock updated. Credit note issued.', data: sr });
-  } catch (e) { res.status(500).json({ success: false, message: e.message }); }
+    const status = error.status || (error.name === 'CastError' ? 422 : 500);
+    return res.status(status).json({ success: false, message: error.name === 'CastError' ? 'Invalid identifier.' : error.message });
+  }
 });
 
-// PATCH /api/v1/sales-returns/:id/cancel
+router.patch('/:id/approve', requirePermission('credit.note'), async (req, res) => {
+  const session = await mongoose.startSession();
+  try {
+    let salesReturn;
+    await session.withTransaction(async () => {
+      const current = await SalesReturn.findOne({ _id: req.params.id, branch: req.branchId }).session(session);
+      if (!current) throw routeError(404, 'Sales Return not found.');
+      if (current.status === 'credit_issued') {
+        salesReturn = current;
+        return;
+      }
+      if (current.status !== 'draft') throw routeError(409, `Cannot approve a sales return in ${current.status} status.`);
+
+      const order = await SalesOrder.findOne({ _id: current.salesOrder, branch: req.branchId }).session(session).lean();
+      if (!order || String(order.dealer) !== String(current.dealer)) {
+        throw routeError(409, 'The source sales order is unavailable or no longer matches the dealer.');
+      }
+      current.items = await validateReturnItems(current.toObject(), order, { excludeId: current._id, session });
+      await assertWarehousesInBranch(current.items.map((item) => item.warehouse), req.branchId, { session });
+
+      const stockUpdates = new Map();
+      for (const item of current.items) {
+        const quantity = Number(item.returnQty);
+        if (!Number.isFinite(quantity) || quantity <= 0) throw routeError(422, 'Return quantities must be finite and greater than zero.');
+        if (!['resaleable', 'damaged'].includes(item.condition)) continue;
+        const key = stockKey(item);
+        const previous = stockUpdates.get(key);
+        stockUpdates.set(key, { item, quantity: (previous?.quantity || 0) + quantity });
+      }
+      for (const { item, quantity } of stockUpdates.values()) {
+        const increment = item.condition === 'resaleable'
+          ? { totalQty: quantity, availableQty: quantity }
+          : { totalQty: quantity, damagedQty: quantity };
+        await Stock.findOneAndUpdate(
+          { branch: current.branch, product: item.product, warehouse: item.warehouse, shade: item.shade || '', batch: item.batch || '' },
+          { $inc: increment, $set: { branch: current.branch } },
+          { upsert: true, new: true, session }
+        );
+      }
+      if (current.dealer && current.adjustmentType === 'credit_note' && current.grandTotal > 0) {
+        await postSubledgerEntry({
+          session,
+          branch: req.branchId,
+          partyType: 'dealer',
+          partyId: current.dealer,
+          amount: current.grandTotal,
+          side: 'credit',
+          postingKey: `sales-return:${current._id}:credit-note`,
+          entryType: 'credit_note',
+          entryDate: current.returnDate,
+          description: `Credit note for sales return ${current.returnNumber}`,
+          referenceNumber: current.creditNoteNumber || current.returnNumber,
+          referenceModel: 'SalesReturn',
+          referenceId: current._id,
+          createdBy: req.user._id,
+        });
+      }
+      current.status = 'credit_issued';
+      current.approvedBy = req.user._id;
+      current.approvalDate = new Date();
+      current.approvalRemarks = req.body.remarks || '';
+      await current.save({ session });
+      salesReturn = current;
+    });
+    return res.json({ success: true, message: 'Sales Return approved. Stock updated. Credit note issued.', data: salesReturn });
+  } catch (error) {
+    const status = error.status || (error.name === 'CastError' ? 422 : 500);
+    return res.status(status).json({ success: false, message: error.name === 'CastError' ? 'Invalid identifier.' : error.message });
+  } finally {
+    await session.endSession();
+  }
+});
+
 router.patch('/:id/cancel', requirePermission('credit.note'), async (req, res) => {
   try {
-    const sr = await SalesReturn.findByIdAndUpdate(req.params.id, { status: 'cancelled' }, { new: true });
-    res.json({ success: true, message: 'Sales Return cancelled.', data: sr });
-  } catch (e) { res.status(500).json({ success: false, message: e.message }); }
-});
-
-// GET /api/v1/sales-returns/orders-for-dealer/:dealerId — get SO list for returns
-router.get('/orders-for-dealer/:dealerId', requirePermission('credit.note'), async (req, res) => {
-  try {
-    const orders = await SalesOrder.find({
-      dealer: req.params.dealerId,
-      status: { $in: ['confirmed', 'processing', 'dispatched', 'delivered'] },
-    }).select('orderNumber orderDate grandTotal items status').sort({ orderDate: -1 }).limit(50).lean();
-    res.json({ success: true, data: orders });
-  } catch (e) { res.status(500).json({ success: false, message: e.message }); }
+    const salesReturn = await SalesReturn.findOneAndUpdate(
+      { _id: req.params.id, branch: req.branchId, status: 'draft' },
+      { $set: { status: 'cancelled' } },
+      { new: true, runValidators: true }
+    );
+    if (salesReturn) return res.json({ success: true, message: 'Sales Return cancelled.', data: salesReturn });
+    const current = await SalesReturn.findOne({ _id: req.params.id, branch: req.branchId });
+    if (!current) return res.status(404).json({ success: false, message: 'Sales Return not found.' });
+    if (current.status === 'cancelled') return res.json({ success: true, message: 'Sales Return is already cancelled.', data: current });
+    return res.status(409).json({ success: false, message: `Cannot cancel a sales return in ${current.status} status without reversal.` });
+  } catch (error) {
+    return res.status(500).json({ success: false, message: error.message });
+  }
 });
 
 export default router;

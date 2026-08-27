@@ -7,6 +7,8 @@ import mongoose from 'mongoose';
  */
 const activityLogSchema = new mongoose.Schema(
   {
+    // Optional only for audit rows created before branch context was introduced.
+    branch: { type: mongoose.Schema.Types.ObjectId, ref: 'Branch' },
     user: { type: mongoose.Schema.Types.ObjectId, ref: 'User' },
     userName: { type: String, default: '' },
     userRole: { type: String, default: '' },
@@ -55,10 +57,11 @@ const activityLogSchema = new mongoose.Schema(
 // TTL index: auto-delete logs older than 60 days
 activityLogSchema.index({ timestamp: 1 }, { expireAfterSeconds: 60 * 24 * 60 * 60 });
 
-// Query indexes
-activityLogSchema.index({ user: 1, timestamp: -1 });
-activityLogSchema.index({ module: 1, timestamp: -1 });
-activityLogSchema.index({ action: 1, timestamp: -1 });
-activityLogSchema.index({ recordId: 1 });
+// Branch-scoped query indexes. Keep the TTL index above single-field.
+activityLogSchema.index({ branch: 1, timestamp: -1 });
+activityLogSchema.index({ branch: 1, user: 1, timestamp: -1 });
+activityLogSchema.index({ branch: 1, module: 1, timestamp: -1 });
+activityLogSchema.index({ branch: 1, action: 1, timestamp: -1 });
+activityLogSchema.index({ branch: 1, recordId: 1 });
 
 export default mongoose.model('ActivityLog', activityLogSchema);

@@ -57,6 +57,8 @@ const accountantReviewSchema = new mongoose.Schema({
 const complaintSchema = new mongoose.Schema(
   {
     complaintNumber: { type: String, unique: true, required: true },
+    // Optional for legacy records; all new writes set the selected branch server-side.
+    branch: { type: mongoose.Schema.Types.ObjectId, ref: 'Branch', index: true },
     complaintDate: { type: Date, default: Date.now },
 
     // Linked entities
@@ -126,9 +128,9 @@ const complaintSchema = new mongoose.Schema(
   { timestamps: true }
 );
 
-complaintSchema.index({ complaintNumber: 1 });
-complaintSchema.index({ dealer: 1, status: 1 });
-complaintSchema.index({ status: 1, priority: 1 });
-complaintSchema.index({ 'warehouseVerification.verifiedAt': -1 });
+complaintSchema.index({ branch: 1, dealer: 1, status: 1 });
+complaintSchema.index({ branch: 1, status: 1, priority: 1 });
+complaintSchema.index({ branch: 1, 'warehouseVerification.verifiedAt': -1 });
+complaintSchema.index({ branch: 1, createdAt: -1 });
 
 export default mongoose.model('Complaint', complaintSchema);

@@ -2,6 +2,7 @@ import mongoose from 'mongoose';
 
 const hrmsSettingsSchema = new mongoose.Schema(
   {
+    branch: { type: mongoose.Schema.Types.ObjectId, ref: 'Branch' },
     // Shift timing
     defaultShiftStart: { type: String, default: '09:00' },
     defaultShiftEnd: { type: String, default: '18:00' },
@@ -44,5 +45,7 @@ const hrmsSettingsSchema = new mongoose.Schema(
   },
   { timestamps: true }
 );
+
+hrmsSettingsSchema.index({ branch: 1 }, { unique: true, sparse: true });
 
 export default mongoose.model('HrmsSettings', hrmsSettingsSchema);

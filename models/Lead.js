@@ -24,6 +24,8 @@ const assignmentHistorySchema = new mongoose.Schema({
 const leadSchema = new mongoose.Schema(
   {
     leadNumber: { type: String, unique: true, required: true },
+    // Optional for legacy records; all new writes set the selected branch server-side.
+    branch: { type: mongoose.Schema.Types.ObjectId, ref: 'Branch', index: true },
 
     // Customer Info
     name: { type: String, required: true },
@@ -103,11 +105,10 @@ const leadSchema = new mongoose.Schema(
   { timestamps: true }
 );
 
-leadSchema.index({ leadNumber: 1 });
-leadSchema.index({ status: 1, nextFollowupDate: 1 });
-leadSchema.index({ assignedTo: 1, assignmentStatus: 1 });
-leadSchema.index({ customerType: 1 });
-leadSchema.index({ createdAt: -1 });
-leadSchema.index({ assignmentStatus: 1, createdAt: -1 }); // for queue: unassigned first
+leadSchema.index({ branch: 1, status: 1, nextFollowupDate: 1 });
+leadSchema.index({ branch: 1, assignedTo: 1, assignmentStatus: 1 });
+leadSchema.index({ branch: 1, customerType: 1 });
+leadSchema.index({ branch: 1, createdAt: -1 });
+leadSchema.index({ branch: 1, assignmentStatus: 1, createdAt: -1 }); // branch queue
 
 export default mongoose.model('Lead', leadSchema);

@@ -11,6 +11,7 @@ import Vehicle from '../models/Vehicle.js';
 import User from '../models/User.js';
 import Expense from '../models/Expense.js';
 import { protect, requirePermission } from '../middleware/auth.js';
+import { requireBranch } from '../utils/branchScope.js';
 
 const router = Router();
 router.use(protect);
@@ -113,13 +114,14 @@ router.use('/expense-categories', simpleCrud(ExpenseCategory, 'expense.category'
 // ═══════════════════════════════════════
 const warehouseRouter = Router();
 warehouseRouter.use(requirePermission('warehouse.master'));
+warehouseRouter.use(requireBranch);
 
 warehouseRouter.get('/', async (req, res) => {
   try {
     const { page = 1, limit = 50, search, status, region } = req.query;
     const p = Math.max(1, parseInt(page));
     const l = Math.min(200, parseInt(limit) || 50);
-    let filter = {};
+    let filter = { branch: req.branchId };
     if (search) {
       const rx = new RegExp(search, 'i');
       filter.$or = [{ name: rx }, { city: rx }, { managerName: rx }, { warehouseCode: rx }];
@@ -128,7 +130,7 @@ warehouseRouter.get('/', async (req, res) => {
     if (region) filter.region = region;
     const [items, total] = await Promise.all([
       Warehouse.find(filter).sort({ name: 1 }).skip((p - 1) * l).limit(l)
-        .populate('region', 'name').lean(),
+        .populate('region', 'name').populate('branch', 'branchCode name').lean(),
       Warehouse.countDocuments(filter),
     ]);
     res.json({ success: true, data: items, pagination: { currentPage: p, totalPages: Math.ceil(total / l), totalItems: total, itemsPerPage: l } });
@@ -137,9 +139,10 @@ warehouseRouter.get('/', async (req, res) => {
 
 warehouseRouter.post('/', async (req, res) => {
   try {
-    const data = { ...req.body, createdBy: req.user._id };
+    const { branch, ...input } = req.body;
+    const data = { ...input, branch: req.branchId, createdBy: req.user._id };
     if (!data.warehouseCode) {
-      const count = await Warehouse.countDocuments();
+      const count = await Warehouse.countDocuments({ branch: req.branchId });
       data.warehouseCode = `WH${String(count + 1).padStart(4, '0')}`;
     }
     const wh = await Warehouse.create(data);
@@ -152,8 +155,14 @@ warehouseRouter.post('/', async (req, res) => {
 
 warehouseRouter.put('/:id', async (req, res) => {
   try {
-    const wh = await Warehouse.findByIdAndUpdate(req.params.id, req.body, { new: true, runValidators: true })
-      .populate('region', 'name');
+    const { branch, createdBy, ...updates } = req.body;
+    const wh = await Warehouse.findOneAndUpdate(
+      { _id: req.params.id, branch: req.branchId },
+      updates,
+      { new: true, runValidators: true }
+    )
+      .populate('region', 'name')
+      .populate('branch', 'branchCode name');
     if (!wh) return res.status(404).json({ success: false, message: 'Warehouse not found.' });
     res.json({ success: true, message: 'Warehouse updated.', data: wh });
   } catch (e) {
@@ -164,8 +173,15 @@ warehouseRouter.put('/:id', async (req, res) => {
 
 warehouseRouter.delete('/:id', async (req, res) => {
   try {
+    const warehouse = await Warehouse.findOne({ _id: req.params.id, branch: req.branchId }).lean();
+    if (!warehouse) return res.status(404).json({ success: false, message: 'Warehouse not found.' });
     const { safeDelete } = await import('../middleware/safeDelete.js');
-    const result = await safeDelete(Warehouse, req.params.id, { user: req.user, module: 'warehouse', titleField: 'name' });
+    const result = await safeDelete(Warehouse, req.params.id, {
+      user: req.user,
+      module: 'warehouse',
+      titleField: 'name',
+      scope: { branch: req.branchId },
+    });
     res.status(result.status || 200).json(result);
   } catch (e) { res.status(500).json({ success: false, message: e.message }); }
 });
@@ -449,7 +465,7 @@ vehicleRouter.post('/', async (req, res) => {
 
 vehicleRouter.put('/:id', async (req, res) => {
   try {
-    const vehicle = await Vehicle.findByIdAndUpdate(req.params.id, req.body, { new: true });
+    const vehicle = await Vehicle.findByIdAndUpdate(req.params.id, req.body, { new: true, runValidators: true });
     if (!vehicle) return res.status(404).json({ success: false, message: 'Not found.' });
     res.json({ success: true, message: 'Vehicle updated.', data: vehicle });
   } catch (e) { res.status(500).json({ success: false, message: e.message }); }

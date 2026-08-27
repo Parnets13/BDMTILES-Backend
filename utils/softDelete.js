@@ -1,41 +1,44 @@
 import RecycleBin from '../models/RecycleBin.js';
 import { logActivity } from '../middleware/activityLogger.js';
+import { getDeleteOwnership } from '../middleware/safeDelete.js';
 
-/**
- * Soft delete a record — moves it to RecycleBin instead of permanent delete.
- *
- * Usage in route:
- *   const result = await softDelete({
- *     model: Product,
- *     id: req.params.id,
- *     modelName: 'Product',
- *     module: 'product',
- *     user: req.user,
- *     req,
- *     reason: req.body.deleteReason || '',
- *   });
- *   if (!result.success) return res.status(result.status).json(result);
- *   res.json(result);
- */
-export const softDelete = async ({ model, id, modelName, module, user, req, reason }) => {
+const branchScopeForModel = (Model, branch) => {
+  if (Model.schema.path('branch')) return { branch };
+  if (Model.schema.path('branchId')) return { branchId: branch };
+  return {};
+};
+
+const missingBranch = () => ({
+  success: false,
+  status: 428,
+  code: 'BRANCH_REQUIRED',
+  message: 'Select an active branch before continuing.',
+});
+
+/** Move a record to the selected branch's RecycleBin. */
+export const softDelete = async ({ model, id, modelName, module, user, req, reason, branch, scope = {} }) => {
   try {
-    const record = await model.findById(id).lean();
-    if (!record) {
-      return { success: false, status: 404, message: `${modelName} not found.` };
-    }
+    const authoritativeBranch = branch || req?.branchId || scope.branch || scope.branchId;
+    if (!authoritativeBranch) return missingBranch();
 
-    // Generate display title
-    const recordTitle = record.orderNumber || record.poNumber || record.itemName ||
-      record.businessName || record.companyName || record.name ||
-      record.paymentNumber || record.voucherNumber || record.complaintNumber ||
-      record.leadNumber || record.schemeNumber || record.quotationNumber ||
-      record.debitNoteNumber || record.grnNumber || record.productCode || '';
+    const sourceFilter = {
+      _id: id,
+      ...scope,
+      ...branchScopeForModel(model, authoritativeBranch),
+    };
+    const record = await model.findOne(sourceFilter).lean();
+    if (!record) return { success: false, status: 404, message: `${modelName} not found.` };
 
-    const recordCode = record.productCode || record.orderNumber || record.poNumber ||
-      record.dealerCode || record.supplierCode || record.employeeCode || record.dispatchNumber || '';
+    const recordTitle = record.orderNumber || record.poNumber || record.itemName
+      || record.businessName || record.companyName || record.name
+      || record.paymentNumber || record.voucherNumber || record.complaintNumber
+      || record.leadNumber || record.schemeNumber || record.quotationNumber
+      || record.debitNoteNumber || record.grnNumber || record.productCode || '';
+    const recordCode = record.productCode || record.orderNumber || record.poNumber
+      || record.dealerCode || record.supplierCode || record.employeeCode || record.dispatchNumber || '';
 
-    // Move to recycle bin
-    await RecycleBin.create({
+    const binRecord = await RecycleBin.create({
+      branch: authoritativeBranch,
       originalModel: modelName,
       originalId: record._id,
       recordTitle,
@@ -48,10 +51,12 @@ export const softDelete = async ({ model, id, modelName, module, user, req, reas
       deletedAt: new Date(),
     });
 
-    // Delete from original collection
-    await model.findByIdAndDelete(id);
+    const deleted = await model.deleteOne(sourceFilter);
+    if (deleted.deletedCount !== 1) {
+      await RecycleBin.deleteOne({ _id: binRecord._id, branch: authoritativeBranch });
+      return { success: false, status: 409, message: 'Record changed or moved outside your access scope.' };
+    }
 
-    // Log the activity
     await logActivity({
       user,
       action: 'delete',
@@ -60,69 +65,71 @@ export const softDelete = async ({ model, id, modelName, module, user, req, reas
       recordTitle,
       recordModel: modelName,
       description: `Deleted ${modelName}: ${recordTitle || recordCode}`,
+      branch: authoritativeBranch,
       req,
     });
 
-    return { success: true, message: `${modelName} moved to Recycle Bin. Will auto-delete after 30 days.` };
+    return {
+      success: true,
+      message: `${modelName} moved to Recycle Bin. Will auto-delete after 30 days.`,
+      data: { _id: record._id, branch: authoritativeBranch },
+    };
   } catch (err) {
     return { success: false, status: 500, message: err.message };
   }
 };
 
-/**
- * Restore a record from RecycleBin back to its original collection.
- */
-export const restoreFromBin = async ({ binId, models, user, req }) => {
+/** Restore a record only from the selected branch's RecycleBin. */
+export const restoreFromBin = async ({ binId, models, user, req, branch }) => {
   try {
-    const binRecord = await RecycleBin.findById(binId);
+    const authoritativeBranch = branch || req?.branchId;
+    if (!authoritativeBranch) return missingBranch();
+
+    const binRecord = await RecycleBin.findOne({ _id: binId, branch: authoritativeBranch });
     if (!binRecord) {
       return { success: false, status: 404, message: 'Record not found in Recycle Bin.' };
     }
+    if (binRecord.originalModel === 'User') {
+      return { success: false, status: 400, message: 'User accounts cannot be restored through the Recycle Bin.' };
+    }
 
-    // Get the mongoose model by name
     const Model = models[binRecord.originalModel];
     if (!Model) {
       return { success: false, status: 400, message: `Cannot restore: Model "${binRecord.originalModel}" not found.` };
     }
 
-    // Restore the record — insert raw to bypass validation (data was valid when originally created)
     const data = { ...binRecord.data };
     const originalId = binRecord.originalId;
-    
-    // Check if a record with same ID already exists
     const existing = await Model.findById(originalId);
     if (existing) {
-      return { success: false, status: 400, message: `Cannot restore: A record with the same ID already exists. It may have been re-created.` };
+      return { success: false, status: 400, message: 'Cannot restore: A record with the same ID already exists. It may have been re-created.' };
     }
 
-    // Remove mongoose internal fields
     delete data.__v;
+    if (Model.schema.path('branch')) data.branch = authoritativeBranch;
+    if (Model.schema.path('branchId')) data.branchId = authoritativeBranch;
 
-    // Insert directly into collection (bypasses schema validation — data was valid when saved)
     try {
       await Model.collection.insertOne(data);
     } catch (insertErr) {
-      if (insertErr.code === 11000) {
-        // Duplicate key on unique field (e.g. productCode already exists)
-        // This means another record has the same unique field value
-        // Find which field conflicts and provide clear message
-        const keyPattern = insertErr.keyPattern || {};
-        const keyValue = insertErr.keyValue || {};
-        const conflictField = Object.keys(keyPattern)[0] || 'unknown field';
-        const conflictValue = Object.values(keyValue)[0] || '';
-        return {
-          success: false, status: 400,
-          message: `Cannot restore: Another ${binRecord.originalModel} already has ${conflictField} = "${conflictValue}". Delete or rename that record first, then retry restore.`,
-        };
-      } else {
-        throw insertErr;
-      }
+      if (insertErr.code !== 11000) throw insertErr;
+      const keyPattern = insertErr.keyPattern || {};
+      const keyValue = insertErr.keyValue || {};
+      const conflictField = Object.keys(keyPattern)[0] || 'unknown field';
+      const conflictValue = Object.values(keyValue)[0] || '';
+      return {
+        success: false,
+        status: 400,
+        message: `Cannot restore: Another ${binRecord.originalModel} already has ${conflictField} = "${conflictValue}". Delete or rename that record first, then retry restore.`,
+      };
     }
 
-    // Remove from recycle bin
-    await RecycleBin.findByIdAndDelete(binId);
+    const removed = await RecycleBin.deleteOne({ _id: binId, branch: authoritativeBranch });
+    if (removed.deletedCount !== 1) {
+      await Model.deleteOne({ _id: originalId, ...branchScopeForModel(Model, authoritativeBranch) });
+      return { success: false, status: 409, message: 'Recycle record changed during restore. No record was restored.' };
+    }
 
-    // Log restore
     await logActivity({
       user,
       action: 'restore',
@@ -131,26 +138,28 @@ export const restoreFromBin = async ({ binId, models, user, req }) => {
       recordTitle: binRecord.recordTitle,
       recordModel: binRecord.originalModel,
       description: `Restored ${binRecord.originalModel}: ${binRecord.recordTitle}`,
+      branch: authoritativeBranch,
       req,
     });
 
-    return { success: true, message: `${binRecord.originalModel} "${binRecord.recordTitle}" restored successfully.` };
+    return {
+      success: true,
+      message: `${binRecord.originalModel} "${binRecord.recordTitle}" restored successfully.`,
+      data: { _id: originalId, branch: authoritativeBranch },
+    };
   } catch (err) {
     return { success: false, status: 500, message: err.message };
   }
 };
 
-/**
- * Permanently delete a record from RecycleBin (no recovery possible).
- */
-export const permanentDelete = async ({ binId, user, req }) => {
+/** Permanently delete one recycle item inside the selected branch. */
+export const permanentDelete = async ({ binId, user, req, branch }) => {
   try {
-    const binRecord = await RecycleBin.findById(binId);
-    if (!binRecord) {
-      return { success: false, status: 404, message: 'Not found in Recycle Bin.' };
-    }
+    const authoritativeBranch = branch || req?.branchId;
+    if (!authoritativeBranch) return missingBranch();
 
-    await RecycleBin.findByIdAndDelete(binId);
+    const binRecord = await RecycleBin.findOneAndDelete({ _id: binId, branch: authoritativeBranch });
+    if (!binRecord) return { success: false, status: 404, message: 'Not found in Recycle Bin.' };
 
     await logActivity({
       user,
@@ -160,6 +169,7 @@ export const permanentDelete = async ({ binId, user, req }) => {
       recordTitle: binRecord.recordTitle,
       recordModel: binRecord.originalModel,
       description: `Permanently deleted ${binRecord.originalModel}: ${binRecord.recordTitle}`,
+      branch: authoritativeBranch,
       req,
     });
 
@@ -169,23 +179,32 @@ export const permanentDelete = async ({ binId, user, req }) => {
   }
 };
 
-/**
- * Manual cleanup — delete all recycle bin items older than specified days.
- */
-export const manualCleanup = async ({ olderThanDays = 30, user, req }) => {
+/** Delete old recycle items only inside the selected branch. */
+export const manualCleanup = async ({ olderThanDays = 30, user, req, branch }) => {
   try {
+    const authoritativeBranch = branch || req?.branchId;
+    if (!authoritativeBranch) return missingBranch();
+
     const cutoff = new Date(Date.now() - olderThanDays * 24 * 60 * 60 * 1000);
-    const result = await RecycleBin.deleteMany({ deletedAt: { $lt: cutoff } });
+    const result = await RecycleBin.deleteMany({
+      branch: authoritativeBranch,
+      deletedAt: { $lt: cutoff },
+    });
 
     await logActivity({
       user,
       action: 'permanent_delete',
       module: 'recycle_bin',
       description: `Manual cleanup: removed ${result.deletedCount} items older than ${olderThanDays} days`,
+      branch: authoritativeBranch,
       req,
     });
 
-    return { success: true, message: `${result.deletedCount} items permanently removed.`, data: { deletedCount: result.deletedCount } };
+    return {
+      success: true,
+      message: `${result.deletedCount} items permanently removed.`,
+      data: { deletedCount: result.deletedCount },
+    };
   } catch (err) {
     return { success: false, status: 500, message: err.message };
   }

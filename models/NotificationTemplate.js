@@ -2,7 +2,9 @@ import mongoose from 'mongoose';
 
 const notificationTemplateSchema = new mongoose.Schema(
   {
-    templateCode: { type: String, unique: true, required: true },
+    // Optional only for pre-branch legacy rows. All API writes require and set this field.
+    branch: { type: mongoose.Schema.Types.ObjectId, ref: 'Branch' },
+    templateCode: { type: String, required: true },
     templateName: { type: String, required: true },
     channel: { type: String, enum: ['whatsapp', 'sms', 'email', 'push'], required: true },
     event: { type: String, enum: [
@@ -20,5 +22,9 @@ const notificationTemplateSchema = new mongoose.Schema(
   },
   { timestamps: true }
 );
+
+notificationTemplateSchema.index({ branch: 1, templateCode: 1 }, { unique: true });
+notificationTemplateSchema.index({ branch: 1, event: 1, channel: 1 });
+notificationTemplateSchema.index({ branch: 1, isActive: 1 });
 
 export default mongoose.model('NotificationTemplate', notificationTemplateSchema);

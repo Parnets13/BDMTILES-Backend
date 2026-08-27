@@ -1,9 +1,10 @@
 import { Router } from 'express';
 import Document from '../models/Document.js';
-import { protect } from '../middleware/auth.js';
+import { protect, requirePermission } from '../middleware/auth.js';
 
 const router = Router();
 router.use(protect);
+router.use(requirePermission('document.management'));
 
 router.get('/', async (req, res) => {
   try {

@@ -1,10 +1,12 @@
 import mongoose from 'mongoose';
 
 /**
- * SupplierLedger — auto-generated from PO, GRN, Supplier Payments, Debit Notes
+ * SupplierLedger — append-only branch entries from GRN, payments, and debit notes.
+ * Outstanding is derived from credit minus debit; no running balance is stored.
  */
 const supplierLedgerSchema = new mongoose.Schema(
   {
+    branch: { type: mongoose.Schema.Types.ObjectId, ref: 'Branch', required: true, index: true },
     supplier: { type: mongoose.Schema.Types.ObjectId, ref: 'Supplier', required: true },
     supplierName: String,
     supplierCode: String,
@@ -20,12 +22,13 @@ const supplierLedgerSchema = new mongoose.Schema(
     referenceNumber: String,
     referenceModel: { type: String, enum: ['PurchaseOrder', 'GRN', 'Payment', 'PurchaseReturn', 'SupplierInvoice', ''] },
     referenceId: { type: mongoose.Schema.Types.ObjectId },
+    postingKey: { type: String, trim: true },
+    reversalOf: { type: mongoose.Schema.Types.ObjectId, ref: 'SupplierLedger' },
 
     // Debit = we paid / debit note raised
     // Credit = we owe supplier (purchase/grn)
     debit: { type: Number, default: 0 },
     credit: { type: Number, default: 0 },
-    balance: { type: Number, default: 0 }, // positive = we owe supplier
 
     tallySyncStatus: { type: String, enum: ['not_synced', 'pending', 'synced', 'failed'], default: 'not_synced' },
     createdBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User' },
@@ -33,6 +36,12 @@ const supplierLedgerSchema = new mongoose.Schema(
   { timestamps: true }
 );
 
+supplierLedgerSchema.index({ branch: 1, supplier: 1, entryDate: -1 });
+supplierLedgerSchema.index({ branch: 1, postingKey: 1 }, {
+  unique: true,
+  partialFilterExpression: { postingKey: { $type: 'string' } },
+});
+supplierLedgerSchema.index({ branch: 1, referenceModel: 1, referenceId: 1, entryType: 1 });
 supplierLedgerSchema.index({ supplier: 1, entryDate: -1 });
 supplierLedgerSchema.index({ referenceNumber: 1 });
 

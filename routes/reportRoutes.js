@@ -6,15 +6,16 @@ import GRN from '../models/GRN.js';
 import Stock from '../models/Stock.js';
 import Payment from '../models/Payment.js';
 import DealerLedger from '../models/DealerLedger.js';
-import Dealer from '../models/Dealer.js';
-import Product from '../models/Product.js';
 import Employee from '../models/Employee.js';
 import Attendance from '../models/Attendance.js';
 import Leave from '../models/Leave.js';
 import { protect, requirePermission } from '../middleware/auth.js';
+import { requireBranch } from '../utils/branchScope.js';
+import { getDashboardReport } from '../services/dashboardReport.js';
 
 const router = Router();
 router.use(protect);
+router.use(requireBranch);
 
 const dateFilter = (from, to, field = 'createdAt') => {
   const f = {};
@@ -29,13 +30,9 @@ const dateFilter = (from, to, field = 'createdAt') => {
 // ═══════════════════════════════════════════════════════
 // OWNER DASHBOARD KPIs
 // ═══════════════════════════════════════════════════════
-router.get('/dashboard', requirePermission('reports.management'), async (req, res) => {
+router.get('/dashboard', requirePermission('dashboard.view'), async (req, res) => {
   try {
-    const today = new Date(); today.setHours(0,0,0,0);
-    const weekStart = new Date(today); weekStart.setDate(today.getDate() - 6);
-    const monthStart = new Date(today.getFullYear(), today.getMonth(), 1);
-    const prevMonthStart = new Date(today.getFullYear(), today.getMonth() - 1, 1);
-    const prevMonthEnd = new Date(today.getFullYear(), today.getMonth(), 0);
+    return await getDashboardReport(req, res);
 
     const [
       todaySales, monthSales, prevMonthSales,
@@ -43,18 +40,18 @@ router.get('/dashboard', requirePermission('reports.management'), async (req, re
       pendingPayments, openComplaints,
       weeklySalesTrend,
     ] = await Promise.all([
-      SalesOrder.aggregate([{ $match: { createdAt: { $gte: today }, status: { $nin: ['cancelled','draft'] } } }, { $group: { _id: null, total: { $sum: '$grandTotal' }, count: { $sum: 1 } } }]),
-      SalesOrder.aggregate([{ $match: { createdAt: { $gte: monthStart }, status: { $nin: ['cancelled','draft'] } } }, { $group: { _id: null, total: { $sum: '$grandTotal' }, count: { $sum: 1 } } }]),
-      SalesOrder.aggregate([{ $match: { createdAt: { $gte: prevMonthStart, $lte: prevMonthEnd }, status: { $nin: ['cancelled','draft'] } } }, { $group: { _id: null, total: { $sum: '$grandTotal' } } }]),
-      SalesOrder.countDocuments({ status: { $in: ['confirmed','processing','approved'] } }),
-      Stock.aggregate([{ $group: { _id: null, totalQty: { $sum: '$availableQty' } } }]),
-      Stock.aggregate([{ $group: { _id: null, value: { $sum: { $multiply: ['$availableQty','$purchaseRate'] } } } }]),
-      SalesOrder.aggregate([{ $match: { paymentStatus: { $in: ['pending','partial'] }, status: { $nin: ['cancelled','draft'] } } }, { $group: { _id: null, total: { $sum: '$balanceAmount' }, count: { $sum: 1 } } }]),
+      SalesOrder.aggregate([{ $match: { branch: req.branchId, createdAt: { $gte: today }, status: { $nin: ['cancelled','draft'] } } }, { $group: { _id: null, total: { $sum: '$grandTotal' }, count: { $sum: 1 } } }]),
+      SalesOrder.aggregate([{ $match: { branch: req.branchId, createdAt: { $gte: monthStart }, status: { $nin: ['cancelled','draft'] } } }, { $group: { _id: null, total: { $sum: '$grandTotal' }, count: { $sum: 1 } } }]),
+      SalesOrder.aggregate([{ $match: { branch: req.branchId, createdAt: { $gte: prevMonthStart, $lte: prevMonthEnd }, status: { $nin: ['cancelled','draft'] } } }, { $group: { _id: null, total: { $sum: '$grandTotal' } } }]),
+      SalesOrder.countDocuments({ branch: req.branchId, status: { $in: ['confirmed','processing','approved'] } }),
+      Stock.aggregate([{ $match: { branch: req.branchId } }, { $group: { _id: null, totalQty: { $sum: '$availableQty' } } }]),
+      Stock.aggregate([{ $match: { branch: req.branchId } }, { $group: { _id: null, value: { $sum: { $multiply: ['$availableQty','$purchaseRate'] } } } }]),
+      SalesOrder.aggregate([{ $match: { branch: req.branchId, paymentStatus: { $in: ['pending','partial'] }, status: { $nin: ['cancelled','draft'] } } }, { $group: { _id: null, total: { $sum: '$balanceAmount' }, count: { $sum: 1 } } }]),
       // placeholder — complaints model optional
       Promise.resolve([{ count: 0 }]),
       // Daily sales for last 7 days
       SalesOrder.aggregate([
-        { $match: { createdAt: { $gte: weekStart }, status: { $nin: ['cancelled','draft'] } } },
+        { $match: { branch: req.branchId, createdAt: { $gte: weekStart }, status: { $nin: ['cancelled','draft'] } } },
         { $group: { _id: { $dateToString: { format: '%Y-%m-%d', date: '$createdAt' } }, total: { $sum: '$grandTotal' }, count: { $sum: 1 } } },
         { $sort: { _id: 1 } },
       ]),
@@ -83,10 +80,10 @@ router.get('/dashboard', requirePermission('reports.management'), async (req, re
 // ═══════════════════════════════════════════════════════
 // SALES REPORTS
 // ═══════════════════════════════════════════════════════
-router.get('/sales', requirePermission('reports.management'), async (req, res) => {
+router.get('/sales', requirePermission('reports.sales'), async (req, res) => {
   try {
     const { dateFrom, dateTo, groupBy = 'day', dealer, category } = req.query;
-    const match = { status: { $nin: ['cancelled','draft'] }, ...dateFilter(dateFrom, dateTo, 'orderDate') };
+    const match = { branch: req.branchId, status: { $nin: ['cancelled','draft'] }, ...dateFilter(dateFrom, dateTo, 'orderDate') };
     if (dealer) match.dealer = dealer;
 
     const groupFormats = { day: '%Y-%m-%d', month: '%Y-%m', year: '%Y' };
@@ -109,7 +106,7 @@ router.get('/sales', requirePermission('reports.management'), async (req, res) =
         { $sort: { revenue: -1 } }, { $limit: 10 },
       ]),
       SalesReturn.aggregate([
-        { $match: { status: { $nin: ['cancelled'] }, ...dateFilter(dateFrom, dateTo, 'returnDate') } },
+        { $match: { branch: req.branchId, status: { $nin: ['cancelled'] }, ...dateFilter(dateFrom, dateTo, 'returnDate') } },
         { $group: { _id: null, total: { $sum: '$grandTotal' }, count: { $sum: 1 } } },
       ]),
     ]);
@@ -128,10 +125,10 @@ router.get('/sales', requirePermission('reports.management'), async (req, res) =
 // ═══════════════════════════════════════════════════════
 // PURCHASE REPORTS
 // ═══════════════════════════════════════════════════════
-router.get('/purchase', requirePermission('reports.management'), async (req, res) => {
+router.get('/purchase', requirePermission('reports.purchase'), async (req, res) => {
   try {
     const { dateFrom, dateTo, supplier } = req.query;
-    const match = { status: { $nin: ['cancelled'] }, ...dateFilter(dateFrom, dateTo, 'poDate') };
+    const match = { branch: req.branchId, status: { $nin: ['cancelled'] }, ...dateFilter(dateFrom, dateTo, 'poDate') };
     if (supplier) match.supplier = supplier;
 
     const [byPeriod, bySupplier, summary] = await Promise.all([
@@ -161,10 +158,10 @@ router.get('/purchase', requirePermission('reports.management'), async (req, res
 // ═══════════════════════════════════════════════════════
 // INVENTORY REPORTS
 // ═══════════════════════════════════════════════════════
-router.get('/inventory', requirePermission('reports.management'), async (req, res) => {
+router.get('/inventory', requirePermission('reports.inventory'), async (req, res) => {
   try {
     const { warehouse, lowStock = 10 } = req.query;
-    const match = warehouse ? { warehouse } : {};
+    const match = { branch: req.branchId, ...(warehouse ? { warehouse } : {}) };
 
     const [summary, byWarehouse, lowStockItems, stockAging] = await Promise.all([
       Stock.aggregate([
@@ -195,10 +192,10 @@ router.get('/inventory', requirePermission('reports.management'), async (req, re
 // ═══════════════════════════════════════════════════════
 // GST REPORTS (GSTR-1 / GSTR-3B style)
 // ═══════════════════════════════════════════════════════
-router.get('/gst', requirePermission('reports.management'), async (req, res) => {
+router.get('/gst', requirePermission('reports.sales'), async (req, res) => {
   try {
     const { dateFrom, dateTo } = req.query;
-    const match = { status: { $nin: ['cancelled','draft'] }, ...dateFilter(dateFrom, dateTo, 'orderDate') };
+    const match = { branch: req.branchId, status: { $nin: ['cancelled','draft'] }, ...dateFilter(dateFrom, dateTo, 'orderDate') };
 
     const [gstrData, gstByRate] = await Promise.all([
       SalesOrder.aggregate([
@@ -241,19 +238,33 @@ router.get('/gst', requirePermission('reports.management'), async (req, res) => 
 // ═══════════════════════════════════════════════════════
 // AGING REPORT (outstanding receivables)
 // ═══════════════════════════════════════════════════════
-router.get('/aging', requirePermission('reports.management'), async (req, res) => {
+router.get('/aging', requirePermission('reports.sales'), async (req, res) => {
   try {
-    const today = new Date();
-    const dealers = await Dealer.find({ currentOutstanding: { $gt: 0 } })
-      .select('businessName dealerCode city creditLimit creditDays currentOutstanding').lean();
+    const ledgerBalances = await DealerLedger.aggregate([
+      { $match: { branch: req.branchId } },
+      {
+        $group: {
+          _id: '$dealer',
+          outstanding: { $sum: { $subtract: [{ $ifNull: ['$debit', 0] }, { $ifNull: ['$credit', 0] }] } },
+          dealerName: { $last: '$dealerName' },
+          dealerCode: { $last: '$dealerCode' },
+        },
+      },
+      { $match: { outstanding: { $gt: 0 } } },
+      { $lookup: { from: 'dealers', localField: '_id', foreignField: '_id', as: 'dealer' } },
+      { $unwind: { path: '$dealer', preserveNullAndEmptyArrays: true } },
+    ]);
 
-    const buckets = dealers.map(d => {
-      const outstanding = d.currentOutstanding || 0;
+    const buckets = ledgerBalances.map((entry) => {
+      const outstanding = entry.outstanding || 0;
       return {
-        dealerCode: d.dealerCode, dealerName: d.businessName, city: d.city,
-        creditLimit: d.creditLimit, creditDays: d.creditDays,
+        dealerCode: entry.dealerCode || entry.dealer?.dealerCode || '',
+        dealerName: entry.dealerName || entry.dealer?.businessName || '',
+        city: entry.dealer?.city || '',
+        creditLimit: entry.dealer?.creditLimit || 0,
+        creditDays: entry.dealer?.creditDays || 0,
         outstanding,
-        overCreditLimit: outstanding > (d.creditLimit || 0),
+        overCreditLimit: outstanding > (entry.dealer?.creditLimit || 0),
       };
     });
 
@@ -270,17 +281,32 @@ router.get('/aging', requirePermission('reports.management'), async (req, res) =
 // ═══════════════════════════════════════════════════════
 // PROFIT ANALYSIS
 // ═══════════════════════════════════════════════════════
-router.get('/profit', requirePermission('reports.management'), async (req, res) => {
+router.get('/profit', requirePermission('reports.sales'), async (req, res) => {
   try {
     const { dateFrom, dateTo } = req.query;
-    const match = { status: { $nin: ['cancelled','draft'] }, ...dateFilter(dateFrom, dateTo, 'orderDate') };
+    const match = { branch: req.branchId, status: { $nin: ['cancelled','draft'] }, ...dateFilter(dateFrom, dateTo, 'orderDate') };
 
     // Bill-wise profit: revenue - (qty * purchase rate from stock)
     const salesData = await SalesOrder.aggregate([
       { $match: match }, { $unwind: '$items' },
       {
         $lookup: {
-          from: 'stocks', localField: 'items.product', foreignField: 'product',
+          from: 'stocks',
+          let: { productId: '$items.product', orderBranch: '$branch' },
+          pipeline: [
+            {
+              $match: {
+                $expr: {
+                  $and: [
+                    { $eq: ['$product', '$$productId'] },
+                    { $eq: ['$branch', '$$orderBranch'] },
+                  ],
+                },
+              },
+            },
+            { $sort: { updatedAt: -1 } },
+            { $limit: 1 },
+          ],
           as: 'stockInfo',
         },
       },
@@ -321,7 +347,7 @@ router.get('/profit', requirePermission('reports.management'), async (req, res) 
 // ═══════════════════════════════════════════════════════
 // HR REPORTS
 // ═══════════════════════════════════════════════════════
-router.get('/hr', requirePermission('reports.management'), async (req, res) => {
+router.get('/hr', requirePermission('reports.sales'), async (req, res) => {
   try {
     const { dateFrom, dateTo } = req.query;
     const [totalEmployees, activeEmployees, byDept, pendingLeaves] = await Promise.all([
@@ -337,10 +363,10 @@ router.get('/hr', requirePermission('reports.management'), async (req, res) => {
 // ═══════════════════════════════════════════════════════
 // DEALER PERFORMANCE
 // ═══════════════════════════════════════════════════════
-router.get('/dealer-performance', requirePermission('reports.management'), async (req, res) => {
+router.get('/dealer-performance', requirePermission('reports.sales'), async (req, res) => {
   try {
     const { dateFrom, dateTo } = req.query;
-    const match = { status: { $nin: ['cancelled','draft'] }, ...dateFilter(dateFrom, dateTo, 'orderDate') };
+    const match = { branch: req.branchId, status: { $nin: ['cancelled','draft'] }, ...dateFilter(dateFrom, dateTo, 'orderDate') };
 
     const dealerData = await SalesOrder.aggregate([
       { $match: match },
@@ -361,18 +387,18 @@ router.get('/dealer-performance', requirePermission('reports.management'), async
 // ═══════════════════════════════════════════════════════
 // FINANCE STATEMENTS (Balance Sheet / P&L / Trial Balance stubs)
 // ═══════════════════════════════════════════════════════
-router.get('/finance-summary', requirePermission('reports.management'), async (req, res) => {
+router.get('/finance-summary', requirePermission('reports.sales'), async (req, res) => {
   try {
     const { dateFrom, dateTo } = req.query;
-    const salesMatch = { status: { $nin: ['cancelled','draft'] }, ...dateFilter(dateFrom, dateTo, 'orderDate') };
-    const purchaseMatch = { status: { $nin: ['cancelled'] }, ...dateFilter(dateFrom, dateTo, 'poDate') };
+    const salesMatch = { branch: req.branchId, status: { $nin: ['cancelled','draft'] }, ...dateFilter(dateFrom, dateTo, 'orderDate') };
+    const purchaseMatch = { branch: req.branchId, status: { $nin: ['cancelled'] }, ...dateFilter(dateFrom, dateTo, 'poDate') };
 
     const [totalSales, totalPurchase, totalReceipts, totalPayments, stockValue] = await Promise.all([
       SalesOrder.aggregate([{ $match: salesMatch }, { $group: { _id: null, total: { $sum: '$grandTotal' }, tax: { $sum: '$totalTax' } } }]),
       PurchaseOrder.aggregate([{ $match: purchaseMatch }, { $group: { _id: null, total: { $sum: '$grandTotal' }, tax: { $sum: '$totalTax' } } }]),
-      Payment.aggregate([{ $match: { paymentType: 'dealer_receipt', status: 'confirmed', ...dateFilter(dateFrom, dateTo, 'paymentDate') } }, { $group: { _id: null, total: { $sum: '$amount' } } }]),
-      Payment.aggregate([{ $match: { paymentType: 'supplier_payment', status: 'confirmed', ...dateFilter(dateFrom, dateTo, 'paymentDate') } }, { $group: { _id: null, total: { $sum: '$amount' } } }]),
-      Stock.aggregate([{ $group: { _id: null, value: { $sum: { $multiply: ['$availableQty','$purchaseRate'] } } } }]),
+      Payment.aggregate([{ $match: { branch: req.branchId, paymentType: 'dealer_receipt', status: 'confirmed', ...dateFilter(dateFrom, dateTo, 'paymentDate') } }, { $group: { _id: null, total: { $sum: '$amount' } } }]),
+      Payment.aggregate([{ $match: { branch: req.branchId, paymentType: 'supplier_payment', status: 'confirmed', ...dateFilter(dateFrom, dateTo, 'paymentDate') } }, { $group: { _id: null, total: { $sum: '$amount' } } }]),
+      Stock.aggregate([{ $match: { branch: req.branchId } }, { $group: { _id: null, value: { $sum: { $multiply: ['$availableQty','$purchaseRate'] } } } }]),
     ]);
 
     const revenue = totalSales[0]?.total || 0;
@@ -393,10 +419,10 @@ router.get('/finance-summary', requirePermission('reports.management'), async (r
 // ═══════════════════════════════════════════════════════
 // PROFITABILITY REPORT
 // ═══════════════════════════════════════════════════════
-router.get('/profitability', requirePermission('reports.management'), async (req, res) => {
+router.get('/profitability', requirePermission('reports.sales'), async (req, res) => {
   try {
     const { dateFrom, dateTo } = req.query;
-    const match = { status: { $nin: ['cancelled', 'draft'] }, ...dateFilter(dateFrom, dateTo, 'orderDate') };
+    const match = { branch: req.branchId, status: { $nin: ['cancelled', 'draft'] }, ...dateFilter(dateFrom, dateTo, 'orderDate') };
 
     const [productProfit, categoryProfit, dealerProfit, overallSummary] = await Promise.all([
       // Product-wise profit (sales amount - estimated purchase cost)
@@ -463,10 +489,10 @@ router.get('/profitability', requirePermission('reports.management'), async (req
 // ═══════════════════════════════════════════════════════
 // DEALER PERFORMANCE REPORT
 // ═══════════════════════════════════════════════════════
-router.get('/dealer-performance', requirePermission('reports.management'), async (req, res) => {
+router.get('/dealer-performance', requirePermission('reports.sales'), async (req, res) => {
   try {
     const { dateFrom, dateTo } = req.query;
-    const match = { status: { $nin: ['cancelled', 'draft'] }, ...dateFilter(dateFrom, dateTo, 'orderDate') };
+    const match = { branch: req.branchId, status: { $nin: ['cancelled', 'draft'] }, ...dateFilter(dateFrom, dateTo, 'orderDate') };
 
     const dealerPerformance = await SalesOrder.aggregate([
       { $match: match },
@@ -485,7 +511,7 @@ router.get('/dealer-performance', requirePermission('reports.management'), async
     ]);
 
     // Get payment data per dealer
-    const paymentMatch = dateFilter(dateFrom, dateTo, 'paymentDate');
+    const paymentMatch = { branch: req.branchId, ...dateFilter(dateFrom, dateTo, 'paymentDate') };
     const dealerPayments = await Payment.aggregate([
       { $match: { status: 'confirmed', ...paymentMatch } },
       { $group: { _id: '$dealer', collected: { $sum: '$amount' } } },
@@ -506,10 +532,10 @@ router.get('/dealer-performance', requirePermission('reports.management'), async
 // ═══════════════════════════════════════════════════════
 // SALES EXECUTIVE PERFORMANCE REPORT
 // ═══════════════════════════════════════════════════════
-router.get('/se-performance', requirePermission('reports.management'), async (req, res) => {
+router.get('/se-performance', requirePermission('reports.sales'), async (req, res) => {
   try {
     const { dateFrom, dateTo } = req.query;
-    const match = { status: { $nin: ['cancelled', 'draft'] }, ...dateFilter(dateFrom, dateTo, 'orderDate') };
+    const match = { branch: req.branchId, status: { $nin: ['cancelled', 'draft'] }, ...dateFilter(dateFrom, dateTo, 'orderDate') };
 
     const sePerformance = await SalesOrder.aggregate([
       { $match: { ...match, salesExecutive: { $exists: true, $ne: null } } },

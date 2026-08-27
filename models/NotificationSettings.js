@@ -17,10 +17,11 @@ const recipientSchema = new mongoose.Schema({
 
 const notificationSettingsSchema = new mongoose.Schema(
   {
+    // Optional only for pre-branch legacy rows. All API writes require and set this field.
+    branch: { type: mongoose.Schema.Types.ObjectId, ref: 'Branch' },
     module: {
       type: String,
       required: true,
-      unique: true,
       enum: [
         'sales_order', 'quotation', 'invoice', 'payment', 'purchase_order', 'grn',
         'stock_alert', 'dispatch', 'delivery', 'complaint', 'lead', 'approval',
@@ -58,6 +59,7 @@ const notificationSettingsSchema = new mongoose.Schema(
   { timestamps: true }
 );
 
-notificationSettingsSchema.index({ module: 1 });
+notificationSettingsSchema.index({ branch: 1, module: 1 }, { unique: true });
+notificationSettingsSchema.index({ branch: 1, updatedAt: -1 });
 
 export default mongoose.model('NotificationSettings', notificationSettingsSchema);

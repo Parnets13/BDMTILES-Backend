@@ -7,7 +7,8 @@ import mongoose from 'mongoose';
  */
 const expenseSchema = new mongoose.Schema(
   {
-    expenseNumber: { type: String, unique: true, required: true },
+    expenseNumber: { type: String, required: true },
+    branch: { type: mongoose.Schema.Types.ObjectId, ref: 'Branch', index: true },
     employee: { type: mongoose.Schema.Types.ObjectId, ref: 'Employee', required: true },
     employeeName: String,
     department: String,
@@ -51,7 +52,9 @@ const expenseSchema = new mongoose.Schema(
   { timestamps: true }
 );
 
-expenseSchema.index({ expenseNumber: 1 });
+expenseSchema.index({ branch: 1, status: 1, expenseDate: -1 });
+expenseSchema.index({ branch: 1, employee: 1, status: 1 });
+expenseSchema.index({ branch: 1, expenseNumber: 1 }, { unique: true });
 expenseSchema.index({ employee: 1, status: 1 });
 expenseSchema.index({ status: 1, expenseDate: -1 });
 

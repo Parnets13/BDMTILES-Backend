@@ -2,6 +2,7 @@ import mongoose from 'mongoose';
 
 const loanSchema = new mongoose.Schema(
   {
+    branch: { type: mongoose.Schema.Types.ObjectId, ref: 'Branch', index: true },
     employee: { type: mongoose.Schema.Types.ObjectId, ref: 'Employee', required: true },
     type: { type: String, enum: ['Loan', 'Advance'], required: true },
     amount: { type: Number, required: true },
@@ -18,6 +19,6 @@ const loanSchema = new mongoose.Schema(
   { timestamps: true }
 );
 
-loanSchema.index({ employee: 1, status: 1 });
+loanSchema.index({ branch: 1, employee: 1, status: 1 });
 
 export default mongoose.model('Loan', loanSchema);

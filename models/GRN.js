@@ -24,8 +24,11 @@ const grnItemSchema = new mongoose.Schema({
 
 const grnSchema = new mongoose.Schema(
   {
-    grnNumber: { type: String, unique: true, required: true },
+    grnNumber: { type: String, required: true },
+    branch: { type: mongoose.Schema.Types.ObjectId, ref: 'Branch', index: true },
     grnDate: { type: Date, default: Date.now },
+    sourceKey: { type: String, unique: true, sparse: true },
+    requestFingerprint: { type: String, default: '' },
     purchaseOrder: { type: mongoose.Schema.Types.ObjectId, ref: 'PurchaseOrder' },
     poNumber: String,
     supplier: { type: mongoose.Schema.Types.ObjectId, ref: 'Supplier', required: true },
@@ -51,7 +54,9 @@ const grnSchema = new mongoose.Schema(
   { timestamps: true }
 );
 
-grnSchema.index({ grnNumber: 1 });
+grnSchema.index({ branch: 1, status: 1, grnDate: -1 });
+grnSchema.index({ branch: 1, purchaseOrder: 1 });
+grnSchema.index({ branch: 1, grnNumber: 1 }, { unique: true });
 grnSchema.index({ purchaseOrder: 1 });
 grnSchema.index({ supplier: 1, grnDate: -1 });
 

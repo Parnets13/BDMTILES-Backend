@@ -18,10 +18,11 @@ import ActivityLog from '../models/ActivityLog.js';
  */
 export const logActivity = async ({
   user, action, module, recordId, recordTitle, recordModel,
-  description, changes, metadata, req,
+  description, changes, metadata, branch, req,
 }) => {
   try {
     await ActivityLog.create({
+      branch: branch || req?.branchId || undefined,
       user: user?._id || user,
       userName: user?.name || user?.userName || '',
       userRole: user?.role || '',
@@ -59,8 +60,8 @@ export const autoLogMiddleware = (req, res, next) => {
   const originalJson = res.json.bind(res);
 
   res.json = function (body) {
-    // Only log successful operations
-    if (body?.success && req.user) {
+    // Explicit lifecycle/audit logging can suppress the generic entry to avoid duplicates.
+    if (body?.success && req.user && !res.locals.skipAutoActivityLog) {
       const action = getActionFromMethod(req.method, req.path);
       const module = getModuleFromPath(req.originalUrl || req.path);
 

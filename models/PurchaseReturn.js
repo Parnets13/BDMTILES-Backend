@@ -20,7 +20,8 @@ const purchaseReturnItemSchema = new mongoose.Schema({
 
 const purchaseReturnSchema = new mongoose.Schema(
   {
-    debitNoteNumber: { type: String, unique: true, required: true },
+    debitNoteNumber: { type: String, required: true },
+    branch: { type: mongoose.Schema.Types.ObjectId, ref: 'Branch', index: true },
     returnDate: { type: Date, default: Date.now },
 
     // Reference to PO / GRN
@@ -40,6 +41,9 @@ const purchaseReturnSchema = new mongoose.Schema(
     totalTax: { type: Number, default: 0 },
     grandTotal: { type: Number, default: 0 },
 
+    sourceKey: { type: String, unique: true, sparse: true },
+    requestFingerprint: { type: String, default: '' },
+
     // Status
     status: { type: String, enum: ['draft', 'approved', 'stock_deducted', 'debit_issued', 'cancelled'], default: 'draft' },
     approvedBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User' },
@@ -57,7 +61,9 @@ const purchaseReturnSchema = new mongoose.Schema(
   { timestamps: true }
 );
 
-purchaseReturnSchema.index({ debitNoteNumber: 1 });
+purchaseReturnSchema.index({ branch: 1, status: 1, returnDate: -1 });
+purchaseReturnSchema.index({ branch: 1, purchaseOrder: 1 });
+purchaseReturnSchema.index({ branch: 1, debitNoteNumber: 1 }, { unique: true });
 purchaseReturnSchema.index({ supplier: 1, returnDate: -1 });
 purchaseReturnSchema.index({ purchaseOrder: 1 });
 purchaseReturnSchema.index({ status: 1 });

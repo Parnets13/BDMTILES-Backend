@@ -1,5 +1,6 @@
 import { Router } from 'express';
 import Cheque from '../models/Cheque.js';
+import Payment from '../models/Payment.js';
 import Dealer from '../models/Dealer.js';
 import Supplier from '../models/Supplier.js';
 import { protect, requirePermission } from '../middleware/auth.js';
@@ -119,17 +120,30 @@ router.patch('/:id/bounce', requirePermission('cheque.management'), async (req, 
   try {
     const cheque = await Cheque.findById(req.params.id);
     if (!cheque) return res.status(404).json({ success: false, message: 'Not found.' });
+    if (cheque.status === 'bounced') return res.json({ success: true, message: 'Cheque is already marked bounced.', data: cheque });
+
+    let bounceReason = req.body.reason || '';
+    let bounceCharges = req.body.charges || 0;
+    if (cheque.payment) {
+      const payment = await Payment.findById(cheque.payment).lean();
+      if (!payment) return res.status(409).json({ success: false, message: 'The linked Payment no longer exists.' });
+      if (payment.status !== 'bounced') {
+        return res.status(422).json({
+          success: false,
+          message: 'Bounce the linked Payment first so its branch subledger reversal and charge are posted atomically.',
+        });
+      }
+      bounceReason = payment.bounceReason || bounceReason;
+      bounceCharges = payment.bounceCharges || 0;
+    }
+
     cheque.status = 'bounced';
     cheque.bounceDate = new Date();
-    cheque.bounceReason = req.body.reason || '';
-    cheque.bounceCharges = req.body.charges || 0;
+    cheque.bounceReason = bounceReason;
+    cheque.bounceCharges = bounceCharges;
     cheque.bounceCount = (cheque.bounceCount || 0) + 1;
-    cheque.timeline.push({ action: 'bounced', performedBy: req.user._id, performedByName: req.user.name, notes: `Bounced: ${req.body.reason || 'No reason'} · Charges: ₹${req.body.charges || 0}` });
+    cheque.timeline.push({ action: 'bounced', performedBy: req.user._id, performedByName: req.user.name, notes: `Bounced: ${bounceReason || 'No reason'} · Charges: ₹${bounceCharges}` });
     await cheque.save();
-    // Update dealer outstanding — amount comes back + charges
-    if (cheque.chequeType === 'received' && cheque.dealer) {
-      await Dealer.findByIdAndUpdate(cheque.dealer, { $inc: { currentOutstanding: cheque.amount + (cheque.bounceCharges || 0) } });
-    }
     res.json({ success: true, message: 'Cheque marked bounced.', data: cheque });
   } catch (e) { res.status(500).json({ success: false, message: e.message }); }
 });

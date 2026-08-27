@@ -3,10 +3,16 @@ import Invoice from '../models/Invoice.js';
 import SalesOrder from '../models/SalesOrder.js';
 import Dealer from '../models/Dealer.js';
 import Product from '../models/Product.js';
+import BranchSettings from '../models/BranchSettings.js';
 import { protect, requirePermission } from '../middleware/auth.js';
+import { requireBranch } from '../utils/branchScope.js';
+import { generateBranchNumber } from '../utils/branchSequence.js';
+import { requestFingerprint as fingerprintRequest } from '../utils/idempotency.js';
+import { gstStateMatchesCode, isKnownGstStateCode } from '../utils/gstJurisdiction.js';
 
 const router = Router();
 router.use(protect);
+router.use(requireBranch);
 
 // Number to words (Indian format)
 function numberToWords(num) {
@@ -36,7 +42,7 @@ router.get('/', requirePermission('sales.order.dashboard'), async (req, res) => 
     const p = Math.max(1, parseInt(page));
     const l = Math.min(100, parseInt(limit) || 20);
 
-    let filter = {};
+    let filter = { branch: req.branchId };
     if (search) {
       const regex = new RegExp(search, 'i');
       filter.$or = [{ invoiceNumber: regex }, { buyerName: regex }, { buyerCode: regex }, { orderNumber: regex }];
@@ -65,21 +71,32 @@ router.get('/', requirePermission('sales.order.dashboard'), async (req, res) => 
 // GET /api/v1/invoices/stats
 router.get('/stats', requirePermission('sales.order.dashboard'), async (req, res) => {
   try {
+    const scope = { branch: req.branchId };
     const [total, generated, sent, cancelled, totalValue] = await Promise.all([
-      Invoice.countDocuments(),
-      Invoice.countDocuments({ status: 'generated' }),
-      Invoice.countDocuments({ status: 'sent' }),
-      Invoice.countDocuments({ status: 'cancelled' }),
-      Invoice.aggregate([{ $match: { status: { $ne: 'cancelled' } } }, { $group: { _id: null, total: { $sum: '$grandTotal' } } }]),
+      Invoice.countDocuments(scope),
+      Invoice.countDocuments({ ...scope, status: 'generated' }),
+      Invoice.countDocuments({ ...scope, status: 'sent' }),
+      Invoice.countDocuments({ ...scope, status: 'cancelled' }),
+      Invoice.aggregate([{ $match: { ...scope, status: { $ne: 'cancelled' } } }, { $group: { _id: null, total: { $sum: '$grandTotal' } } }]),
     ]);
     res.json({ success: true, data: { total, generated, sent, cancelled, totalValue: totalValue[0]?.total || 0 } });
   } catch (e) { res.status(500).json({ success: false, message: e.message }); }
 });
 
+function validGstin(value) {
+  return /^[0-9]{2}[A-Z]{5}[0-9]{4}[A-Z][1-9A-Z]Z[0-9A-Z]$/.test(String(value || '').trim().toUpperCase());
+}
+
 // POST /api/v1/invoices/generate-from-so/:soId — generate invoice from Sales Order
 router.post('/generate-from-so/:soId', requirePermission('sales.order.dashboard'), async (req, res) => {
+  const rawIdempotencyKey = String(req.get('Idempotency-Key') || '').trim();
+  if (!rawIdempotencyKey || rawIdempotencyKey.length > 200) {
+    return res.status(422).json({ success: false, message: 'A valid Idempotency-Key header is required.' });
+  }
+  const sourceKey = `${String(req.branchId)}:${rawIdempotencyKey}`;
+  const requestFingerprint = fingerprintRequest({ salesOrder: req.params.soId, ...req.body });
   try {
-    const so = await SalesOrder.findById(req.params.soId)
+    const so = await SalesOrder.findOne({ _id: req.params.soId, branch: req.branchId })
       .populate('dealer', 'businessName dealerCode gstin pan address city state mobile')
       .populate('items.product', 'productCode itemName hsnCode images piecesPerBox sqftPerBox')
       .lean();
@@ -89,15 +106,37 @@ router.post('/generate-from-so/:soId', requirePermission('sales.order.dashboard'
       return res.status(400).json({ success: false, message: `Cannot generate invoice for "${so.status}" order.` });
     }
 
-    // Check if invoice already exists for this SO
-    const existing = await Invoice.findOne({ salesOrder: so._id, status: { $ne: 'cancelled' } }).lean();
-    if (existing) {
-      return res.status(400).json({ success: false, message: `Invoice ${existing.invoiceNumber} already exists for this order.` });
+    if (!so.dealer) {
+      return res.status(422).json({ success: false, message: 'A dealer with a complete tax profile is required for a tax invoice.' });
+    }
+    const sellerGstin = String(req.branch.gstin || '').trim().toUpperCase();
+    const sellerState = String(req.branch.state || '').trim();
+    const sellerStateCode = String(req.branch.stateCode || '').trim();
+    const buyerGstin = String(so.dealer.gstin || '').trim().toUpperCase();
+    const buyerState = String(so.dealer.state || '').trim();
+    const buyerName = String(so.dealerName || so.dealer.businessName || so.customerName || '').trim();
+    if (!sellerState || !/^\d{2}$/.test(sellerStateCode) || !isKnownGstStateCode(sellerStateCode)
+      || !gstStateMatchesCode(sellerStateCode, sellerState) || !validGstin(sellerGstin)
+      || sellerGstin.slice(0, 2) !== sellerStateCode) {
+      return res.status(422).json({ success: false, message: 'The active branch requires a valid GSTIN, state, and matching two-digit state code.' });
+    }
+    const buyerStateCode = buyerGstin.slice(0, 2);
+    if (!buyerName || !buyerState || !validGstin(buyerGstin)
+      || !isKnownGstStateCode(buyerStateCode) || !gstStateMatchesCode(buyerStateCode, buyerState)) {
+      return res.status(422).json({ success: false, message: 'The dealer requires a name, valid GSTIN, and matching canonical GST state.' });
     }
 
-    // Generate invoice number (checks recycle bin too)
-    const { generateUniqueCode } = await import('../utils/codeGenerator.js');
-    const invoiceNumber = await generateUniqueCode(Invoice, 'invoiceNumber', 'INV-', 6);
+    // Existing active invoice is the authoritative idempotent result for this sales order.
+    const existing = await Invoice.findOne({ branch: req.branchId, salesOrder: so._id, status: { $ne: 'cancelled' } }).lean();
+    if (existing) {
+      if (existing.sourceKey === sourceKey && existing.requestFingerprint
+        && existing.requestFingerprint !== requestFingerprint) {
+        return res.status(409).json({ success: false, message: 'This Idempotency-Key was already used with a different invoice request.' });
+      }
+      return res.json({ success: true, message: `Invoice ${existing.invoiceNumber} already exists for this order.`, data: existing });
+    }
+
+    const invoiceNumber = await generateBranchNumber(req.branchId, 'invoice', new Date());
 
     // Build invoice items with full details
     const items = so.items.map(item => {
@@ -149,10 +188,9 @@ router.post('/generate-from-so/:soId', requirePermission('sales.order.dashboard'
       };
     });
 
-    // Determine if inter-state (buyer state different from seller state)
-    const sellerState = 'Karnataka'; // TODO: Load from company settings
-    const buyerState = so.dealer?.state || '';
-    const isInterState = buyerState && buyerState.toLowerCase() !== sellerState.toLowerCase();
+    // Determine interstate treatment from GST jurisdiction codes, never from missing/free-text state names.
+    const branchSettings = await BranchSettings.findOne({ branch: req.branchId }).lean();
+    const isInterState = buyerStateCode !== sellerStateCode;
 
     // If inter-state, convert CGST+SGST to IGST
     if (isInterState) {
@@ -178,23 +216,34 @@ router.post('/generate-from-so/:soId', requirePermission('sales.order.dashboard'
 
     const invoice = await Invoice.create({
       invoiceNumber,
+      sourceKey,
+      requestFingerprint,
+      activeSalesOrderKey: `${String(req.branchId)}:${String(so._id)}`,
+      branch: req.branchId,
       invoiceDate: new Date(),
       invoiceType: 'tax_invoice',
       gstType: 'output', // Sales invoice = Output GST
       isInterState,
       salesOrder: so._id,
       orderNumber: so.orderNumber,
+      sellerName: req.branch.legalName || req.branch.name,
+      sellerGstin,
+      sellerAddress: [req.branch.address, req.branch.city, sellerState, req.branch.pinCode].filter(Boolean).join(', '),
+      sellerState,
+      sellerStateCode,
+      termsAndConditions: branchSettings?.invoiceTerms || '',
 
       // Buyer
       buyerType: so.orderType || 'dealer',
       dealer: so.dealer?._id,
-      buyerName: so.dealerName || so.customerName || '',
+      buyerName,
       buyerCode: so.dealerCode || '',
-      buyerGstin: so.dealer?.gstin || '',
+      buyerGstin,
       buyerPan: so.dealer?.pan || '',
       buyerAddress: so.dealer?.address || '',
       buyerCity: so.dealer?.city || '',
-      buyerState: so.dealer?.state || '',
+      buyerState,
+      buyerStateCode,
       buyerPhone: so.dealer?.mobile || so.customerPhone || '',
       deliveryAddress: so.deliveryAddress || '',
 
@@ -228,13 +277,19 @@ router.post('/generate-from-so/:soId', requirePermission('sales.order.dashboard'
     });
 
     res.status(201).json({ success: true, message: `Invoice ${invoiceNumber} generated.`, data: invoice });
-  } catch (e) { res.status(500).json({ success: false, message: e.message }); }
+  } catch (e) {
+    if (e.code === 11000) {
+      const existing = await Invoice.findOne({ branch: req.branchId, salesOrder: req.params.soId, status: { $ne: 'cancelled' } }).lean();
+      if (existing) return res.json({ success: true, message: `Invoice ${existing.invoiceNumber} already exists for this order.`, data: existing });
+    }
+    return res.status(e.status || 500).json({ success: false, message: e.message });
+  }
 });
 
 // GET /api/v1/invoices/:id — get single invoice (full detail for PDF)
 router.get('/:id', requirePermission('sales.order.dashboard'), async (req, res) => {
   try {
-    const invoice = await Invoice.findById(req.params.id)
+    const invoice = await Invoice.findOne({ _id: req.params.id, branch: req.branchId })
       .populate('dealer', 'businessName dealerCode gstin address city state mobile')
       .populate('salesOrder', 'orderNumber orderDate')
       .populate('createdBy', 'name')
@@ -248,24 +303,52 @@ router.get('/:id', requirePermission('sales.order.dashboard'), async (req, res) 
 router.patch('/:id/status', requirePermission('sales.order.dashboard'), async (req, res) => {
   try {
     const { status, cancelReason } = req.body;
-    const update = { status };
-    if (status === 'cancelled' && cancelReason) update.cancelReason = cancelReason;
-    const invoice = await Invoice.findByIdAndUpdate(req.params.id, update, { new: true });
-    if (!invoice) return res.status(404).json({ success: false, message: 'Not found.' });
-    res.json({ success: true, message: `Invoice ${status}.`, data: invoice });
+    if (!['sent', 'cancelled'].includes(status)) {
+      return res.status(422).json({ success: false, message: 'Invoice status must be sent or cancelled.' });
+    }
+    const allowedSourceStatuses = status === 'sent' ? ['generated'] : ['generated', 'sent'];
+    const update = { $set: { status } };
+    if (status === 'cancelled') {
+      update.$unset = { activeSalesOrderKey: 1 };
+      if (cancelReason) update.$set.cancelReason = cancelReason;
+    }
+    const invoice = await Invoice.findOneAndUpdate(
+      { _id: req.params.id, branch: req.branchId, status: { $in: allowedSourceStatuses } },
+      update,
+      { new: true, runValidators: true }
+    );
+    if (invoice) {
+      return res.json({ success: true, message: `Invoice ${status}.`, data: invoice });
+    }
+
+    const existing = await Invoice.findOne({ _id: req.params.id, branch: req.branchId });
+    if (!existing) return res.status(404).json({ success: false, message: 'Invoice not found.' });
+    if (status === 'sent' && existing.status === 'sent') {
+      return res.json({ success: true, message: 'Invoice already sent.', data: existing });
+    }
+    return res.status(409).json({
+      success: false,
+      message: `Invoice cannot transition from ${existing.status} to ${status}.`,
+    });
   } catch (e) { res.status(500).json({ success: false, message: e.message }); }
 });
 
 // DELETE — not allowed for generated invoices, only draft
 router.delete('/:id', requirePermission('sales.order.dashboard'), async (req, res) => {
   try {
-    const invoice = await Invoice.findById(req.params.id);
+    const invoice = await Invoice.findOne({ _id: req.params.id, branch: req.branchId });
     if (!invoice) return res.status(404).json({ success: false, message: 'Not found.' });
     if (invoice.status !== 'draft') {
       return res.status(400).json({ success: false, message: 'Only draft invoices can be deleted. Cancel generated invoices instead.' });
     }
     const { safeDelete } = await import('../middleware/safeDelete.js');
-    const result = await safeDelete(Invoice, req.params.id, { user: req.user, module: 'invoice', titleField: 'buyerName', codeField: 'invoiceNumber' });
+    const result = await safeDelete(Invoice, req.params.id, {
+      user: req.user,
+      module: 'invoice',
+      titleField: 'buyerName',
+      codeField: 'invoiceNumber',
+      scope: { branch: req.branchId },
+    });
     res.status(result.status || 200).json(result);
   } catch (e) { res.status(500).json({ success: false, message: e.message }); }
 });

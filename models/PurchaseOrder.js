@@ -17,7 +17,9 @@ const poItemSchema = new mongoose.Schema({
 
 const purchaseOrderSchema = new mongoose.Schema(
   {
-    poNumber: { type: String, unique: true, required: true },
+    poNumber: { type: String, required: true },
+    branch: { type: mongoose.Schema.Types.ObjectId, ref: 'Branch', index: true },
+    receivingWarehouse: { type: mongoose.Schema.Types.ObjectId, ref: 'Warehouse' },
     poDate: { type: Date, default: Date.now },
     supplier: { type: mongoose.Schema.Types.ObjectId, ref: 'Supplier', required: true },
     supplierName: String,
@@ -60,7 +62,9 @@ const purchaseOrderSchema = new mongoose.Schema(
   { timestamps: true }
 );
 
-purchaseOrderSchema.index({ poNumber: 1 });
+purchaseOrderSchema.index({ branch: 1, status: 1, poDate: -1 });
+purchaseOrderSchema.index({ branch: 1, supplier: 1, status: 1 });
+purchaseOrderSchema.index({ branch: 1, poNumber: 1 }, { unique: true });
 purchaseOrderSchema.index({ supplier: 1, status: 1 });
 purchaseOrderSchema.index({ status: 1, poDate: -1 });
 

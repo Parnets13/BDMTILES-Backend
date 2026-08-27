@@ -2,6 +2,7 @@ import mongoose from 'mongoose';
 
 const taskSchema = new mongoose.Schema(
   {
+    branch: { type: mongoose.Schema.Types.ObjectId, ref: 'Branch', index: true },
     taskNumber: { type: String, unique: true },
     title: { type: String, required: true, trim: true },
     description: { type: String, default: '' },
@@ -47,9 +48,9 @@ const taskSchema = new mongoose.Schema(
   { timestamps: true }
 );
 
-taskSchema.index({ assignedTo: 1, status: 1 });
-taskSchema.index({ dueDate: 1 });
-taskSchema.index({ status: 1 });
-taskSchema.index({ priority: -1 });
+taskSchema.index({ branch: 1, assignedTo: 1, status: 1 });
+taskSchema.index({ branch: 1, dueDate: 1 });
+taskSchema.index({ branch: 1, status: 1 });
+taskSchema.index({ branch: 1, priority: -1 });
 
 export default mongoose.model('Task', taskSchema);

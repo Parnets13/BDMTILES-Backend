@@ -10,7 +10,7 @@ const bankEntrySchema = new mongoose.Schema({
   // Matching
   matchStatus: { type: String, enum: ['unmatched', 'matched', 'partial', 'discrepancy'], default: 'unmatched' },
   matchedWith: { type: String, default: '' }, // voucher/payment/receipt reference
-  matchedVoucherId: { type: mongoose.Schema.Types.ObjectId },
+  matchedVoucherId: { type: mongoose.Schema.Types.ObjectId, ref: 'Payment' },
   matchedAmount: { type: Number, default: 0 },
   difference: { type: Number, default: 0 },
   remarks: { type: String, default: '' },
@@ -18,7 +18,14 @@ const bankEntrySchema = new mongoose.Schema({
 
 const bankReconciliationSchema = new mongoose.Schema(
   {
-    reconciliationNumber: { type: String, unique: true, required: true },
+    reconciliationNumber: { type: String, required: true },
+    branch: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: 'Branch',
+      required: true,
+      immutable: true,
+      index: true,
+    },
     reconciliationDate: { type: Date, default: Date.now },
 
     // Bank account
@@ -62,8 +69,9 @@ const bankReconciliationSchema = new mongoose.Schema(
   { timestamps: true }
 );
 
-bankReconciliationSchema.index({ reconciliationNumber: 1 });
-bankReconciliationSchema.index({ bankAccount: 1 });
-bankReconciliationSchema.index({ status: 1 });
+bankReconciliationSchema.index({ branch: 1, reconciliationNumber: 1 }, { unique: true });
+bankReconciliationSchema.index({ branch: 1, createdAt: -1 });
+bankReconciliationSchema.index({ branch: 1, status: 1, createdAt: -1 });
+bankReconciliationSchema.index({ branch: 1, bankAccount: 1, statementFrom: -1 });
 
 export default mongoose.model('BankReconciliation', bankReconciliationSchema);

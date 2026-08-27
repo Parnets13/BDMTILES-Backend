@@ -1,221 +1,393 @@
 import { Router } from 'express';
+import mongoose from 'mongoose';
 import Quotation from '../models/Quotation.js';
 import SalesOrder from '../models/SalesOrder.js';
 import Dealer from '../models/Dealer.js';
-import Product from '../models/Product.js';
+import DealerLedger from '../models/DealerLedger.js';
+import { deriveOrderPricing, addCreditApproval } from '../services/orderPricingService.js';
+import { syncAutomaticApprovalRequest } from '../services/approvalRequestService.js';
 import { protect, requirePermission } from '../middleware/auth.js';
+import { requireBranch } from '../utils/branchScope.js';
+import { generateBranchNumber } from '../utils/branchSequence.js';
+import { postSubledgerEntry } from '../utils/subledgerPosting.js';
 
 const router = Router();
 router.use(protect);
+router.use(requireBranch);
 
-// ─── helpers ───────────────────────────────────────────────
-function calcItems(items) {
-  let subtotal = 0, totalDiscount = 0, totalTax = 0;
-  const processed = items.map(item => {
-    const qty = item.quantity || 0;
-    const rate = item.rate || 0;
-    const base = qty * rate;
-    const discAmt = item.discountType === 'percentage'
-      ? (base * (item.discount || 0)) / 100
-      : (item.discount || 0) * qty;
-    const taxable = base - discAmt;
-    const gst = (taxable * (item.gstPercentage || 18)) / 100;
-    subtotal += taxable;
-    totalDiscount += discAmt;
-    totalTax += gst;
-    return {
-      ...item,
-      taxableAmount: +taxable.toFixed(2),
-      gstAmount: +gst.toFixed(2),
-      totalAmount: +(taxable + gst).toFixed(2),
-    };
+const SERVER_MANAGED_FIELDS = new Set([
+  'quotationNumber', 'branch', 'legacyBranch', 'createdBy', 'dealerName', 'dealerCode', 'dealerTypeSnapshot',
+  'subtotal', 'totalDiscount', 'totalSchemeDiscount', 'totalTax', 'roundOff', 'grandTotal',
+  'status', 'approvalRequired', 'approvalStatus', 'approvalReasons', 'approvedBy', 'approvalDate', 'approvalRemarks',
+  'convertedToSO', 'convertedAt', 'version', 'previousVersion', 'tallySyncStatus', 'createdAt', 'updatedAt', '_id', '__v',
+]);
+const STATUS_TRANSITIONS = {
+  draft: new Set(['sent', 'cancelled']),
+  pending_approval: new Set(['cancelled']),
+  approved: new Set(['sent', 'accepted', 'cancelled']),
+  sent: new Set(['accepted', 'cancelled']),
+  accepted: new Set(['cancelled']),
+  converted: new Set([]), expired: new Set([]), cancelled: new Set([]),
+};
+const routeError = (status, message) => Object.assign(new Error(message), { status });
+function editableBody(body = {}) {
+  return Object.fromEntries(Object.entries(body).filter(([key]) => !SERVER_MANAGED_FIELDS.has(key)));
+}
+async function findActiveDealer(id, session = null) {
+  if (!id || !mongoose.isValidObjectId(id)) return null;
+  let query = Dealer.findById(id).populate('dealerType', 'name pricingTier status');
+  if (session) query = query.session(session);
+  const dealer = await query.lean();
+  if (dealer && dealer.status !== 'active') throw routeError(422, 'Dealer is not active.');
+  if (dealer?.dealerType && dealer.dealerType.status !== 'active') throw routeError(422, 'DealerType is not active.');
+  return dealer;
+}
+async function getBranchOutstanding(branchId, dealerId, session = null) {
+  let aggregate = DealerLedger.aggregate([
+    { $match: { branch: branchId, dealer: dealerId } },
+    { $group: { _id: null, debit: { $sum: '$debit' }, credit: { $sum: '$credit' } } },
+  ]);
+  if (session) aggregate = aggregate.session(session);
+  const [branchLedger] = await aggregate;
+  return Number((branchLedger?.debit || 0) - (branchLedger?.credit || 0));
+}
+function quotationContext(data, dealer) {
+  if (dealer) return { dealerId: dealer._id, dealerTypeId: dealer.dealerType?._id, scope: 'dealer', orderType: data.customerType || 'dealer' };
+  if (data.dealerType) return { dealerTypeId: data.dealerType, scope: 'dealer_type', orderType: data.customerType || 'retail' };
+  return { scope: 'walk_in', orderType: 'retail' };
+}
+function quotationPricingFields(priced, dealer) {
+  return {
+    items: priced.items,
+    subtotal: priced.subtotal,
+    totalDiscount: priced.totalDiscount,
+    totalSchemeDiscount: priced.totalSchemeDiscount,
+    totalTax: priced.totalTax,
+    freightCharges: priced.freightCharges,
+    loadingCharges: priced.loadingCharges,
+    installationCharges: priced.installationCharges,
+    otherCharges: priced.otherCharges,
+    roundOff: priced.roundOff,
+    grandTotal: priced.grandTotal,
+    dealerType: dealer?.dealerType?._id || priced.dealerType,
+    dealerTypeSnapshot: dealer?.dealerType
+      ? { name: dealer.dealerType.name, pricingTier: dealer.dealerType.pricingTier }
+      : priced.dealerTypeSnapshot,
+    approvalReasons: priced.approvalReasons,
+    approvalRequired: priced.approvalReasons.length > 0,
+    approvalStatus: priced.approvalStatus,
+  };
+}
+async function priceQuotation(data, dealer, branchId, session = null, existingReasons = [], options = {}) {
+  const priced = await deriveOrderPricing({
+    branchId, ...quotationContext(data, dealer), pricingDate: data.quotationDate || new Date(),
+    items: data.items, freightCharges: data.freightCharges, loadingCharges: data.loadingCharges,
+    installationCharges: data.installationCharges, otherCharges: data.otherCharges,
+    existingApprovalReasons: existingReasons, preserveSnapshots: Boolean(options.preserveSnapshots),
+    preserveBelowMinimumApprovals: Boolean(options.preserveBelowMinimumApprovals), session,
   });
-  return { items: processed, subtotal, totalDiscount, totalTax };
+  return { priced, fields: quotationPricingFields(priced, dealer) };
 }
 
-// GET /api/v1/quotations — list
 router.get('/', requirePermission('sales.order.create'), async (req, res) => {
   try {
     const { page = 1, limit = 20, search, status, dealer } = req.query;
-    const p = Math.max(1, parseInt(page));
-    const l = Math.min(100, parseInt(limit) || 20);
-    let filter = {};
+    const p = Math.max(1, Number.parseInt(page, 10) || 1);
+    const l = Math.min(100, Number.parseInt(limit, 10) || 20);
+    const filter = { branch: req.branchId };
     if (search) {
-      const r = new RegExp(search, 'i');
-      filter.$or = [{ quotationNumber: r }, { dealerName: r }, { customerName: r }];
+      const regex = new RegExp(search, 'i');
+      filter.$or = [{ quotationNumber: regex }, { dealerName: regex }, { customerName: regex }];
     }
     if (status) filter.status = status;
     if (dealer) filter.dealer = dealer;
-
     const [data, total] = await Promise.all([
-      Quotation.find(filter)
-        .sort({ createdAt: -1 }).skip((p - 1) * l).limit(l)
-        .populate('dealer', 'businessName dealerCode mobile')
-        .lean(),
+      Quotation.find(filter).sort({ createdAt: -1 }).skip((p - 1) * l).limit(l)
+        .populate('dealer', 'businessName dealerCode mobile').populate('dealerType', 'name pricingTier').lean(),
       Quotation.countDocuments(filter),
     ]);
-    res.json({ success: true, data, pagination: { currentPage: p, totalPages: Math.ceil(total / l), totalItems: total } });
-  } catch (e) { res.status(500).json({ success: false, message: e.message }); }
+    return res.json({ success: true, data, pagination: { currentPage: p, totalPages: Math.ceil(total / l), totalItems: total } });
+  } catch (error) { return res.status(500).json({ success: false, message: error.message }); }
 });
 
-// GET /api/v1/quotations/stats
 router.get('/stats', requirePermission('sales.order.create'), async (req, res) => {
   try {
-    const [total, draft, sent, accepted, converted, expired, cancelled] = await Promise.all([
-      Quotation.countDocuments(),
-      Quotation.countDocuments({ status: 'draft' }),
-      Quotation.countDocuments({ status: 'sent' }),
-      Quotation.countDocuments({ status: 'accepted' }),
-      Quotation.countDocuments({ status: 'converted' }),
-      Quotation.countDocuments({ status: 'expired' }),
-      Quotation.countDocuments({ status: 'cancelled' }),
+    const scope = { branch: req.branchId };
+    const [total, draft, pendingApproval, sent, accepted, converted, expired, cancelled] = await Promise.all([
+      Quotation.countDocuments(scope), Quotation.countDocuments({ ...scope, status: 'draft' }),
+      Quotation.countDocuments({ ...scope, status: 'pending_approval' }), Quotation.countDocuments({ ...scope, status: 'sent' }),
+      Quotation.countDocuments({ ...scope, status: 'accepted' }), Quotation.countDocuments({ ...scope, status: 'converted' }),
+      Quotation.countDocuments({ ...scope, status: 'expired' }), Quotation.countDocuments({ ...scope, status: 'cancelled' }),
     ]);
     const totalValue = await Quotation.aggregate([
-      { $match: { status: { $nin: ['cancelled'] } } },
+      { $match: { ...scope, status: { $ne: 'cancelled' } } },
       { $group: { _id: null, total: { $sum: '$grandTotal' } } },
     ]);
-    res.json({ success: true, data: { total, draft, sent, accepted, converted, expired, cancelled, totalValue: totalValue[0]?.total || 0 } });
-  } catch (e) { res.status(500).json({ success: false, message: e.message }); }
+    return res.json({ success: true, data: { total, draft, pendingApproval, sent, accepted, converted, expired, cancelled, totalValue: totalValue[0]?.total || 0 } });
+  } catch (error) { return res.status(500).json({ success: false, message: error.message }); }
 });
 
-// GET /api/v1/quotations/:id
+router.post('/price-preview', requirePermission('sales.order.create'), async (req, res) => {
+  try {
+    const data = editableBody(req.body);
+    const dealer = data.dealer ? await findActiveDealer(data.dealer) : null;
+    if (data.dealer && !dealer) throw routeError(404, 'Dealer not found.');
+    if (!dealer && !data.customerName) throw routeError(422, 'customerName is required for walk-in quotations.');
+    const { fields } = await priceQuotation(data, dealer, req.branchId);
+    return res.json({ success: true, data: fields });
+  } catch (error) { return res.status(error.status || (['CastError', 'ValidationError'].includes(error.name) ? 422 : 500)).json({ success: false, message: error.message }); }
+});
+
 router.get('/:id', requirePermission('sales.order.create'), async (req, res) => {
   try {
-    const q = await Quotation.findById(req.params.id)
+    const quotation = await Quotation.findOne({ _id: req.params.id, branch: req.branchId })
       .populate('dealer', 'businessName dealerCode mobile city gstin')
-      .populate('items.product', 'productCode itemName tileSize finish')
-      .lean();
-    if (!q) return res.status(404).json({ success: false, message: 'Quotation not found.' });
-    res.json({ success: true, data: q });
-  } catch (e) { res.status(500).json({ success: false, message: e.message }); }
+      .populate('dealerType', 'name pricingTier')
+      .populate('items.product', 'productCode itemName tileSize finish').lean();
+    if (!quotation) return res.status(404).json({ success: false, message: 'Quotation not found.' });
+    return res.json({ success: true, data: quotation });
+  } catch (error) { return res.status(500).json({ success: false, message: error.message }); }
 });
 
-// POST /api/v1/quotations — create
 router.post('/', requirePermission('sales.order.create'), async (req, res) => {
+  const session = await mongoose.startSession();
   try {
-    const body = { ...req.body, createdBy: req.user._id };
-    const { generateUniqueCode } = await import('../utils/codeGenerator.js');
-    body.quotationNumber = await generateUniqueCode(Quotation, 'quotationNumber', 'QT-', 5);
-
-    if (body.dealer) {
-      const d = await Dealer.findById(body.dealer).lean();
-      if (d) { body.dealerName = d.businessName; body.dealerCode = d.dealerCode; }
-    }
-
-    if (body.items?.length) {
-      const { items, subtotal, totalDiscount, totalTax } = calcItems(body.items);
-      body.items = items;
-      body.subtotal = subtotal;
-      body.totalDiscount = totalDiscount;
-      body.totalTax = totalTax;
-      body.grandTotal = Math.round(subtotal + totalTax + (body.freightCharges || 0) + (body.loadingCharges || 0) + (body.installationCharges || 0) + (body.otherCharges || 0));
-    }
-
-    // Default validity: 30 days from today
-    if (!body.validUntil) {
-      const v = new Date(); v.setDate(v.getDate() + 30);
-      body.validUntil = v;
-    }
-
-    const q = await Quotation.create(body);
-    res.status(201).json({ success: true, message: `Quotation ${q.quotationNumber} created.`, data: q });
-  } catch (e) { res.status(500).json({ success: false, message: e.message }); }
+    let quotation;
+    await session.withTransaction(async () => {
+      const data = editableBody(req.body);
+      if (data.customerType === 'walk_in') data.customerType = 'retail';
+      const dealer = data.dealer ? await findActiveDealer(data.dealer, session) : null;
+      if (data.dealer && !dealer) throw routeError(404, 'Dealer not found.');
+      if (!dealer && !data.customerName) throw routeError(422, 'customerName is required for walk-in quotations.');
+      const { fields } = await priceQuotation(data, dealer, req.branchId, session);
+      Object.assign(data, fields, {
+        branch: req.branchId,
+        createdBy: req.user._id,
+        quotationNumber: await generateBranchNumber(req.branchId, 'quotation', data.quotationDate || new Date()),
+        dealerName: dealer?.businessName || '',
+        dealerCode: dealer?.dealerCode || '',
+        tallySyncStatus: 'not_synced',
+      });
+      data.status = fields.approvalRequired ? 'pending_approval' : (req.body.status === 'sent' ? 'sent' : 'draft');
+      if (!data.validUntil) {
+        const validUntil = new Date(data.quotationDate || new Date());
+        validUntil.setDate(validUntil.getDate() + 30);
+        data.validUntil = validUntil;
+      }
+      [quotation] = await Quotation.create([data], { session });
+      await syncAutomaticApprovalRequest({
+        branchId: req.branchId,
+        type: 'quotation',
+        referenceModel: 'Quotation',
+        referenceId: quotation._id,
+        referenceNumber: quotation.quotationNumber,
+        title: `Quotation ${quotation.quotationNumber} requires pricing approval`,
+        reasons: quotation.approvalReasons || [],
+        requestedBy: req.user._id,
+        requestedByName: req.user.name || '',
+        requestedValue: quotation.grandTotal,
+        document: quotation,
+        session,
+      });
+    });
+    return res.status(201).json({ success: true, message: `Quotation ${quotation.quotationNumber} created.`, data: quotation });
+  } catch (error) { return res.status(error.status || (error.code === 11000 ? 409 : ['CastError', 'ValidationError'].includes(error.name) ? 422 : 500)).json({ success: false, message: error.message }); }
+  finally { await session.endSession(); }
 });
 
-// PATCH /api/v1/quotations/:id/status — update status (sent / accepted / cancelled)
+router.put('/:id', requirePermission('sales.order.create'), async (req, res) => {
+  const session = await mongoose.startSession();
+  try {
+    let quotation;
+    await session.withTransaction(async () => {
+      quotation = await Quotation.findOne({ _id: req.params.id, branch: req.branchId }).session(session);
+      if (!quotation) throw routeError(404, 'Quotation not found.');
+      if (!['draft', 'pending_approval'].includes(quotation.status)) throw routeError(409, `Cannot edit quotation in "${quotation.status}" status.`);
+      const updates = editableBody(req.body);
+      if (updates.customerType === 'walk_in') updates.customerType = 'retail';
+      const data = { ...quotation.toObject(), ...updates };
+      const dealer = data.dealer ? await findActiveDealer(data.dealer, session) : null;
+      if (data.dealer && !dealer) throw routeError(404, 'Dealer not found.');
+      if (!dealer && !data.customerName) throw routeError(422, 'customerName is required for walk-in quotations.');
+      const { fields } = await priceQuotation(data, dealer, req.branchId, session, quotation.approvalReasons || []);
+      Object.assign(quotation, updates, fields, {
+        dealerName: dealer?.businessName || '', dealerCode: dealer?.dealerCode || '',
+        status: fields.approvalRequired ? 'pending_approval' : 'draft',
+      });
+      if (quotation.tallySyncStatus === 'synced') quotation.tallySyncStatus = 'pending';
+      await quotation.save({ session });
+      await syncAutomaticApprovalRequest({
+        branchId: req.branchId,
+        type: 'quotation',
+        referenceModel: 'Quotation',
+        referenceId: quotation._id,
+        referenceNumber: quotation.quotationNumber,
+        title: `Quotation ${quotation.quotationNumber} requires pricing approval`,
+        reasons: quotation.approvalReasons || [],
+        requestedBy: req.user._id,
+        requestedByName: req.user.name || '',
+        requestedValue: quotation.grandTotal,
+        document: quotation,
+        session,
+      });
+    });
+    return res.json({ success: true, message: 'Quotation updated.', data: quotation });
+  } catch (error) { return res.status(error.status || (['CastError', 'ValidationError'].includes(error.name) ? 422 : 500)).json({ success: false, message: error.message }); }
+  finally { await session.endSession(); }
+});
+
 router.patch('/:id/status', requirePermission('sales.order.create'), async (req, res) => {
+  const session = await mongoose.startSession();
   try {
     const { status } = req.body;
-    const q = await Quotation.findByIdAndUpdate(req.params.id, { status }, { new: true });
-    if (!q) return res.status(404).json({ success: false, message: 'Not found.' });
-    res.json({ success: true, message: `Quotation marked as ${status}.`, data: q });
-  } catch (e) { res.status(500).json({ success: false, message: e.message }); }
-});
-
-// POST /api/v1/quotations/:id/convert — convert quotation to Sales Order
-router.post('/:id/convert', requirePermission('sales.order.create'), async (req, res) => {
-  try {
-    const q = await Quotation.findById(req.params.id)
-      .populate('dealer', 'businessName dealerCode creditLimit currentOutstanding')
-      .lean();
-    if (!q) return res.status(404).json({ success: false, message: 'Not found.' });
-    if (q.status === 'converted') return res.status(400).json({ success: false, message: 'Already converted.' });
-    if (q.status === 'cancelled') return res.status(400).json({ success: false, message: 'Cannot convert cancelled quotation.' });
-
-    // Generate unique SO number (safe against recycle bin conflicts)
-    const { generateUniqueCode } = await import('../utils/codeGenerator.js');
-    const soNumber = await generateUniqueCode(SalesOrder, 'orderNumber', 'SO-', 5);
-
-    // Credit limit check
-    let creditLimitExceeded = false;
-    let approvalStatus = 'not_required';
-    if (q.dealer?.creditLimit > 0) {
-      const outstanding = (q.dealer.currentOutstanding || 0) + (q.grandTotal || 0);
-      if (outstanding > q.dealer.creditLimit) {
-        creditLimitExceeded = true;
-        approvalStatus = 'pending';
+    let quotation;
+    await session.withTransaction(async () => {
+      const current = await Quotation.findOne({ _id: req.params.id, branch: req.branchId }).session(session);
+      if (!current) throw routeError(404, 'Quotation not found.');
+      if (!STATUS_TRANSITIONS[current.status]?.has(status)) throw routeError(409, `Cannot change quotation from "${current.status}" to "${status}".`);
+      if (status === 'accepted' && ['pending', 'rejected'].includes(current.approvalStatus)) throw routeError(409, 'Quotation cannot be accepted before pricing approval.');
+      quotation = await Quotation.findOneAndUpdate(
+        { _id: current._id, branch: req.branchId, status: current.status, updatedAt: current.updatedAt },
+        { $set: { status } },
+        { new: true, runValidators: true, session }
+      );
+      if (!quotation) throw routeError(409, 'Quotation changed before the status update could be applied.');
+      if (status === 'cancelled') {
+        await syncAutomaticApprovalRequest({
+          branchId: req.branchId,
+          type: 'quotation',
+          referenceModel: 'Quotation',
+          referenceId: quotation._id,
+          reasons: [],
+          session,
+        });
       }
-    }
-
-    // Map customer type to SO orderType
-    const typeMap = { dealer: 'dealer', wholesaler: 'wholesaler', retail: 'retail', distributor: 'distributor', builder: 'builder' };
-    const orderType = typeMap[q.customerType] || 'dealer';
-
-    const so = await SalesOrder.create({
-      orderNumber: soNumber,
-      orderDate: new Date(),
-      orderType,
-      dealer: q.dealer?._id || undefined,
-      dealerName: q.dealerName || q.customerName || '',
-      dealerCode: q.dealerCode || '',
-      customerName: q.customerName || '',
-      customerPhone: q.customerPhone || '',
-      items: q.items,
-      subtotal: q.subtotal,
-      totalDiscount: q.totalDiscount,
-      totalTax: q.totalTax,
-      freightCharges: q.freightCharges || 0,
-      loadingCharges: q.loadingCharges || 0,
-      installationCharges: q.installationCharges || 0,
-      otherCharges: q.otherCharges || 0,
-      grandTotal: q.grandTotal,
-      balanceAmount: q.grandTotal,
-      status: 'confirmed',
-      remarks: `Converted from ${q.quotationNumber}. ${q.remarks || ''}`.trim(),
-      tallySyncStatus: 'not_synced',
-      creditLimitExceeded,
-      approvalStatus,
-      createdBy: req.user._id,
     });
-
-    // Mark quotation as converted
-    await Quotation.findByIdAndUpdate(q._id, {
-      status: 'converted',
-      convertedToSO: so._id,
-      convertedAt: new Date(),
-    });
-
-    // Increment dealer outstanding for the new confirmed SO
-    if (so.dealer && so.grandTotal > 0) {
-      await Dealer.findByIdAndUpdate(so.dealer, { $inc: { currentOutstanding: so.grandTotal } });
-    }
-
-    res.json({ success: true, message: `Converted to ${soNumber}.`, data: { quotation: q, salesOrder: so } });
-  } catch (e) { res.status(500).json({ success: false, message: e.message }); }
+    return res.json({ success: true, message: `Quotation marked as ${status}.`, data: quotation });
+  } catch (error) { return res.status(error.status || (['CastError', 'ValidationError'].includes(error.name) ? 422 : 500)).json({ success: false, message: error.message }); }
+  finally { await session.endSession(); }
 });
 
-// DELETE /api/v1/quotations/:id — draft/cancelled only
+router.post('/:id/convert', requirePermission('sales.order.create'), async (req, res) => {
+  let preflight;
+  try {
+    preflight = await Quotation.findOne({ _id: req.params.id, branch: req.branchId }).lean();
+    if (!preflight) throw routeError(404, 'Quotation not found.');
+    if (!['accepted', 'approved'].includes(preflight.status)) throw routeError(409, 'Only accepted or approved quotations can be converted.');
+    if (preflight.approvalRequired && preflight.approvalStatus !== 'approved') throw routeError(409, 'Quotation pricing approval is required before conversion.');
+    if (preflight.validUntil && new Date(preflight.validUntil) < new Date()) throw routeError(409, 'Expired quotation cannot be converted.');
+  } catch (error) { return res.status(error.status || (['CastError', 'ValidationError'].includes(error.name) ? 422 : 500)).json({ success: false, message: error.message }); }
+
+  let soNumber;
+  try { soNumber = await generateBranchNumber(preflight.branch, 'salesOrder', new Date()); }
+  catch (error) { return res.status(error.status || (['CastError', 'ValidationError'].includes(error.name) ? 422 : 500)).json({ success: false, message: error.message }); }
+
+  const session = await mongoose.startSession();
+  try {
+    let quotation;
+    let salesOrder;
+    await session.withTransaction(async () => {
+      const current = await Quotation.findOne({ _id: req.params.id, branch: req.branchId }).session(session).lean();
+      if (!current) throw routeError(404, 'Quotation not found.');
+      if (!['accepted', 'approved'].includes(current.status)) throw routeError(409, 'Quotation is no longer convertible.');
+      if (current.approvalRequired && current.approvalStatus !== 'approved') throw routeError(409, 'Quotation pricing approval is required before conversion.');
+      if (current.validUntil && new Date(current.validUntil) < new Date()) throw routeError(409, 'Expired quotation cannot be converted.');
+      const dealer = current.dealer ? await findActiveDealer(current.dealer, session) : null;
+      if (current.dealer && !dealer) throw routeError(404, 'Dealer not found.');
+      const { priced } = await priceQuotation(current, dealer, req.branchId, session, current.approvalReasons || [], {
+        preserveSnapshots: true,
+        preserveBelowMinimumApprovals: true,
+      });
+      const outstanding = dealer ? await getBranchOutstanding(req.branchId, dealer._id, session) : 0;
+      const approval = addCreditApproval(priced, dealer, outstanding, current.approvalReasons || [], { preserveBelowMinimum: true });
+      const salesOrderId = new mongoose.Types.ObjectId();
+      quotation = await Quotation.findOneAndUpdate(
+        { _id: current._id, branch: req.branchId, status: current.status },
+        { $set: { status: 'converted', convertedToSO: salesOrderId, convertedAt: new Date() } },
+        { new: true, runValidators: true, session }
+      );
+      if (!quotation) throw routeError(409, 'Quotation status changed before conversion.');
+      const orderStatus = ['pending', 'rejected'].includes(approval.approvalStatus) ? 'draft' : 'confirmed';
+      [salesOrder] = await SalesOrder.create([{
+        _id: salesOrderId,
+        orderNumber: soNumber,
+        branch: current.branch,
+        orderDate: new Date(),
+        dealer: current.dealer || undefined,
+        dealerType: dealer?.dealerType?._id || priced.dealerType,
+        dealerTypeSnapshot: dealer?.dealerType
+          ? { name: dealer.dealerType.name, pricingTier: dealer.dealerType.pricingTier }
+          : priced.dealerTypeSnapshot,
+        dealerName: dealer?.businessName || current.customerName || '',
+        dealerCode: dealer?.dealerCode || '',
+        customerName: current.customerName || '',
+        customerPhone: current.customerPhone || '',
+        deliveryAddress: current.customerAddress || '',
+        orderType: dealer ? (current.customerType || 'dealer') : 'retail',
+        items: priced.items,
+        subtotal: priced.subtotal,
+        totalDiscount: priced.totalDiscount,
+        totalSchemeDiscount: priced.totalSchemeDiscount,
+        totalTax: priced.totalTax,
+        freightCharges: priced.freightCharges,
+        loadingCharges: priced.loadingCharges,
+        installationCharges: priced.installationCharges,
+        otherCharges: priced.otherCharges,
+        roundOff: priced.roundOff,
+        grandTotal: priced.grandTotal,
+        balanceAmount: priced.grandTotal,
+        paymentStatus: 'pending',
+        status: orderStatus,
+        sourceQuotation: current._id,
+        remarks: `Converted from ${current.quotationNumber}. ${current.remarks || ''}`.trim(),
+        tallySyncStatus: 'not_synced',
+        ...approval,
+        createdBy: req.user._id,
+      }], { session });
+      await syncAutomaticApprovalRequest({
+        branchId: req.branchId,
+        type: 'sales_order',
+        referenceModel: 'SalesOrder',
+        referenceId: salesOrder._id,
+        referenceNumber: salesOrder.orderNumber,
+        title: `Sales Order ${salesOrder.orderNumber} requires approval`,
+        reasons: salesOrder.approvalReasons || [],
+        requestedBy: req.user._id,
+        requestedByName: req.user.name || '',
+        requestedValue: salesOrder.grandTotal,
+        document: salesOrder,
+        session,
+      });
+      if (salesOrder.status === 'confirmed' && salesOrder.dealer && salesOrder.grandTotal > 0) {
+        await postSubledgerEntry({
+          session, branch: req.branchId, partyType: 'dealer', partyId: salesOrder.dealer,
+          amount: salesOrder.grandTotal, side: 'debit', postingKey: `sales-order:${salesOrder._id}:confirmed`,
+          entryType: 'invoice', entryDate: salesOrder.orderDate,
+          description: `Receivable for Sales Order ${salesOrder.orderNumber}`,
+          referenceNumber: salesOrder.orderNumber, referenceModel: 'SalesOrder', referenceId: salesOrder._id, createdBy: req.user._id,
+        });
+      }
+    });
+    return res.json({
+      success: true,
+      message: salesOrder.status === 'draft' ? `Converted to ${soNumber} as draft pending approval.` : `Converted to ${soNumber}.`,
+      data: { quotation, salesOrder },
+    });
+  } catch (error) { return res.status(error.status || (error.code === 11000 ? 409 : 500)).json({ success: false, message: error.message }); }
+  finally { await session.endSession(); }
+});
+
 router.delete('/:id', requirePermission('sales.order.create'), async (req, res) => {
   try {
+    const existing = await Quotation.findOne({ _id: req.params.id, branch: req.branchId }).lean();
+    if (!existing) throw routeError(404, 'Quotation not found.');
+    if (!['draft', 'cancelled'].includes(existing.status)) throw routeError(409, 'Only draft or cancelled quotations can be deleted.');
     const { safeDelete } = await import('../middleware/safeDelete.js');
     const result = await safeDelete(Quotation, req.params.id, {
-      user: req.user,
-      module: 'quotation',
-      titleField: 'dealerName',
-      codeField: 'quotationNumber',
+      user: req.user, module: 'quotation', titleField: 'dealerName', codeField: 'quotationNumber', scope: { branch: req.branchId },
     });
-    res.status(result.status || 200).json(result);
-  } catch (e) { res.status(500).json({ success: false, message: e.message }); }
+    return res.status(result.status || 200).json(result);
+  } catch (error) { return res.status(error.status || (['CastError', 'ValidationError'].includes(error.name) ? 422 : 500)).json({ success: false, message: error.message }); }
 });
 
 export default router;

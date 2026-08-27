@@ -2,6 +2,7 @@ import mongoose from 'mongoose';
 
 const leaveSchema = new mongoose.Schema(
   {
+    branch: { type: mongoose.Schema.Types.ObjectId, ref: 'Branch', index: true },
     employee: { type: mongoose.Schema.Types.ObjectId, ref: 'Employee', required: true },
     leaveType: { type: String, enum: ['Casual', 'Sick', 'Earned', 'Unpaid', 'Maternity', 'Paternity', 'Compensatory'], required: true },
     fromDate: { type: Date, required: true },
@@ -18,7 +19,7 @@ const leaveSchema = new mongoose.Schema(
   { timestamps: true }
 );
 
-leaveSchema.index({ employee: 1, fromDate: 1 });
-leaveSchema.index({ status: 1 });
+leaveSchema.index({ branch: 1, employee: 1, fromDate: 1 });
+leaveSchema.index({ branch: 1, status: 1 });
 
 export default mongoose.model('Leave', leaveSchema);

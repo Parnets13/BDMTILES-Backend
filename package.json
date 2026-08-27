@@ -9,6 +9,7 @@
     "dev": "nodemon server.js",
     "seed": "node scripts/seed.js",
     "create-admin": "node scripts/createSuperAdmin.js",
+    "migrate:branches": "node scripts/migrateMultiBranch.js",
     "test:modules": "node scripts/testAllModules.js"
   },
   "keywords": ["bdmtiles", "erp", "crm", "tiles"],

@@ -27,7 +27,8 @@ const pickItemSchema = new mongoose.Schema({
 
 const pickListSchema = new mongoose.Schema(
   {
-    pickListNumber: { type: String, unique: true, required: true },
+    pickListNumber: { type: String, required: true },
+    branch: { type: mongoose.Schema.Types.ObjectId, ref: 'Branch', index: true },
     pickDate: { type: Date, default: Date.now },
 
     // Source: Sales Order
@@ -47,7 +48,7 @@ const pickListSchema = new mongoose.Schema(
     // Status
     status: {
       type: String,
-      enum: ['generated', 'assigned', 'in_progress', 'picked', 'verified', 'sorted', 'packed', 'ready_for_dispatch'],
+      enum: ['generated', 'assigned', 'in_progress', 'picked', 'verified', 'sorted', 'packed', 'ready_for_dispatch', 'cancelled'],
       default: 'generated',
     },
 
@@ -82,12 +83,31 @@ const pickListSchema = new mongoose.Schema(
     totalPickedQty: { type: Number, default: 0 },
     totalShortQty: { type: Number, default: 0 },
 
+    // Stock reservation lifecycle
+    fulfillmentKey: { type: String, unique: true, sparse: true },
+    stockReserved: { type: Boolean, default: false },
+    reservationState: { type: String, enum: ['none', 'pending', 'reserved', 'adjusting', 'adjusted', 'consuming', 'consumed', 'released'], default: 'none' },
+    reservedAt: Date,
+    reservationAdjustedAt: Date,
+    reservationReleasedAt: Date,
+    stockConsumedAt: Date,
+    pickingCompletionProcessing: { type: Boolean, default: false },
+    cancellationProcessing: { type: Boolean, default: false },
+    stockConsumptionProcessing: { type: Boolean, default: false },
+
+    // Exclusive dispatch-trip ownership
+    dispatchTrip: { type: mongoose.Schema.Types.ObjectId, ref: 'DispatchTrip' },
+    dispatchTripNumber: { type: String, default: '' },
+    tripClaimedAt: Date,
+
     createdBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User' },
   },
   { timestamps: true }
 );
 
-pickListSchema.index({ pickListNumber: 1 });
+pickListSchema.index({ branch: 1, status: 1, priority: -1, createdAt: -1 });
+pickListSchema.index({ branch: 1, salesOrder: 1 });
+pickListSchema.index({ branch: 1, pickListNumber: 1 }, { unique: true });
 pickListSchema.index({ salesOrder: 1 });
 pickListSchema.index({ status: 1 });
 pickListSchema.index({ assignedTo: 1 });

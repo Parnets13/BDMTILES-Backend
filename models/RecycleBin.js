@@ -7,6 +7,8 @@ import mongoose from 'mongoose';
  */
 const recycleBinSchema = new mongoose.Schema(
   {
+    // Optional only for recycle rows created before branch context was introduced.
+    branch: { type: mongoose.Schema.Types.ObjectId, ref: 'Branch' },
     // What was deleted
     originalModel: { type: String, required: true }, // 'Product', 'SalesOrder', 'Dealer', etc.
     originalId: { type: mongoose.Schema.Types.ObjectId, required: true },
@@ -32,9 +34,10 @@ const recycleBinSchema = new mongoose.Schema(
 // TTL: auto-permanently-delete after 30 days
 recycleBinSchema.index({ deletedAt: 1 }, { expireAfterSeconds: 30 * 24 * 60 * 60 });
 
-// Query indexes
-recycleBinSchema.index({ originalModel: 1, deletedAt: -1 });
-recycleBinSchema.index({ module: 1 });
-recycleBinSchema.index({ deletedBy: 1 });
+// Branch-scoped query indexes. Keep the TTL index above single-field.
+recycleBinSchema.index({ branch: 1, deletedAt: -1 });
+recycleBinSchema.index({ branch: 1, module: 1, deletedAt: -1 });
+recycleBinSchema.index({ branch: 1, originalModel: 1, deletedAt: -1 });
+recycleBinSchema.index({ branch: 1, deletedBy: 1, deletedAt: -1 });
 
 export default mongoose.model('RecycleBin', recycleBinSchema);

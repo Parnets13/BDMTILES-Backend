@@ -2,7 +2,8 @@ import mongoose from 'mongoose';
 
 const deliverySchema = new mongoose.Schema(
   {
-    deliveryNumber: { type: String, unique: true, required: true },
+    deliveryNumber: { type: String, required: true },
+    branch: { type: mongoose.Schema.Types.ObjectId, ref: 'Branch', index: true },
     deliveryDate: { type: Date, default: Date.now },
 
     // Source references
@@ -25,6 +26,8 @@ const deliverySchema = new mongoose.Schema(
 
     // Items summary
     totalBoxes: { type: Number, default: 0 },
+    unfulfilledQty: { type: Number, default: 0 },
+    hasFulfillmentShortage: { type: Boolean, default: false },
     deliveredBoxes: { type: Number, default: 0 },
     shortBoxes: { type: Number, default: 0 },
     damagedBoxes: { type: Number, default: 0 },
@@ -78,14 +81,18 @@ const deliverySchema = new mongoose.Schema(
     deliveryRemarks: { type: String, default: '' },
     customerFeedback: { type: String, default: '' },
 
+    completionProcessing: { type: Boolean, default: false },
+
     createdBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User' },
   },
   { timestamps: true }
 );
 
-deliverySchema.index({ deliveryNumber: 1 });
+deliverySchema.index({ branch: 1, status: 1, deliveryDate: -1 });
+deliverySchema.index({ branch: 1, deliveryExecutive: 1, status: 1 });
+deliverySchema.index({ branch: 1, deliveryNumber: 1 }, { unique: true });
 deliverySchema.index({ salesOrder: 1 });
-deliverySchema.index({ dispatchTrip: 1 });
+deliverySchema.index({ dispatchTrip: 1, salesOrder: 1 }, { unique: true, partialFilterExpression: { dispatchTrip: { $type: 'objectId' }, salesOrder: { $type: 'objectId' } } });
 deliverySchema.index({ status: 1 });
 deliverySchema.index({ deliveryExecutive: 1 });
 deliverySchema.index({ deliveryDate: -1 });

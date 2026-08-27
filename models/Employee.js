@@ -35,7 +35,9 @@ const employeeSchema = new mongoose.Schema(
     employmentType: { type: String, enum: ['Full Time', 'Part Time', 'Contract', 'Daily Wage'], default: 'Full Time' },
     probationEndDate: { type: Date },
     reportingManager: { type: String, trim: true, default: '' },
+    // Legacy free-text branch label. Canonical ownership is branchId; existing text is never auto-converted.
     branch: { type: String, trim: true, default: '' },
+    branchId: { type: mongoose.Schema.Types.ObjectId, ref: 'Branch', index: true },
     workLocation: { type: String, trim: true, default: '' },
     shift: { type: String, trim: true, default: 'General' },
 
@@ -76,8 +78,8 @@ const employeeSchema = new mongoose.Schema(
     documents: [{ name: String, url: String, uploadDate: Date }],
     profileImage: { type: String, default: '' },
 
-    // Linked user account (for app access)
-    userId: { type: mongoose.Schema.Types.ObjectId, ref: 'User' },
+    // Linked user account (canonical app-access identity)
+    userId: { type: mongoose.Schema.Types.ObjectId, ref: 'User', unique: true, sparse: true },
 
     createdBy: { type: mongoose.Schema.Types.ObjectId },
   },
@@ -105,6 +107,6 @@ employeeSchema.statics.generateEmpId = async function () {
 };
 
 employeeSchema.index({ name: 'text', empId: 'text', mobile: 'text' });
-employeeSchema.index({ status: 1, department: 1 });
+employeeSchema.index({ branchId: 1, status: 1, department: 1 });
 
 export default mongoose.model('Employee', employeeSchema);

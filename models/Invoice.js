@@ -29,7 +29,8 @@ const invoiceItemSchema = new mongoose.Schema({
 
 const invoiceSchema = new mongoose.Schema(
   {
-    invoiceNumber: { type: String, unique: true, required: true },
+    invoiceNumber: { type: String, required: true },
+    branch: { type: mongoose.Schema.Types.ObjectId, ref: 'Branch', index: true },
     invoiceDate: { type: Date, default: Date.now },
 
     // Type
@@ -46,6 +47,9 @@ const invoiceSchema = new mongoose.Schema(
     // Source reference
     salesOrder: { type: mongoose.Schema.Types.ObjectId, ref: 'SalesOrder' },
     orderNumber: String,
+    sourceKey: { type: String, unique: true, sparse: true },
+    requestFingerprint: { type: String, default: '' },
+    activeSalesOrderKey: { type: String, unique: true, sparse: true },
 
     // Seller details (company)
     sellerName: { type: String, default: 'BDM GRANIMARMO PRIVATE LIMITED' },
@@ -128,7 +132,9 @@ const invoiceSchema = new mongoose.Schema(
   { timestamps: true }
 );
 
-invoiceSchema.index({ invoiceNumber: 1 });
+invoiceSchema.index({ branch: 1, status: 1, invoiceDate: -1 });
+invoiceSchema.index({ branch: 1, dealer: 1, invoiceDate: -1 });
+invoiceSchema.index({ branch: 1, invoiceNumber: 1 }, { unique: true });
 invoiceSchema.index({ salesOrder: 1 });
 invoiceSchema.index({ dealer: 1 });
 invoiceSchema.index({ invoiceDate: -1 });

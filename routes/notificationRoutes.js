@@ -1,206 +1,288 @@
 import { Router } from 'express';
 import NotificationTemplate from '../models/NotificationTemplate.js';
 import NotificationSettings from '../models/NotificationSettings.js';
-import { protect } from '../middleware/auth.js';
+import { protect, requirePermission } from '../middleware/auth.js';
+import { requireBranch } from '../utils/branchScope.js';
 
 const router = Router();
-router.use(protect);
+const TEMPLATE_WRITE_FIELDS = [
+  'templateCode', 'templateName', 'channel', 'event', 'subject', 'body', 'variables', 'isActive',
+];
+const SETTINGS_WRITE_FIELDS = ['moduleName', 'isEnabled', 'events', 'dataAccess'];
+const pick = (source, fields) => fields.reduce((result, field) => {
+  if (Object.prototype.hasOwnProperty.call(source || {}, field)) result[field] = source[field];
+  return result;
+}, {});
+const escapeRegex = (value) => String(value).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+const errorStatus = (error) => (error?.code === 11000 ? 409 : 500);
 
-// Templates CRUD
+router.use(protect);
+router.use(requireBranch);
+router.use(['/templates', '/send'], requirePermission('system.management'));
+
+// Templates CRUD — every lookup and mutation is owned by the selected branch.
 router.get('/templates', async (req, res) => {
   try {
     const { channel, event, search } = req.query;
-    let filter = {};
+    const filter = { branch: req.branchId };
     if (channel) filter.channel = channel;
     if (event) filter.event = event;
-    if (search) filter.templateName = new RegExp(search, 'i');
+    if (search) filter.templateName = new RegExp(escapeRegex(search), 'i');
     const templates = await NotificationTemplate.find(filter).sort({ event: 1 }).lean();
-    res.json({ success: true, data: templates });
-  } catch (e) { res.status(500).json({ success: false, message: e.message }); }
+    return res.json({ success: true, data: templates });
+  } catch (error) {
+    return res.status(500).json({ success: false, message: error.message });
+  }
 });
 
 router.post('/templates', async (req, res) => {
   try {
-    const data = { ...req.body, createdBy: req.user._id };
-    const t = await NotificationTemplate.create(data);
-    res.status(201).json({ success: true, message: 'Template created.', data: t });
-  } catch (e) { res.status(500).json({ success: false, message: e.message }); }
+    const data = {
+      ...pick(req.body, TEMPLATE_WRITE_FIELDS),
+      branch: req.branchId,
+      createdBy: req.user._id,
+    };
+    const template = await NotificationTemplate.create(data);
+    return res.status(201).json({ success: true, message: 'Template created.', data: template });
+  } catch (error) {
+    return res.status(errorStatus(error)).json({ success: false, message: error.message });
+  }
 });
 
 router.put('/templates/:id', async (req, res) => {
   try {
-    const t = await NotificationTemplate.findByIdAndUpdate(req.params.id, req.body, { new: true });
-    res.json({ success: true, message: 'Updated.', data: t });
-  } catch (e) { res.status(500).json({ success: false, message: e.message }); }
+    const template = await NotificationTemplate.findOneAndUpdate(
+      { _id: req.params.id, branch: req.branchId },
+      { $set: pick(req.body, TEMPLATE_WRITE_FIELDS) },
+      { new: true, runValidators: true }
+    );
+    if (!template) return res.status(404).json({ success: false, message: 'Template not found in the selected branch.' });
+    return res.json({ success: true, message: 'Updated.', data: template });
+  } catch (error) {
+    return res.status(errorStatus(error)).json({ success: false, message: error.message });
+  }
 });
 
 router.delete('/templates/:id', async (req, res) => {
-  try { await NotificationTemplate.findByIdAndDelete(req.params.id); res.json({ success: true, message: 'Deleted.' }); }
-  catch (e) { res.status(500).json({ success: false, message: e.message }); }
+  try {
+    const template = await NotificationTemplate.findOneAndDelete({
+      _id: req.params.id,
+      branch: req.branchId,
+    });
+    if (!template) return res.status(404).json({ success: false, message: 'Template not found in the selected branch.' });
+    return res.json({ success: true, message: 'Deleted.', data: { _id: template._id } });
+  } catch (error) {
+    return res.status(500).json({ success: false, message: error.message });
+  }
 });
 
-// Send notification (placeholder — actual integration depends on WhatsApp API / SMS gateway)
+// Placeholder send operation. Template selection cannot cross the selected branch.
 router.post('/send', async (req, res) => {
   try {
     const { templateCode, recipients, variables } = req.body;
-    const template = await NotificationTemplate.findOne({ templateCode, isActive: true }).lean();
+    const template = await NotificationTemplate.findOne({
+      branch: req.branchId,
+      templateCode,
+      isActive: true,
+    }).lean();
     if (!template) return res.status(404).json({ success: false, message: 'Template not found or inactive.' });
 
-    // Replace variables in body
     let messageBody = template.body;
-    if (variables) {
+    if (variables && typeof variables === 'object' && !Array.isArray(variables)) {
       Object.entries(variables).forEach(([key, value]) => {
-        messageBody = messageBody.replace(new RegExp(`{{${key}}}`, 'g'), value);
+        messageBody = messageBody.replace(new RegExp(`{{${escapeRegex(key)}}}`, 'g'), String(value));
       });
     }
 
-    // TODO: Integrate with actual WhatsApp Business API / SMS gateway
-    // For now, log and return success
-    console.log(`[NOTIFICATION] Channel: ${template.channel}, To: ${recipients?.join(', ')}, Message: ${messageBody}`);
-
-    res.json({
+    console.log(`[NOTIFICATION] Branch: ${req.branchId}, Channel: ${template.channel}, To: ${recipients?.join(', ')}, Message: ${messageBody}`);
+    return res.json({
       success: true,
       message: `Notification queued via ${template.channel} to ${recipients?.length || 0} recipients.`,
       data: { channel: template.channel, messageBody, recipients },
     });
-  } catch (e) { res.status(500).json({ success: false, message: e.message }); }
+  } catch (error) {
+    return res.status(500).json({ success: false, message: error.message });
+  }
 });
 
-// ═══════════════════════════════════════
-// NOTIFICATION SETTINGS (Super Admin / Owner only)
-// ═══════════════════════════════════════
+const requireSettingsOwner = (req, res) => {
+  if (!['super_admin', 'owner'].includes(req.user.role)) {
+    res.status(403).json({ success: false, message: 'Only Super Admin / Owner can manage notification settings.' });
+    return false;
+  }
+  return true;
+};
 
-// GET /api/v1/notifications/settings — get all module notification settings
 router.get('/settings', async (req, res) => {
   try {
-    // Only super_admin/owner can manage settings
-    if (!['super_admin', 'owner'].includes(req.user.role)) {
-      return res.status(403).json({ success: false, message: 'Only Super Admin / Owner can access notification settings.' });
-    }
-    const settings = await NotificationSettings.find().sort({ module: 1 }).lean();
-    res.json({ success: true, data: settings });
-  } catch (e) { res.status(500).json({ success: false, message: e.message }); }
+    if (!requireSettingsOwner(req, res)) return;
+    const settings = await NotificationSettings.find({ branch: req.branchId }).sort({ module: 1 }).lean();
+    return res.json({ success: true, data: settings });
+  } catch (error) {
+    return res.status(500).json({ success: false, message: error.message });
+  }
 });
 
-// GET /api/v1/notifications/settings/:module — get single module settings
 router.get('/settings/:module', async (req, res) => {
   try {
-    if (!['super_admin', 'owner'].includes(req.user.role)) {
-      return res.status(403).json({ success: false, message: 'Access denied.' });
-    }
-    let settings = await NotificationSettings.findOne({ module: req.params.module }).lean();
+    if (!requireSettingsOwner(req, res)) return;
+    let settings = await NotificationSettings.findOne({
+      branch: req.branchId,
+      module: req.params.module,
+    }).lean();
     if (!settings) {
-      // Return default structure
-      settings = { module: req.params.module, isEnabled: true, events: [], dataAccess: { restrictByTime: false, accessWindowDays: 0, exemptRoles: ['super_admin', 'owner'] } };
+      settings = {
+        branch: req.branchId,
+        module: req.params.module,
+        isEnabled: true,
+        events: [],
+        dataAccess: {
+          restrictByTime: false,
+          accessWindowDays: 0,
+          exemptRoles: ['super_admin', 'owner'],
+        },
+      };
     }
-    res.json({ success: true, data: settings });
-  } catch (e) { res.status(500).json({ success: false, message: e.message }); }
+    return res.json({ success: true, data: settings });
+  } catch (error) {
+    return res.status(500).json({ success: false, message: error.message });
+  }
 });
 
-// PUT /api/v1/notifications/settings/:module — update module settings
 router.put('/settings/:module', async (req, res) => {
   try {
-    if (!['super_admin', 'owner'].includes(req.user.role)) {
-      return res.status(403).json({ success: false, message: 'Only Super Admin / Owner can modify settings.' });
-    }
+    if (!requireSettingsOwner(req, res)) return;
     const settings = await NotificationSettings.findOneAndUpdate(
-      { module: req.params.module },
-      { ...req.body, module: req.params.module, updatedBy: req.user._id },
-      { upsert: true, new: true, setDefaultsOnInsert: true }
+      { branch: req.branchId, module: req.params.module },
+      {
+        $set: { ...pick(req.body, SETTINGS_WRITE_FIELDS), updatedBy: req.user._id },
+        $setOnInsert: { branch: req.branchId, module: req.params.module },
+      },
+      { upsert: true, new: true, setDefaultsOnInsert: true, runValidators: true }
     );
-    res.json({ success: true, message: `Settings for "${req.params.module}" updated.`, data: settings });
-  } catch (e) { res.status(500).json({ success: false, message: e.message }); }
+    return res.json({
+      success: true,
+      message: `Settings for "${req.params.module}" updated.`,
+      data: settings,
+    });
+  } catch (error) {
+    return res.status(errorStatus(error)).json({ success: false, message: error.message });
+  }
 });
 
-// POST /api/v1/notifications/settings/initialize — create default settings for all modules
 router.post('/settings/initialize', async (req, res) => {
   try {
-    if (!['super_admin', 'owner'].includes(req.user.role)) {
-      return res.status(403).json({ success: false, message: 'Access denied.' });
-    }
-
+    if (!requireSettingsOwner(req, res)) return;
     const modules = [
       { module: 'sales_order', moduleName: 'Sales Orders', events: [
         { eventCode: 'order_created', eventName: 'New Order Created', isEnabled: true, channels: ['web', 'push'], recipientRoles: ['admin', 'owner', 'sales_manager'] },
         { eventCode: 'order_confirmed', eventName: 'Order Confirmed', isEnabled: true, channels: ['web', 'whatsapp'], recipientRoles: ['warehouse_manager'] },
         { eventCode: 'credit_exceeded', eventName: 'Credit Limit Exceeded', isEnabled: true, channels: ['web', 'push', 'whatsapp'], recipientRoles: ['owner', 'finance_manager'] },
-      ]},
+      ] },
       { module: 'payment', moduleName: 'Payments', events: [
         { eventCode: 'payment_received', eventName: 'Payment Received', isEnabled: true, channels: ['web'], recipientRoles: ['finance_manager', 'owner'] },
         { eventCode: 'cheque_bounced', eventName: 'Cheque Bounced', isEnabled: true, channels: ['web', 'push', 'whatsapp'], recipientRoles: ['owner', 'finance_manager', 'sales_manager'] },
-      ]},
+      ] },
       { module: 'stock_alert', moduleName: 'Stock Alerts', events: [
         { eventCode: 'stock_low', eventName: 'Stock Below Reorder', isEnabled: true, channels: ['web'], recipientRoles: ['purchase_manager', 'warehouse_manager'] },
         { eventCode: 'stock_zero', eventName: 'Zero Stock', isEnabled: true, channels: ['web', 'push'], recipientRoles: ['purchase_manager', 'owner'] },
-      ]},
+      ] },
       { module: 'delivery', moduleName: 'Delivery', events: [
         { eventCode: 'delivery_failed', eventName: 'Delivery Failed', isEnabled: true, channels: ['web', 'push'], recipientRoles: ['sales_manager', 'owner'] },
         { eventCode: 'delivery_completed', eventName: 'Delivery Completed', isEnabled: true, channels: ['web'], recipientRoles: ['finance_manager'] },
-      ]},
+      ] },
       { module: 'lead', moduleName: 'Lead Management', events: [
         { eventCode: 'lead_assigned', eventName: 'Lead Assigned to SE', isEnabled: true, channels: ['push', 'web'], recipientRoles: ['sales_executive'] },
         { eventCode: 'lead_accepted', eventName: 'Lead Accepted by SE', isEnabled: true, channels: ['web'], recipientRoles: ['sales_manager'] },
         { eventCode: 'lead_declined', eventName: 'Lead Declined by SE', isEnabled: true, channels: ['web', 'push'], recipientRoles: ['sales_manager', 'admin'] },
-      ]},
+      ] },
       { module: 'approval', moduleName: 'Approvals', events: [
         { eventCode: 'approval_required', eventName: 'Approval Required', isEnabled: true, channels: ['web', 'push'], recipientRoles: ['owner', 'admin'] },
-      ]},
+      ] },
       { module: 'complaint', moduleName: 'Complaints', events: [
         { eventCode: 'complaint_raised', eventName: 'New Complaint', isEnabled: true, channels: ['web'], recipientRoles: ['sales_manager', 'warehouse_manager'] },
-      ]},
+      ] },
       { module: 'expense', moduleName: 'Expenses', events: [
         { eventCode: 'expense_submitted', eventName: 'Expense Submitted for Approval', isEnabled: true, channels: ['web'], recipientRoles: ['finance_manager', 'hr_manager'] },
-      ]},
+      ] },
     ];
 
     let created = 0;
-    for (const mod of modules) {
-      const exists = await NotificationSettings.findOne({ module: mod.module });
-      if (!exists) {
-        await NotificationSettings.create({
-          ...mod, isEnabled: true,
-          dataAccess: { restrictByTime: false, accessWindowDays: 0, exemptRoles: ['super_admin', 'owner'] },
-          updatedBy: req.user._id,
-        });
-        created++;
-      }
+    for (const item of modules) {
+      const result = await NotificationSettings.updateOne(
+        { branch: req.branchId, module: item.module },
+        {
+          $setOnInsert: {
+            ...item,
+            branch: req.branchId,
+            isEnabled: true,
+            dataAccess: {
+              restrictByTime: false,
+              accessWindowDays: 0,
+              exemptRoles: ['super_admin', 'owner'],
+            },
+            updatedBy: req.user._id,
+          },
+        },
+        { upsert: true, runValidators: true }
+      );
+      if (result.upsertedCount) created += 1;
     }
 
-    res.json({ success: true, message: `Initialized ${created} module settings.`, data: { created, total: modules.length } });
-  } catch (e) { res.status(500).json({ success: false, message: e.message }); }
+    return res.json({
+      success: true,
+      message: `Initialized ${created} module settings.`,
+      data: { created, total: modules.length },
+    });
+  } catch (error) {
+    return res.status(errorStatus(error)).json({ success: false, message: error.message });
+  }
 });
 
-// PATCH /api/v1/notifications/settings/:module/toggle — enable/disable module notifications
 router.patch('/settings/:module/toggle', async (req, res) => {
   try {
-    if (!['super_admin', 'owner'].includes(req.user.role)) {
-      return res.status(403).json({ success: false, message: 'Access denied.' });
-    }
+    if (!requireSettingsOwner(req, res)) return;
     const settings = await NotificationSettings.findOneAndUpdate(
-      { module: req.params.module },
-      { isEnabled: req.body.isEnabled },
-      { new: true }
+      { branch: req.branchId, module: req.params.module },
+      { $set: { isEnabled: req.body.isEnabled, updatedBy: req.user._id } },
+      { new: true, runValidators: true }
     );
     if (!settings) return res.status(404).json({ success: false, message: 'Module settings not found. Initialize first.' });
-    res.json({ success: true, message: `${req.params.module} notifications ${settings.isEnabled ? 'enabled' : 'disabled'}.`, data: settings });
-  } catch (e) { res.status(500).json({ success: false, message: e.message }); }
+    return res.json({
+      success: true,
+      message: `${req.params.module} notifications ${settings.isEnabled ? 'enabled' : 'disabled'}.`,
+      data: settings,
+    });
+  } catch (error) {
+    return res.status(500).json({ success: false, message: error.message });
+  }
 });
 
-// PATCH /api/v1/notifications/settings/:module/data-access — set data access restrictions
 router.patch('/settings/:module/data-access', async (req, res) => {
   try {
-    if (!['super_admin', 'owner'].includes(req.user.role)) {
-      return res.status(403).json({ success: false, message: 'Access denied.' });
+    if (!requireSettingsOwner(req, res)) return;
+    const updates = {};
+    if (Object.prototype.hasOwnProperty.call(req.body, 'restrictByTime')) {
+      updates['dataAccess.restrictByTime'] = req.body.restrictByTime;
     }
-    const { restrictByTime, accessWindowDays, exemptRoles } = req.body;
+    if (Object.prototype.hasOwnProperty.call(req.body, 'accessWindowDays')) {
+      updates['dataAccess.accessWindowDays'] = req.body.accessWindowDays;
+    }
+    if (Object.prototype.hasOwnProperty.call(req.body, 'exemptRoles')) {
+      updates['dataAccess.exemptRoles'] = req.body.exemptRoles;
+    }
+    updates.updatedBy = req.user._id;
+
     const settings = await NotificationSettings.findOneAndUpdate(
-      { module: req.params.module },
-      { 'dataAccess.restrictByTime': restrictByTime, 'dataAccess.accessWindowDays': accessWindowDays || 0, 'dataAccess.exemptRoles': exemptRoles || ['super_admin', 'owner'] },
-      { new: true }
+      { branch: req.branchId, module: req.params.module },
+      { $set: updates },
+      { new: true, runValidators: true }
     );
     if (!settings) return res.status(404).json({ success: false, message: 'Module settings not found.' });
-    res.json({ success: true, message: 'Data access settings updated.', data: settings });
-  } catch (e) { res.status(500).json({ success: false, message: e.message }); }
+    return res.json({ success: true, message: 'Data access settings updated.', data: settings });
+  } catch (error) {
+    return res.status(500).json({ success: false, message: error.message });
+  }
 });
 
 export default router;

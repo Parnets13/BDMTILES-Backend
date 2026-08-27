@@ -21,7 +21,8 @@ const returnItemSchema = new mongoose.Schema({
 
 const salesReturnSchema = new mongoose.Schema(
   {
-    returnNumber: { type: String, unique: true, required: true },
+    returnNumber: { type: String, required: true },
+    branch: { type: mongoose.Schema.Types.ObjectId, ref: 'Branch', index: true },
     returnDate: { type: Date, default: Date.now },
 
     // Reference to original sales order
@@ -39,6 +40,9 @@ const salesReturnSchema = new mongoose.Schema(
     subtotal: { type: Number, default: 0 },
     totalTax: { type: Number, default: 0 },
     grandTotal: { type: Number, default: 0 },
+
+    sourceKey: { type: String, unique: true, sparse: true },
+    requestFingerprint: { type: String, default: '' },
 
     // Credit Note
     creditNoteNumber: String,
@@ -62,7 +66,13 @@ const salesReturnSchema = new mongoose.Schema(
   { timestamps: true }
 );
 
-salesReturnSchema.index({ returnNumber: 1 });
+salesReturnSchema.index({ branch: 1, status: 1, returnDate: -1 });
+salesReturnSchema.index({ branch: 1, salesOrder: 1 });
+salesReturnSchema.index({ branch: 1, returnNumber: 1 }, { unique: true });
+salesReturnSchema.index(
+  { branch: 1, creditNoteNumber: 1 },
+  { unique: true, partialFilterExpression: { creditNoteNumber: { $type: 'string' } } }
+);
 salesReturnSchema.index({ salesOrder: 1 });
 salesReturnSchema.index({ dealer: 1, returnDate: -1 });
 salesReturnSchema.index({ status: 1 });

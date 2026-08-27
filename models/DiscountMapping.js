@@ -1,4 +1,5 @@
 import mongoose from 'mongoose';
+import { calculateDiscountRule } from '../utils/pricingCalculations.js';
 
 /**
  * DiscountMapping — Hierarchy-based discount rules for BDM Tiles
@@ -231,39 +232,18 @@ discountMappingSchema.statics.bulkResolveDiscounts = async function (products, d
   return results;
 };
 
+discountMappingSchema.statics.calculateRuleDiscount = function (rule, rate, quantity = 1, options = {}) {
+  return calculateDiscountRule(rule, rate, quantity, options);
+};
+
 /**
- * Instance method: Calculate discount amount for a given rate and quantity
+ * Instance method: Calculate discount amount for a given rate and quantity.
+ * Delegates to the same formula used by authoritative sales pricing.
  */
-discountMappingSchema.methods.calculateDiscount = function (rate, quantity = 1) {
-  const baseAmount = rate * quantity;
-  let discountAmt = 0;
-
-  if (this.discountType === 'slab') {
-    // Find matching slab for the quantity
-    const slab = (this.slabs || [])
-      .sort((a, b) => b.minQty - a.minQty) // highest first
-      .find(s => quantity >= s.minQty && (s.maxQty === 0 || quantity <= s.maxQty));
-    if (slab) {
-      if (slab.discountPercentage > 0) discountAmt += (baseAmount * slab.discountPercentage) / 100;
-      if (slab.discountFlat > 0) discountAmt += slab.discountFlat * quantity;
-    }
-  } else {
-    if (this.discountType === 'percentage' || this.discountType === 'both') {
-      discountAmt += (baseAmount * this.discountPercentage) / 100;
-    }
-    if (this.discountType === 'flat' || this.discountType === 'both') {
-      discountAmt += this.discountFlat * quantity;
-    }
-  }
-
-  // Cap at maxDiscountPercentage
-  const maxAmt = (baseAmount * this.maxDiscountPercentage) / 100;
-  discountAmt = Math.min(discountAmt, maxAmt);
-
+discountMappingSchema.methods.calculateDiscount = function (rate, quantity = 1, options = {}) {
+  const calculated = calculateDiscountRule(this.toObject(), rate, quantity, options);
   return {
-    discountAmount: Math.round(discountAmt * 100) / 100,
-    discountPercentage: baseAmount > 0 ? Math.round((discountAmt / baseAmount) * 10000) / 100 : 0,
-    taxableAmount: Math.round((baseAmount - discountAmt) * 100) / 100,
+    ...calculated,
     ruleId: this._id,
     ruleName: this.ruleName,
     targetType: this.targetType,

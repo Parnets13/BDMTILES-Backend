@@ -2,6 +2,7 @@ import mongoose from 'mongoose';
 
 const salarySlipSchema = new mongoose.Schema(
   {
+    branch: { type: mongoose.Schema.Types.ObjectId, ref: 'Branch', index: true },
     employee: { type: mongoose.Schema.Types.ObjectId, ref: 'Employee', required: true },
     month: { type: Number, required: true }, // 1-12
     year: { type: Number, required: true },
@@ -60,7 +61,7 @@ const salarySlipSchema = new mongoose.Schema(
   { timestamps: true }
 );
 
-salarySlipSchema.index({ employee: 1, month: 1, year: 1 }, { unique: true });
-salarySlipSchema.index({ status: 1, year: 1, month: 1 });
+salarySlipSchema.index({ branch: 1, employee: 1, month: 1, year: 1 }, { unique: true });
+salarySlipSchema.index({ branch: 1, status: 1, year: 1, month: 1 });
 
 export default mongoose.model('SalarySlip', salarySlipSchema);

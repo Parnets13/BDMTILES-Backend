@@ -1,7 +1,8 @@
 import mongoose from 'mongoose';
 
 const tripOrderSchema = new mongoose.Schema({
-  salesOrder: { type: mongoose.Schema.Types.ObjectId, ref: 'SalesOrder' },
+  pickList: { type: mongoose.Schema.Types.ObjectId, ref: 'PickList' },
+  salesOrder: { type: mongoose.Schema.Types.ObjectId, ref: 'SalesOrder', required: true },
   orderNumber: String,
   dealerName: String,
   dealerCode: String,
@@ -27,7 +28,8 @@ const tripOrderSchema = new mongoose.Schema({
 
 const dispatchTripSchema = new mongoose.Schema(
   {
-    tripNumber: { type: String, unique: true, required: true },
+    tripNumber: { type: String, required: true },
+    branch: { type: mongoose.Schema.Types.ObjectId, ref: 'Branch', index: true },
     tripDate: { type: Date, default: Date.now },
 
     // Vehicle
@@ -73,6 +75,10 @@ const dispatchTripSchema = new mongoose.Schema(
     loadingSupervisor: { type: mongoose.Schema.Types.ObjectId, ref: 'User' },
     loadingVerified: { type: Boolean, default: false },
 
+    // Prevent concurrent/retried dispatch from applying stock twice
+    dispatchProcessing: { type: Boolean, default: false },
+    stockDeductedAt: Date,
+
     // Documents
     eWayBillNumber: { type: String, default: '' },
     lrNumber: { type: String, default: '' },
@@ -84,7 +90,8 @@ const dispatchTripSchema = new mongoose.Schema(
   { timestamps: true }
 );
 
-dispatchTripSchema.index({ tripNumber: 1 });
+dispatchTripSchema.index({ branch: 1, status: 1, tripDate: -1 });
+dispatchTripSchema.index({ branch: 1, tripNumber: 1 }, { unique: true });
 dispatchTripSchema.index({ status: 1 });
 dispatchTripSchema.index({ tripDate: -1 });
 dispatchTripSchema.index({ vehicle: 1 });

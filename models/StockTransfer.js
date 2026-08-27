@@ -18,7 +18,9 @@ const transferItemSchema = new mongoose.Schema({
 
 const stockTransferSchema = new mongoose.Schema(
   {
-    transferNumber: { type: String, unique: true, required: true },
+    transferNumber: { type: String, required: true },
+    sourceBranch: { type: mongoose.Schema.Types.ObjectId, ref: 'Branch', index: true },
+    destinationBranch: { type: mongoose.Schema.Types.ObjectId, ref: 'Branch', index: true },
     transferDate: { type: Date, default: Date.now },
 
     // Source and destination
@@ -80,7 +82,9 @@ const stockTransferSchema = new mongoose.Schema(
   { timestamps: true }
 );
 
-stockTransferSchema.index({ transferNumber: 1 });
+stockTransferSchema.index({ sourceBranch: 1, status: 1, transferDate: -1 });
+stockTransferSchema.index({ destinationBranch: 1, status: 1, transferDate: -1 });
+stockTransferSchema.index({ sourceBranch: 1, transferNumber: 1 }, { unique: true });
 stockTransferSchema.index({ status: 1 });
 stockTransferSchema.index({ fromWarehouse: 1 });
 stockTransferSchema.index({ toWarehouse: 1 });

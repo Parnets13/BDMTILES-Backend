@@ -7,6 +7,7 @@ import mongoose from 'mongoose';
 const stockSchema = new mongoose.Schema(
   {
     product: { type: mongoose.Schema.Types.ObjectId, ref: 'Product', required: true },
+    branch: { type: mongoose.Schema.Types.ObjectId, ref: 'Branch', index: true },
     warehouse: { type: mongoose.Schema.Types.ObjectId, ref: 'Warehouse', required: true },
     shade: { type: String, default: '' },
     batch: { type: String, default: '' },
@@ -19,6 +20,7 @@ const stockSchema = new mongoose.Schema(
     damagedQty: { type: Number, default: 0 },
     sampleQty: { type: Number, default: 0 },
     transitQty: { type: Number, default: 0 },
+    shortQty: { type: Number, default: 0 },
 
     // Location within warehouse
     zone: { type: String, default: '' },
@@ -40,8 +42,8 @@ const stockSchema = new mongoose.Schema(
 );
 
 // CRITICAL: Compound unique index — one row per product+warehouse+shade+batch
-stockSchema.index({ product: 1, warehouse: 1, shade: 1, batch: 1 }, { unique: true });
-stockSchema.index({ product: 1, availableQty: 1 });
-stockSchema.index({ warehouse: 1 });
+stockSchema.index({ branch: 1, product: 1, warehouse: 1, shade: 1, batch: 1 }, { unique: true });
+stockSchema.index({ branch: 1, product: 1, availableQty: 1 });
+stockSchema.index({ branch: 1, warehouse: 1 });
 
 export default mongoose.model('Stock', stockSchema);

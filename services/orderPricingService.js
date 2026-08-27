@@ -1,0 +1,226 @@
+import mongoose from 'mongoose';
+import Product from '../models/Product.js';
+import { pricingAuditSnapshot, resolvePricing } from './pricingResolver.js';
+import { roundMoney } from '../utils/pricingCalculations.js';
+
+function routeError(status, message) {
+  return Object.assign(new Error(message), { status });
+}
+function finiteNonNegative(value, field, fallback = 0) {
+  const number = Number(value ?? fallback);
+  if (!Number.isFinite(number) || number < 0) throw routeError(422, `${field} must be a non-negative finite number.`);
+  return number;
+}
+function quantityValue(value, field) {
+  const number = Number(value);
+  if (!Number.isFinite(number) || number < 1) throw routeError(422, `${field} must be at least 1.`);
+  return number;
+}
+async function loadPreservedResolution(item, quantity, session) {
+  if (!mongoose.isValidObjectId(item.product)) throw routeError(422, 'Each item requires a valid product.');
+  let query = Product.findById(item.product);
+  if (session) query = query.session(session);
+  const product = await query.lean();
+  if (!product) throw routeError(404, 'Product not found.');
+  if (product.status !== 'active') throw routeError(422, `Product ${product.productCode || product._id} is not active.`);
+  const snapshot = item.pricingSnapshot;
+  if (!snapshot || !Number.isFinite(Number(snapshot.effectiveRate))) return null;
+  const effectiveRate = roundMoney(finiteNonNegative(snapshot.effectiveRate, 'pricingSnapshot.effectiveRate'));
+  const pricingRate = roundMoney(finiteNonNegative(snapshot.pricingRate, 'pricingSnapshot.pricingRate', effectiveRate));
+  const regularDiscountPerUnit = roundMoney(finiteNonNegative(snapshot.regularDiscountPerUnit, 'pricingSnapshot.regularDiscountPerUnit'));
+  const schemeDiscountPerUnit = roundMoney(finiteNonNegative(snapshot.schemeDiscountPerUnit, 'pricingSnapshot.schemeDiscountPerUnit'));
+  const minimumSellingRate = roundMoney(finiteNonNegative(product.minimumSellingRate, 'minimumSellingRate'));
+  return {
+    product,
+    quantity,
+    dealer: null,
+    dealerType: null,
+    source: snapshot.source || 'product_tier',
+    sourceId: snapshot.sourceId || null,
+    sourceName: snapshot.sourceName || 'Accepted quotation snapshot',
+    overrideScope: snapshot.overrideScope || null,
+    requestedTier: snapshot.requestedTier,
+    rateField: snapshot.rateField,
+    baseRate: finiteNonNegative(snapshot.baseRate, 'pricingSnapshot.baseRate', pricingRate),
+    pricingRate,
+    regularDiscountPerUnit,
+    regularDiscountAmount: roundMoney(regularDiscountPerUnit * quantity),
+    schemeDiscountPerUnit,
+    schemeDiscountAmount: roundMoney(schemeDiscountPerUnit * quantity),
+    effectiveRate,
+    taxableAmount: roundMoney(effectiveRate * quantity),
+    minimumSellingRate,
+    belowMinimum: minimumSellingRate > 0 && effectiveRate < minimumSellingRate,
+    requiresApproval: minimumSellingRate > 0 && effectiveRate < minimumSellingRate,
+    fallbackApplied: Boolean(snapshot.fallbackApplied),
+    slab: snapshot.slab || null,
+    rule: snapshot.rule || null,
+  };
+}
+function approvalKey(reason) {
+  return `${reason.type}:${reason.itemIndex ?? ''}:${reason.product ? String(reason.product) : ''}:${reason.subject || ''}`;
+}
+export function mergeApprovalReasons(generated, existing = [], options = {}) {
+  const oldByKey = new Map((existing || []).map((reason) => [approvalKey(reason), reason.toObject?.() || reason]));
+  return generated.map((reason) => {
+    const old = oldByKey.get(approvalKey(reason));
+    const sameExposure = old
+      && Number(old.requestedValue) === Number(reason.requestedValue)
+      && Number(old.thresholdValue) === Number(reason.thresholdValue);
+    const preserve = sameExposure && (
+      reason.type === 'credit_limit'
+      || (options.preserveBelowMinimum && reason.type === 'below_minimum_price')
+    );
+    return preserve ? { ...reason, status: old.status || 'pending' } : { ...reason, status: 'pending' };
+  });
+}
+export function approvalStatusForReasons(reasons = []) {
+  if (!reasons.length) return 'not_required';
+  if (reasons.some((reason) => reason.status === 'rejected')) return 'rejected';
+  if (reasons.some((reason) => reason.status !== 'approved')) return 'pending';
+  return 'approved';
+}
+export function addCreditApproval(pricingResult, dealer, branchOutstanding, existingReasons = [], options = {}) {
+  const reasons = [...pricingResult.approvalReasons];
+  let creditLimitExceeded = false;
+  if (dealer?.creditLimit > 0 && branchOutstanding + pricingResult.grandTotal > dealer.creditLimit) {
+    creditLimitExceeded = true;
+    reasons.push({
+      type: 'credit_limit',
+      message: `Projected outstanding ${roundMoney(branchOutstanding + pricingResult.grandTotal)} exceeds credit limit ${roundMoney(dealer.creditLimit)}.`,
+      requestedValue: roundMoney(branchOutstanding + pricingResult.grandTotal),
+      thresholdValue: roundMoney(dealer.creditLimit),
+      subject: String(dealer._id),
+    });
+  }
+  const merged = mergeApprovalReasons(reasons, existingReasons, {
+    preserveBelowMinimum: Boolean(options.preserveBelowMinimum),
+  });
+  return { creditLimitExceeded, approvalReasons: merged, approvalStatus: approvalStatusForReasons(merged) };
+}
+
+export async function deriveOrderPricing(options = {}) {
+  const {
+    branchId, dealerId, dealerTypeId, scope, orderType = dealerId ? 'dealer' : 'retail',
+    pricingDate = new Date(), items, session = null, existingApprovalReasons = [],
+    preserveSnapshots = false, preserveBelowMinimumApprovals = false,
+    freightCharges = 0, loadingCharges = 0, installationCharges = 0, otherCharges = 0,
+    advanceAmount = 0,
+  } = options;
+  if (!Array.isArray(items) || items.length === 0) throw routeError(422, 'At least one item is required.');
+  const normalized = items.map((item, index) => ({
+    source: item,
+    product: item.product?._id || item.product,
+    quantity: quantityValue(item.quantity, `items[${index}].quantity`),
+  }));
+
+  let resolutions;
+  if (preserveSnapshots) {
+    resolutions = await Promise.all(normalized.map(async ({ source, quantity }) => {
+      const preserved = await loadPreservedResolution(source, quantity, session);
+      if (preserved) return preserved;
+      return resolvePricing({
+        branchId, dealerId, dealerTypeId, scope, product: source.product,
+        quantity, manualRate: source.manualRate, orderType, pricingDate, session,
+      });
+    }));
+  } else {
+    const firstPass = await Promise.all(normalized.map(({ source, product, quantity }) => resolvePricing({
+      branchId, dealerId, dealerTypeId, scope, product, quantity, manualRate: source.manualRate,
+      orderType, pricingDate, session,
+    })));
+    const orderAmount = roundMoney(firstPass.reduce((sum, result) => sum + result.pricingRate * result.quantity, 0));
+    resolutions = await Promise.all(normalized.map(({ source, product, quantity }) => resolvePricing({
+      branchId, dealerId, dealerTypeId, scope, product, quantity, manualRate: source.manualRate,
+      orderType, pricingDate, orderAmount, session,
+    })));
+  }
+
+  let subtotal = 0;
+  let totalDiscount = 0;
+  let totalSchemeDiscount = 0;
+  let totalTax = 0;
+  const generatedReasons = [];
+  const pricedItems = resolutions.map((resolution, index) => {
+    const source = normalized[index].source;
+    const product = resolution.product;
+    const quantity = resolution.quantity;
+    const gstPercentage = finiteNonNegative(product.gst, `products[${index}].gst`, 18);
+    if (gstPercentage > 100) throw routeError(422, `Product ${product.productCode || product._id} has invalid GST.`);
+    const taxableAmount = roundMoney(resolution.effectiveRate * quantity);
+    const gstAmount = roundMoney((taxableAmount * gstPercentage) / 100);
+    subtotal += taxableAmount;
+    totalDiscount += resolution.regularDiscountAmount;
+    totalSchemeDiscount += resolution.schemeDiscountAmount;
+    totalTax += gstAmount;
+    if (resolution.belowMinimum) {
+      generatedReasons.push({
+        type: 'below_minimum_price',
+        message: `${product.productCode || product.itemName} effective rate ${resolution.effectiveRate} is below minimum ${resolution.minimumSellingRate}.`,
+        itemIndex: index,
+        product: product._id,
+        requestedValue: resolution.effectiveRate,
+        thresholdValue: resolution.minimumSellingRate,
+      });
+    }
+    return {
+      product: product._id,
+      productCode: product.productCode || '',
+      productName: product.itemName,
+      productImage: product.images?.[0] || '',
+      shade: source.shade || '',
+      batch: source.batch || '',
+      quantity,
+      unit: product.unit || 'Box',
+      boxes: finiteNonNegative(source.boxes, `items[${index}].boxes`),
+      pieces: finiteNonNegative(source.pieces, `items[${index}].pieces`),
+      sqft: finiteNonNegative(source.sqft, `items[${index}].sqft`),
+      rate: resolution.pricingRate,
+      discount: resolution.regularDiscountPerUnit,
+      discountType: 'flat',
+      schemeDiscount: resolution.schemeDiscountAmount,
+      taxableAmount,
+      gstPercentage,
+      cgst: roundMoney(gstAmount / 2),
+      sgst: roundMoney(gstAmount / 2),
+      igst: 0,
+      gstAmount,
+      totalAmount: roundMoney(taxableAmount + gstAmount),
+      warehouse: source.warehouse || undefined,
+      pricingSnapshot: pricingAuditSnapshot(resolution),
+    };
+  });
+
+  const charges = {
+    freightCharges: finiteNonNegative(freightCharges, 'freightCharges'),
+    loadingCharges: finiteNonNegative(loadingCharges, 'loadingCharges'),
+    installationCharges: finiteNonNegative(installationCharges, 'installationCharges'),
+    otherCharges: finiteNonNegative(otherCharges, 'otherCharges'),
+  };
+  const unroundedTotal = subtotal + totalTax + Object.values(charges).reduce((sum, value) => sum + value, 0);
+  const grandTotal = Math.round(unroundedTotal);
+  const advance = finiteNonNegative(advanceAmount, 'advanceAmount');
+  if (advance > grandTotal) throw routeError(422, 'advanceAmount cannot exceed the calculated grandTotal.');
+  const approvalReasons = mergeApprovalReasons(generatedReasons, existingApprovalReasons, {
+    preserveBelowMinimum: preserveBelowMinimumApprovals,
+  });
+  const dealerType = resolutions.find((resolution) => resolution.dealerType)?.dealerType || null;
+  return {
+    items: pricedItems,
+    subtotal: roundMoney(subtotal),
+    totalDiscount: roundMoney(totalDiscount),
+    totalSchemeDiscount: roundMoney(totalSchemeDiscount),
+    totalTax: roundMoney(totalTax),
+    ...charges,
+    roundOff: roundMoney(grandTotal - unroundedTotal),
+    grandTotal,
+    advanceAmount: advance,
+    balanceAmount: roundMoney(grandTotal - advance),
+    paymentStatus: grandTotal - advance === 0 ? 'paid' : advance > 0 ? 'partial' : 'pending',
+    approvalReasons,
+    approvalStatus: approvalStatusForReasons(approvalReasons),
+    dealerType: dealerType?._id || dealerType || dealerTypeId || undefined,
+    dealerTypeSnapshot: dealerType ? { name: dealerType.name, pricingTier: dealerType.pricingTier } : undefined,
+    resolutions,
+  };
+}
