@@ -5,9 +5,11 @@ import SalesOrder from '../models/SalesOrder.js';
 import Dealer from '../models/Dealer.js';
 import DealerLedger from '../models/DealerLedger.js';
 import { deriveOrderPricing, addCreditApproval } from '../services/orderPricingService.js';
+import { getDealerCreditExposure } from '../services/dealerCreditService.js';
 import { syncAutomaticApprovalRequest } from '../services/approvalRequestService.js';
-import { protect, requirePermission } from '../middleware/auth.js';
-import { requireBranch } from '../utils/branchScope.js';
+import { protect, requireAnyPermission, requirePermission } from '../middleware/auth.js';
+import { assertWarehousesInBranch, requireBranch } from '../utils/branchScope.js';
+import { reserveSalesOrderInventory } from '../utils/salesOrderInventory.js';
 import { generateBranchNumber } from '../utils/branchSequence.js';
 import { postSubledgerEntry } from '../utils/subledgerPosting.js';
 
@@ -88,8 +90,30 @@ async function priceQuotation(data, dealer, branchId, session = null, existingRe
   });
   return { priced, fields: quotationPricingFields(priced, dealer) };
 }
+async function findLinkedConvertedOrder(quotation, branchId, session = null) {
+  if (!quotation?.convertedToSO) return null;
+  let query = SalesOrder.findOne({
+    _id: quotation.convertedToSO,
+    branch: branchId,
+    sourceQuotation: quotation._id,
+  });
+  if (session) query = query.session(session);
+  return query;
+}
+function conversionSuccess(quotation, salesOrder, idempotent = false) {
+  return {
+    success: true,
+    idempotent,
+    message: idempotent
+      ? `Quotation was already converted to ${salesOrder.orderNumber}.`
+      : salesOrder.status === 'draft'
+        ? `Converted to ${salesOrder.orderNumber} as draft pending approval.`
+        : `Converted to ${salesOrder.orderNumber}.`,
+    data: { quotation, salesOrder },
+  };
+}
 
-router.get('/', requirePermission('sales.order.create'), async (req, res) => {
+router.get('/', requirePermission('quotation.management'), async (req, res) => {
   try {
     const { page = 1, limit = 20, search, status, dealer } = req.query;
     const p = Math.max(1, Number.parseInt(page, 10) || 1);
@@ -110,7 +134,7 @@ router.get('/', requirePermission('sales.order.create'), async (req, res) => {
   } catch (error) { return res.status(500).json({ success: false, message: error.message }); }
 });
 
-router.get('/stats', requirePermission('sales.order.create'), async (req, res) => {
+router.get('/stats', requirePermission('quotation.management'), async (req, res) => {
   try {
     const scope = { branch: req.branchId };
     const [total, draft, pendingApproval, sent, accepted, converted, expired, cancelled] = await Promise.all([
@@ -127,18 +151,19 @@ router.get('/stats', requirePermission('sales.order.create'), async (req, res) =
   } catch (error) { return res.status(500).json({ success: false, message: error.message }); }
 });
 
-router.post('/price-preview', requirePermission('sales.order.create'), async (req, res) => {
+router.post('/price-preview', requireAnyPermission('sales.order.create', 'quotation.management'), async (req, res) => {
   try {
     const data = editableBody(req.body);
     const dealer = data.dealer ? await findActiveDealer(data.dealer) : null;
     if (data.dealer && !dealer) throw routeError(404, 'Dealer not found.');
     if (!dealer && !data.customerName) throw routeError(422, 'customerName is required for walk-in quotations.');
+    await assertWarehousesInBranch((data.items || []).map(item => item.warehouse), req.branchId);
     const { fields } = await priceQuotation(data, dealer, req.branchId);
     return res.json({ success: true, data: fields });
   } catch (error) { return res.status(error.status || (['CastError', 'ValidationError'].includes(error.name) ? 422 : 500)).json({ success: false, message: error.message }); }
 });
 
-router.get('/:id', requirePermission('sales.order.create'), async (req, res) => {
+router.get('/:id', requirePermission('quotation.management'), async (req, res) => {
   try {
     const quotation = await Quotation.findOne({ _id: req.params.id, branch: req.branchId })
       .populate('dealer', 'businessName dealerCode mobile city gstin')
@@ -149,7 +174,7 @@ router.get('/:id', requirePermission('sales.order.create'), async (req, res) => 
   } catch (error) { return res.status(500).json({ success: false, message: error.message }); }
 });
 
-router.post('/', requirePermission('sales.order.create'), async (req, res) => {
+router.post('/', requirePermission('quotation.management'), async (req, res) => {
   const session = await mongoose.startSession();
   try {
     let quotation;
@@ -159,6 +184,7 @@ router.post('/', requirePermission('sales.order.create'), async (req, res) => {
       const dealer = data.dealer ? await findActiveDealer(data.dealer, session) : null;
       if (data.dealer && !dealer) throw routeError(404, 'Dealer not found.');
       if (!dealer && !data.customerName) throw routeError(422, 'customerName is required for walk-in quotations.');
+      await assertWarehousesInBranch((data.items || []).map(item => item.warehouse), req.branchId, { session });
       const { fields } = await priceQuotation(data, dealer, req.branchId, session);
       Object.assign(data, fields, {
         branch: req.branchId,
@@ -195,7 +221,7 @@ router.post('/', requirePermission('sales.order.create'), async (req, res) => {
   finally { await session.endSession(); }
 });
 
-router.put('/:id', requirePermission('sales.order.create'), async (req, res) => {
+router.put('/:id', requirePermission('quotation.management'), async (req, res) => {
   const session = await mongoose.startSession();
   try {
     let quotation;
@@ -209,6 +235,7 @@ router.put('/:id', requirePermission('sales.order.create'), async (req, res) => 
       const dealer = data.dealer ? await findActiveDealer(data.dealer, session) : null;
       if (data.dealer && !dealer) throw routeError(404, 'Dealer not found.');
       if (!dealer && !data.customerName) throw routeError(422, 'customerName is required for walk-in quotations.');
+      await assertWarehousesInBranch((data.items || []).map(item => item.warehouse), req.branchId, { session });
       const { fields } = await priceQuotation(data, dealer, req.branchId, session, quotation.approvalReasons || []);
       Object.assign(quotation, updates, fields, {
         dealerName: dealer?.businessName || '', dealerCode: dealer?.dealerCode || '',
@@ -236,7 +263,7 @@ router.put('/:id', requirePermission('sales.order.create'), async (req, res) => 
   finally { await session.endSession(); }
 });
 
-router.patch('/:id/status', requirePermission('sales.order.create'), async (req, res) => {
+router.patch('/:id/status', requirePermission('quotation.management'), async (req, res) => {
   const session = await mongoose.startSession();
   try {
     const { status } = req.body;
@@ -268,11 +295,16 @@ router.patch('/:id/status', requirePermission('sales.order.create'), async (req,
   finally { await session.endSession(); }
 });
 
-router.post('/:id/convert', requirePermission('sales.order.create'), async (req, res) => {
+router.post('/:id/convert', requirePermission('quotation.management'), requirePermission('sales.order.create'), async (req, res) => {
   let preflight;
   try {
     preflight = await Quotation.findOne({ _id: req.params.id, branch: req.branchId }).lean();
     if (!preflight) throw routeError(404, 'Quotation not found.');
+    if (preflight.convertedToSO || preflight.convertedAt || preflight.status === 'converted') {
+      const existingOrder = await findLinkedConvertedOrder(preflight, req.branchId);
+      if (existingOrder) return res.json(conversionSuccess(preflight, existingOrder, true));
+      throw routeError(409, 'Quotation is already marked as converted, but its linked Sales Order could not be verified.');
+    }
     if (!['accepted', 'approved'].includes(preflight.status)) throw routeError(409, 'Only accepted or approved quotations can be converted.');
     if (preflight.approvalRequired && preflight.approvalStatus !== 'approved') throw routeError(409, 'Quotation pricing approval is required before conversion.');
     if (preflight.validUntil && new Date(preflight.validUntil) < new Date()) throw routeError(409, 'Expired quotation cannot be converted.');
@@ -286,23 +318,43 @@ router.post('/:id/convert', requirePermission('sales.order.create'), async (req,
   try {
     let quotation;
     let salesOrder;
+    let idempotent = false;
     await session.withTransaction(async () => {
       const current = await Quotation.findOne({ _id: req.params.id, branch: req.branchId }).session(session).lean();
       if (!current) throw routeError(404, 'Quotation not found.');
+      if (current.convertedToSO || current.convertedAt || current.status === 'converted') {
+        const existingOrder = await findLinkedConvertedOrder(current, req.branchId, session);
+        if (!existingOrder) throw routeError(409, 'Quotation is already marked as converted, but its linked Sales Order could not be verified.');
+        quotation = current;
+        salesOrder = existingOrder;
+        idempotent = true;
+        return;
+      }
       if (!['accepted', 'approved'].includes(current.status)) throw routeError(409, 'Quotation is no longer convertible.');
       if (current.approvalRequired && current.approvalStatus !== 'approved') throw routeError(409, 'Quotation pricing approval is required before conversion.');
       if (current.validUntil && new Date(current.validUntil) < new Date()) throw routeError(409, 'Expired quotation cannot be converted.');
       const dealer = current.dealer ? await findActiveDealer(current.dealer, session) : null;
       if (current.dealer && !dealer) throw routeError(404, 'Dealer not found.');
+      await assertWarehousesInBranch((current.items || []).map(item => item.warehouse), req.branchId, { session });
       const { priced } = await priceQuotation(current, dealer, req.branchId, session, current.approvalReasons || [], {
         preserveSnapshots: true,
         preserveBelowMinimumApprovals: true,
       });
       const outstanding = dealer ? await getBranchOutstanding(req.branchId, dealer._id, session) : 0;
-      const approval = addCreditApproval(priced, dealer, outstanding, current.approvalReasons || [], { preserveBelowMinimum: true });
+      const creditExposure = dealer ? await getDealerCreditExposure({ branchId: req.branchId, dealer, asOf: new Date(), session }) : null;
+      const approval = addCreditApproval(priced, dealer, outstanding, current.approvalReasons || [], {
+        preserveBelowMinimum: true,
+        creditExposure,
+      });
       const salesOrderId = new mongoose.Types.ObjectId();
       quotation = await Quotation.findOneAndUpdate(
-        { _id: current._id, branch: req.branchId, status: current.status },
+        {
+          _id: current._id,
+          branch: req.branchId,
+          status: current.status,
+          convertedToSO: null,
+          convertedAt: null,
+        },
         { $set: { status: 'converted', convertedToSO: salesOrderId, convertedAt: new Date() } },
         { new: true, runValidators: true, session }
       );
@@ -338,12 +390,14 @@ router.post('/:id/convert', requirePermission('sales.order.create'), async (req,
         balanceAmount: priced.grandTotal,
         paymentStatus: 'pending',
         status: orderStatus,
+        confirmationRequested: true,
         sourceQuotation: current._id,
         remarks: `Converted from ${current.quotationNumber}. ${current.remarks || ''}`.trim(),
         tallySyncStatus: 'not_synced',
         ...approval,
         createdBy: req.user._id,
       }], { session });
+      if (salesOrder.status === 'confirmed') await reserveSalesOrderInventory(salesOrder, { session });
       await syncAutomaticApprovalRequest({
         branchId: req.branchId,
         type: 'sales_order',
@@ -368,16 +422,19 @@ router.post('/:id/convert', requirePermission('sales.order.create'), async (req,
         });
       }
     });
-    return res.json({
-      success: true,
-      message: salesOrder.status === 'draft' ? `Converted to ${soNumber} as draft pending approval.` : `Converted to ${soNumber}.`,
-      data: { quotation, salesOrder },
-    });
-  } catch (error) { return res.status(error.status || (error.code === 11000 ? 409 : 500)).json({ success: false, message: error.message }); }
+    return res.json(conversionSuccess(quotation, salesOrder, idempotent));
+  } catch (error) {
+    if (error.code === 11000) {
+      const authoritativeQuotation = await Quotation.findOne({ _id: req.params.id, branch: req.branchId }).lean();
+      const existingOrder = await findLinkedConvertedOrder(authoritativeQuotation, req.branchId);
+      if (existingOrder) return res.json(conversionSuccess(authoritativeQuotation, existingOrder, true));
+    }
+    return res.status(error.status || (error.code === 11000 ? 409 : 500)).json({ success: false, message: error.message });
+  }
   finally { await session.endSession(); }
 });
 
-router.delete('/:id', requirePermission('sales.order.create'), async (req, res) => {
+router.delete('/:id', requirePermission('quotation.management'), async (req, res) => {
   try {
     const existing = await Quotation.findOne({ _id: req.params.id, branch: req.branchId }).lean();
     if (!existing) throw routeError(404, 'Quotation not found.');

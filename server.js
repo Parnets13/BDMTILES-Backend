@@ -35,6 +35,7 @@ import sampleRoutes from './routes/sampleRoutes.js';
 import { autoLogMiddleware } from './middleware/activityLogger.js';
 import dailyWageRoutes from './routes/dailyWageRoutes.js';
 import purchaseRequisitionRoutes from './routes/purchaseRequisitionRoutes.js';
+import supplierQuotationRoutes from './routes/supplierQuotationRoutes.js';
 import assetRoutes from './routes/assetRoutes.js';
 import discountMappingRoutes from './routes/discountMappingRoutes.js';
 import invoiceRoutes from './routes/invoiceRoutes.js';
@@ -46,6 +47,7 @@ import bankReconciliationRoutes from './routes/bankReconciliationRoutes.js';
 import documentRoutes from './routes/documentRoutes.js';
 import taskRoutes from './routes/taskRoutes.js';
 import notificationRoutes from './routes/notificationRoutes.js';
+import accessPolicyRoutes from './routes/accessPolicyRoutes.js';
 import incentiveRoutes from './routes/incentiveRoutes.js';
 import branchRoutes from './routes/branchRoutes.js';
 
@@ -117,6 +119,7 @@ app.use('/api/v1/expenses', expenseRoutes);
 app.use('/api/v1/samples', sampleRoutes);
 app.use('/api/v1/daily-wages', dailyWageRoutes);
 app.use('/api/v1/purchase-requisitions', purchaseRequisitionRoutes);
+app.use('/api/v1/supplier-quotations', supplierQuotationRoutes);
 app.use('/api/v1/assets', assetRoutes);
 app.use('/api/v1/discount-mappings', discountMappingRoutes);
 app.use('/api/v1/invoices', invoiceRoutes);
@@ -128,9 +131,11 @@ app.use('/api/v1/bank-reconciliation', bankReconciliationRoutes);
 app.use('/api/v1/documents', documentRoutes);
 app.use('/api/v1/tasks', taskRoutes);
 app.use('/api/v1/notifications', notificationRoutes);
+app.use('/api/v1/access-policies', accessPolicyRoutes);
 app.use('/api/v1/incentives', incentiveRoutes);
 
-// Static uploads
+// Static uploads (supplier financial evidence is never public)
+app.use('/uploads/supplier-credit-notes', (_req, res) => res.status(404).json({ success: false, message: 'Not found.' }));
 app.use('/uploads', express.static('uploads'));
 
 // 404

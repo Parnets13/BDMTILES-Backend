@@ -13,12 +13,74 @@ function finiteNonNegative(value, field, fallback = 0) {
 }
 function quantityValue(value, field) {
   const number = Number(value);
-  if (!Number.isFinite(number) || number < 1) throw routeError(422, `${field} must be at least 1.`);
+  if (!Number.isFinite(number) || number <= 0) throw routeError(422, `${field} must be greater than zero.`);
   return number;
 }
+const fieldProvided = (item, field) => {
+  if (!Object.prototype.hasOwnProperty.call(item, field) || item[field] === undefined || item[field] === null || item[field] === '') return false;
+  // Persisted legacy items used zero defaults for omitted display UOMs.
+  return !(item._id && Number(item[field]) === 0 && field !== 'quantity');
+};
+const roundQuantity = value => Math.round((Number(value) + Number.EPSILON) * 1e6) / 1e6;
+const quantitiesMatch = (left, right) => Math.abs(left - right) <= Math.max(0.0001, Math.max(Math.abs(left), Math.abs(right)) * 0.000001);
+
+export async function normalizeOrderItemsUom(items, session = null) {
+  if (!Array.isArray(items) || items.length === 0) throw routeError(422, 'At least one item is required.');
+  const productIds = items.map((item, index) => {
+    const id = item.product?._id || item.product;
+    if (!mongoose.isValidObjectId(id)) throw routeError(422, `items[${index}].product must be valid.`);
+    return id;
+  });
+  let query = Product.find({ _id: { $in: productIds } }).lean();
+  if (session) query = query.session(session);
+  const products = await query;
+  const byId = new Map(products.map(product => [String(product._id), product]));
+
+  return items.map((item, index) => {
+    const product = byId.get(String(productIds[index]));
+    if (!product) throw routeError(404, `Product not found for items[${index}].`);
+    if (product.status !== 'active') throw routeError(422, `Product ${product.productCode || product._id} is not active.`);
+    const piecesPerBox = finiteNonNegative(product.piecesPerBox, `items[${index}].piecesPerBox`);
+    const sqftPerBox = finiteNonNegative(product.sqftPerBox, `items[${index}].sqftPerBox`);
+    if (!(piecesPerBox > 0) || !(sqftPerBox > 0)) {
+      throw routeError(422, `Product ${product.productCode || product.itemName} requires positive piecesPerBox and sqftPerBox conversions.`);
+    }
+    const candidates = [];
+    if (fieldProvided(item, 'quantity')) candidates.push({ field: 'quantity', boxes: quantityValue(item.quantity, `items[${index}].quantity`) });
+    if (fieldProvided(item, 'boxes')) candidates.push({ field: 'boxes', boxes: quantityValue(item.boxes, `items[${index}].boxes`) });
+    if (fieldProvided(item, 'pieces')) {
+      const pieces = quantityValue(item.pieces, `items[${index}].pieces`);
+      candidates.push({ field: 'pieces', boxes: pieces / piecesPerBox });
+    }
+    if (fieldProvided(item, 'sqft')) {
+      const sqft = quantityValue(item.sqft, `items[${index}].sqft`);
+      candidates.push({ field: 'sqft', boxes: sqft / sqftPerBox });
+    }
+    if (!candidates.length) throw routeError(422, `items[${index}] requires quantity, boxes, pieces, or sqft.`);
+    const boxes = candidates[0].boxes;
+    const inconsistent = candidates.find(candidate => !quantitiesMatch(candidate.boxes, boxes));
+    if (inconsistent) {
+      throw routeError(422, `items[${index}].${inconsistent.field} is inconsistent with ${candidates[0].field} for product packaging.`);
+    }
+    const canonicalBoxes = roundQuantity(boxes);
+    return {
+      source: {
+        ...item,
+        product: product._id,
+        quantity: canonicalBoxes,
+        boxes: canonicalBoxes,
+        pieces: roundQuantity(canonicalBoxes * piecesPerBox),
+        sqft: roundQuantity(canonicalBoxes * sqftPerBox),
+      },
+      product,
+      quantity: canonicalBoxes,
+    };
+  });
+}
 async function loadPreservedResolution(item, quantity, session) {
-  if (!mongoose.isValidObjectId(item.product)) throw routeError(422, 'Each item requires a valid product.');
-  let query = Product.findById(item.product);
+  const productId = item.product?._id || item.product;
+  if (!mongoose.isValidObjectId(productId)) throw routeError(422, 'Each item requires a valid product.');
+  let query = Product.findById(productId);
   if (session) query = query.session(session);
   const product = await query.lean();
   if (!product) throw routeError(404, 'Product not found.');
@@ -68,7 +130,7 @@ export function mergeApprovalReasons(generated, existing = [], options = {}) {
       && Number(old.requestedValue) === Number(reason.requestedValue)
       && Number(old.thresholdValue) === Number(reason.thresholdValue);
     const preserve = sameExposure && (
-      reason.type === 'credit_limit'
+      ['credit_limit', 'overdue_credit', 'credit_days'].includes(reason.type)
       || (options.preserveBelowMinimum && reason.type === 'below_minimum_price')
     );
     return preserve ? { ...reason, status: old.status || 'pending' } : { ...reason, status: 'pending' };
@@ -93,6 +155,24 @@ export function addCreditApproval(pricingResult, dealer, branchOutstanding, exis
       subject: String(dealer._id),
     });
   }
+  const exposure = options.creditExposure;
+  if (dealer && exposure && !exposure.creditDaysValid) {
+    reasons.push({
+      type: 'credit_days',
+      message: `Dealer credit days value ${dealer.creditDays} is invalid and requires approval.`,
+      requestedValue: Number(dealer.creditDays || 0),
+      thresholdValue: 0,
+      subject: String(dealer._id),
+    });
+  } else if (dealer && exposure?.overdueAmount > 0) {
+    reasons.push({
+      type: 'overdue_credit',
+      message: `Dealer has ${exposure.overdueCount} overdue invoice/order exposure(s) totaling ${roundMoney(exposure.overdueAmount)} beyond ${exposure.creditDays} credit day(s).`,
+      requestedValue: roundMoney(exposure.overdueAmount),
+      thresholdValue: 0,
+      subject: String(dealer._id),
+    });
+  }
   const merged = mergeApprovalReasons(reasons, existingReasons, {
     preserveBelowMinimum: Boolean(options.preserveBelowMinimum),
   });
@@ -107,12 +187,7 @@ export async function deriveOrderPricing(options = {}) {
     freightCharges = 0, loadingCharges = 0, installationCharges = 0, otherCharges = 0,
     advanceAmount = 0,
   } = options;
-  if (!Array.isArray(items) || items.length === 0) throw routeError(422, 'At least one item is required.');
-  const normalized = items.map((item, index) => ({
-    source: item,
-    product: item.product?._id || item.product,
-    quantity: quantityValue(item.quantity, `items[${index}].quantity`),
-  }));
+  const normalized = await normalizeOrderItemsUom(items, session);
 
   let resolutions;
   if (preserveSnapshots) {

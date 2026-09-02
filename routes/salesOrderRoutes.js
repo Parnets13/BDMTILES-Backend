@@ -6,27 +6,32 @@ import DealerLedger from '../models/DealerLedger.js';
 import Product from '../models/Product.js';
 import Stock from '../models/Stock.js';
 import DealerType from '../models/DealerType.js';
+import Delivery from '../models/Delivery.js';
+import ApprovalRequest from '../models/ApprovalRequest.js';
 import { deriveOrderPricing, addCreditApproval } from '../services/orderPricingService.js';
+import { getDealerCreditExposure } from '../services/dealerCreditService.js';
 import { resolvePricing } from '../services/pricingResolver.js';
-import { releaseSalesOrderReservation } from '../utils/releaseSalesOrderReservation.js';
-import { protect, requirePermission } from '../middleware/auth.js';
-import { assertWarehousesInBranch, requireBranch } from '../utils/branchScope.js';
+import { protect, requireAnyPermission, requirePermission } from '../middleware/auth.js';
+import { assertWarehousesInBranch, getAssignedBranchIds, hasGlobalBranchAccess, requireBranch } from '../utils/branchScope.js';
 import { generateBranchNumber } from '../utils/branchSequence.js';
 import { postSubledgerEntry } from '../utils/subledgerPosting.js';
-import { getIdempotencyContext, assertIdempotentReplay } from '../utils/idempotency.js';
 import { syncAutomaticApprovalRequest, approvalExposureFingerprint } from '../services/approvalRequestService.js';
+import { reserveSalesOrderInventory } from '../utils/salesOrderInventory.js';
 
 const router = Router();
 router.use(protect);
 router.use(requireBranch);
+
+const requireSalesOrderStatusPermission = (req, res, next) =>
+  requirePermission('sales.order.create')(req, res, next);
 
 const SALES_ORDER_STATUSES = new Set([
   'draft', 'confirmed', 'approved', 'processing', 'partial_dispatch',
   'dispatched', 'delivered', 'cancelled', 'expired',
 ]);
 const USER_STATUS_TRANSITIONS = {
-  draft: new Set(['confirmed', 'cancelled']), confirmed: new Set(['cancelled']),
-  approved: new Set(['cancelled']), processing: new Set(['cancelled']),
+  draft: new Set(['confirmed', 'cancelled']), confirmed: new Set([]),
+  approved: new Set([]), processing: new Set([]),
   partial_dispatch: new Set([]), dispatched: new Set([]), delivered: new Set([]),
   cancelled: new Set([]), expired: new Set([]),
 };
@@ -34,9 +39,14 @@ const SERVER_MANAGED_ORDER_FIELDS = new Set([
   'orderNumber', 'branch', 'legacyBranch', 'createdBy', 'status', 'paymentStatus',
   'subtotal', 'totalDiscount', 'totalSchemeDiscount', 'totalTax', 'roundOff', 'grandTotal', 'balanceAmount',
   'dealerTypeSnapshot', 'dealerName', 'dealerCode', 'creditLimitExceeded', 'approvalStatus', 'approvalReasons',
-  'approvedBy', 'approvalDate', 'approvalRemarks', 'sourceQuotation', 'sourceKey', 'requestFingerprint', 'cancellationReason', 'modificationLogs',
+  'approvedBy', 'approvalDate', 'approvalRemarks', 'confirmationRequested', 'reservationStatus', 'reservedAt',
+  'reservationReleasedAt', 'reservationConsumedAt', 'cancellationRequestStatus', 'cancellationApprovalRequest',
+  'cancellationRequestedAt', 'cancellationRequestedBy', 'sourceQuotation', 'sourceKey', 'requestFingerprint', 'cancellationReason', 'modificationLogs',
   'tallySyncStatus', 'tallyVoucherNumber', 'tallyGUID', 'tallySyncDate', 'tallySyncError',
   'createdAt', 'updatedAt', '_id', '__v',
+]);
+const CONVERTED_ORDER_OPERATIONAL_FIELDS = new Set([
+  'deliveryAddress', 'expectedDeliveryDate', 'deliveryPriority', 'salesExecutive', 'remarks', 'internalNotes',
 ]);
 const validationError = (message) => Object.assign(new Error(message), { status: 422 });
 function withoutServerManagedFields(body = {}) {
@@ -83,8 +93,12 @@ async function authoritativeOrderData(data, dealer, branchOutstanding, branchId,
     advanceAmount: data.advanceAmount, existingApprovalReasons: existingReasons,
     preserveBelowMinimumApprovals: existingReasons.length > 0, session,
   });
+  const creditExposure = dealer ? await getDealerCreditExposure({
+    branchId, dealer, asOf: data.orderDate || new Date(), session,
+  }) : null;
   const credit = addCreditApproval(priced, dealer, branchOutstanding, existingReasons, {
     preserveBelowMinimum: existingReasons.length > 0,
+    creditExposure,
   });
   return {
     ...priced,
@@ -97,33 +111,85 @@ async function authoritativeOrderData(data, dealer, branchOutstanding, branchId,
   };
 }
 
+async function authorizedOrderBranches(req) {
+  const requested = req.query.branch || req.query.branchId;
+  if (!requested) return [req.branchId];
+  const assigned = getAssignedBranchIds(req.user);
+  const canCrossBranch = hasGlobalBranchAccess(req.user) || (req.user.permissions || []).includes('*');
+  const requestedIds = String(requested).toLowerCase() === 'all'
+    ? assigned
+    : [...new Set(String(requested).split(',').map(value => value.trim()).filter(Boolean))];
+  if (!requestedIds.length || requestedIds.some(id => !mongoose.isValidObjectId(id))) {
+    throw Object.assign(new Error('One or more branch filters are invalid.'), { status: 422 });
+  }
+  const activeBranch = String(req.branchId);
+  const isCrossBranch = requestedIds.length !== 1 || requestedIds[0] !== activeBranch;
+  if (isCrossBranch && !canCrossBranch) throw Object.assign(new Error('Cross-branch Sales Order access is not permitted.'), { status: 403 });
+  if (requestedIds.some(id => !assigned.includes(String(id)))) {
+    throw Object.assign(new Error('Sales Order branch filter exceeds assigned branches.'), { status: 403 });
+  }
+  return requestedIds;
+}
+
 router.get('/', requirePermission('sales.order.dashboard'), async (req, res) => {
   try {
-    const { page = 1, limit = 20, search, status, dealer, paymentStatus, dateFrom, dateTo, salesExecutive } = req.query;
+    const {
+      page = 1, limit = 20, search, status, dealer, customerName, customer,
+      product, category, region, deliveryStatus, paymentStatus, dateFrom, dateTo, salesExecutive,
+    } = req.query;
     const p = Math.max(1, Number.parseInt(page, 10) || 1);
     const l = Math.min(100, Number.parseInt(limit, 10) || 20);
-    const filter = { branch: req.branchId };
-    if (search) {
-      const regex = new RegExp(search, 'i');
-      filter.$or = [{ orderNumber: regex }, { dealerName: regex }, { dealerCode: regex }];
-    }
+    const branchIds = await authorizedOrderBranches(req);
+    const filter = { branch: branchIds.length === 1 ? branchIds[0] : { $in: branchIds } };
+    const conditions = [];
+    const addTextCondition = (value, fields) => {
+      if (!value) return;
+      const escaped = String(value).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+      const regex = new RegExp(escaped, 'i');
+      conditions.push({ $or: fields.map(field => ({ [field]: regex })) });
+    };
+    addTextCondition(search, ['orderNumber', 'dealerName', 'dealerCode', 'customerName']);
+    addTextCondition(customerName, ['customerName', 'dealerName']);
+    addTextCondition(customer, ['customerName', 'dealerName', 'dealerCode']);
     if (status) filter.status = status;
-    if (dealer) filter.dealer = dealer;
+    if (dealer) conditions.push({ dealer });
     if (paymentStatus) filter.paymentStatus = paymentStatus;
     if (salesExecutive) filter.salesExecutive = salesExecutive;
+    if (product) conditions.push({ 'items.product': product });
+    if (category) {
+      const productIds = await Product.find({ category, status: 'active' }).distinct('_id');
+      conditions.push({ 'items.product': { $in: productIds } });
+    }
+    if (region) {
+      const dealerIds = await Dealer.find({ assignedRegion: region }).distinct('_id');
+      conditions.push({ dealer: { $in: dealerIds } });
+    }
+    if (deliveryStatus) {
+      const deliveryOrderIds = await Delivery.find({
+        branch: filter.branch,
+        status: { $in: String(deliveryStatus).split(',').map(value => value.trim()).filter(Boolean) },
+      }).distinct('salesOrder');
+      filter._id = { $in: deliveryOrderIds };
+    }
+    if (conditions.length) filter.$and = conditions;
     if (dateFrom || dateTo) {
       filter.orderDate = {};
       if (dateFrom) filter.orderDate.$gte = new Date(dateFrom);
-      if (dateTo) filter.orderDate.$lte = new Date(dateTo);
+      if (dateTo) {
+        const end = new Date(dateTo);
+        if (/^\d{4}-\d{2}-\d{2}$/.test(String(dateTo))) end.setHours(23, 59, 59, 999);
+        filter.orderDate.$lte = end;
+      }
     }
     const [orders, total] = await Promise.all([
       SalesOrder.find(filter).sort({ createdAt: -1 }).skip((p - 1) * l).limit(l)
-        .populate('dealer', 'businessName dealerCode mobile city').populate('dealerType', 'name pricingTier')
-        .populate('salesExecutive', 'name').lean(),
+        .populate('branch', 'branchCode name').populate('dealer', 'businessName dealerCode mobile city assignedRegion')
+        .populate('dealerType', 'name pricingTier').populate('salesExecutive', 'name')
+        .populate('sourceQuotation', 'quotationNumber quotationDate validUntil status convertedAt').lean(),
       SalesOrder.countDocuments(filter),
     ]);
     return res.json({ success: true, data: orders, pagination: { currentPage: p, totalPages: Math.ceil(total / l), totalItems: total, itemsPerPage: l } });
-  } catch (error) { return res.status(500).json({ success: false, message: error.message }); }
+  } catch (error) { return res.status(error.status || (['CastError', 'ValidationError'].includes(error.name) ? 422 : 500)).json({ success: false, message: error.message }); }
 });
 
 router.get('/stats', requirePermission('sales.order.dashboard'), async (req, res) => {
@@ -144,12 +210,27 @@ router.get('/stats', requirePermission('sales.order.dashboard'), async (req, res
   } catch (error) { return res.status(500).json({ success: false, message: error.message }); }
 });
 
-router.get('/search-dealers', requirePermission('sales.order.create'), async (req, res) => {
+router.get('/search-dealers', requireAnyPermission('sales.order.create', 'quotation.management'), async (req, res) => {
   try {
     const { q, page = 1, limit = 20, pricingTier, dealerTypeId } = req.query;
     const p = Math.max(1, Number.parseInt(page, 10) || 1);
     const l = Math.min(50, Number.parseInt(limit, 10) || 20);
     const filter = { status: 'active' };
+    const assignmentScope = req.user.assignmentScopes || {};
+    const broadDealerAccess = ['super_admin', 'owner', 'admin'].includes(req.user.role)
+      || assignmentScope.dealers === 'all'
+      || assignmentScope.regions === 'all';
+    if (!broadDealerAccess) {
+      const assignedDealers = (req.user.assignedDealers || []).map(value => value?._id || value).filter(Boolean);
+      const assignedRegions = (req.user.assignedRegions || []).map(value => value?._id || value).filter(Boolean);
+      filter.$and = [{
+        $or: [
+          ...(assignedDealers.length ? [{ _id: { $in: assignedDealers } }] : []),
+          ...(assignedRegions.length ? [{ assignedRegion: { $in: assignedRegions } }] : []),
+          { assignedSalesExecutive: req.user._id },
+        ],
+      }];
+    }
     if (q && q.length >= 2) {
       const regex = new RegExp(q, 'i');
       filter.$or = [{ businessName: regex }, { dealerCode: regex }, { mobile: regex }, { ownerName: regex }];
@@ -169,7 +250,7 @@ router.get('/search-dealers', requirePermission('sales.order.create'), async (re
   } catch (error) { return res.status(500).json({ success: false, message: error.message }); }
 });
 
-router.get('/search-products', requirePermission('sales.order.create'), async (req, res) => {
+router.get('/search-products', requireAnyPermission('sales.order.create', 'quotation.management'), async (req, res) => {
   try {
     const { q, brand, category, subcategory, page = 1, limit = 20, dealerId, dealerTypeId, scope } = req.query;
     const p = Math.max(1, Number.parseInt(page, 10) || 1);
@@ -223,7 +304,7 @@ router.get('/search-products', requirePermission('sales.order.create'), async (r
   } catch (error) { return res.status(error.status || (['CastError', 'ValidationError'].includes(error.name) ? 422 : 500)).json({ success: false, message: error.message }); }
 });
 
-router.post('/price-preview', requirePermission('sales.order.create'), async (req, res) => {
+router.post('/price-preview', requireAnyPermission('sales.order.create', 'quotation.management'), async (req, res) => {
   try {
     const data = withoutServerManagedFields(req.body);
     const dealer = data.dealer ? await findDealer(data.dealer) : null;
@@ -240,87 +321,18 @@ router.get('/:id', requirePermission('sales.order.dashboard'), async (req, res) 
     const order = await SalesOrder.findOne({ _id: req.params.id, branch: req.branchId })
       .populate('dealer', 'businessName dealerCode mobile city creditLimit creditDays currentOutstanding gstin address')
       .populate('dealerType', 'name pricingTier').populate('salesExecutive', 'name phone')
+      .populate('sourceQuotation', 'quotationNumber quotationDate validUntil status convertedAt')
       .populate('items.product', 'productCode itemName tileSize finish unit').populate('items.warehouse', 'name').lean();
     if (!order) return res.status(404).json({ success: false, message: 'Order not found.' });
     return res.json({ success: true, data: order });
   } catch (error) { return res.status(500).json({ success: false, message: error.message }); }
 });
 
-router.post('/', requirePermission('sales.order.create'), async (req, res) => {
-  const session = await mongoose.startSession();
-  let idempotency;
-  try {
-    idempotency = getIdempotencyContext(req);
-    const existingOrder = await SalesOrder.findOne({ branch: req.branchId, sourceKey: idempotency.sourceKey });
-    if (existingOrder) {
-      assertIdempotentReplay(existingOrder, idempotency.requestFingerprint);
-      return res.json({ success: true, message: 'Sales Order already created.', data: existingOrder });
-    }
-    const requestedStatus = req.body.status ?? 'draft';
-    if (!['draft', 'confirmed'].includes(requestedStatus)) throw validationError('Sales orders can only be created as draft or confirmed.');
-    const data = withoutServerManagedFields(req.body);
-    if (data.orderType === 'walk_in') data.orderType = 'retail';
-    data.branch = req.branchId; data.createdBy = req.user._id; data.tallySyncStatus = 'not_synced';
-    data.sourceKey = idempotency.sourceKey; data.requestFingerprint = idempotency.requestFingerprint;
-    data.orderNumber = await generateBranchNumber(req.branchId, 'salesOrder', data.orderDate || new Date());
-    let order;
-    let forcedPendingDraft = false;
-    await session.withTransaction(async () => {
-      await assertWarehousesInBranch((data.items || []).map((item) => item.warehouse), req.branchId, { session });
-      const dealer = data.dealer ? await findDealer(data.dealer, session) : null;
-      if (data.dealer && !dealer) throw Object.assign(new Error('Dealer not found.'), { status: 404 });
-      if (!dealer && !data.customerName) throw validationError('customerName is required for walk-in sales.');
-      const outstanding = dealer ? await getBranchOutstanding(req.branchId, dealer._id, session) : 0;
-      const authoritative = await authoritativeOrderData(data, dealer, outstanding, req.branchId, session, []);
-      Object.assign(data, authoritative, {
-        dealerName: dealer?.businessName || '', dealerCode: dealer?.dealerCode || '',
-      });
-      forcedPendingDraft = requestedStatus === 'confirmed' && ['pending', 'rejected'].includes(data.approvalStatus);
-      data.status = forcedPendingDraft ? 'draft' : requestedStatus;
-      [order] = await SalesOrder.create([data], { session });
-      await syncAutomaticApprovalRequest({
-        branchId: req.branchId,
-        type: 'sales_order',
-        referenceModel: 'SalesOrder',
-        referenceId: order._id,
-        referenceNumber: order.orderNumber,
-        title: `Sales Order ${order.orderNumber} requires approval`,
-        reasons: order.approvalReasons || [],
-        requestedBy: req.user._id,
-        requestedByName: req.user.name || '',
-        requestedValue: order.grandTotal,
-        document: order,
-        session,
-      });
-      if (order.status === 'confirmed' && order.approvalStatus !== 'pending' && order.approvalStatus !== 'rejected' && order.dealer && order.grandTotal > 0) {
-        await postSubledgerEntry({
-          session, branch: req.branchId, partyType: 'dealer', partyId: order.dealer,
-          amount: order.grandTotal, side: 'debit', postingKey: `sales-order:${order._id}:confirmed`,
-          entryType: 'invoice', entryDate: order.orderDate,
-          description: `Receivable for Sales Order ${order.orderNumber}`,
-          referenceNumber: order.orderNumber, referenceModel: 'SalesOrder', referenceId: order._id, createdBy: req.user._id,
-        });
-      }
-    });
-    return res.status(201).json({
-      success: true,
-      message: forcedPendingDraft ? 'Sales Order created as draft pending approval.' : 'Sales Order created.',
-      data: order,
-    });
-  } catch (error) {
-    if (error.code === 11000 && idempotency?.sourceKey) {
-      const replay = await SalesOrder.findOne({ branch: req.branchId, sourceKey: idempotency.sourceKey });
-      if (replay) {
-        if (replay.requestFingerprint && replay.requestFingerprint !== idempotency.requestFingerprint) {
-          return res.status(409).json({ success: false, message: 'This Idempotency-Key was already used with a different request payload.' });
-        }
-        return res.json({ success: true, message: 'Sales Order already created.', data: replay });
-      }
-    }
-    if (error.code === 11000) return res.status(409).json({ success: false, message: 'Order number exists.' });
-    return res.status(error.status || (['CastError', 'ValidationError'].includes(error.name) ? 422 : 500)).json({ success: false, message: error.message });
-  } finally { await session.endSession(); }
-});
+router.post('/', requirePermission('sales.order.create'), (req, res) => res.status(405).json({
+  success: false,
+  code: 'QUOTATION_REQUIRED',
+  message: 'Direct Sales Order creation is not allowed. Create an approved or accepted quotation, then POST /api/v1/quotations/:id/convert.',
+}));
 
 router.put('/:id', requirePermission('sales.order.create'), async (req, res) => {
   const session = await mongoose.startSession();
@@ -329,6 +341,29 @@ router.put('/:id', requirePermission('sales.order.create'), async (req, res) => 
     await session.withTransaction(async () => {
       order = await SalesOrder.findOne({ _id: req.params.id, branch: req.branchId }).session(session);
       if (!order) throw Object.assign(new Error('Order not found.'), { status: 404 });
+      if (order.sourceQuotation) {
+        const rejectedFields = Object.keys(req.body || {}).filter((key) => !CONVERTED_ORDER_OPERATIONAL_FIELDS.has(key));
+        if (rejectedFields.length) {
+          throw Object.assign(new Error(
+            `Converted Sales Orders preserve their quotation pricing snapshot. Only operational fields may be updated; rejected: ${rejectedFields.join(', ')}.`
+          ), { status: 409, code: 'CONVERTED_ORDER_COMMERCIAL_FIELDS_IMMUTABLE' });
+        }
+        const updateData = Object.fromEntries(
+          Object.entries(req.body || {}).filter(([key]) => CONVERTED_ORDER_OPERATIONAL_FIELDS.has(key))
+        );
+        const changes = [];
+        for (const [key, newValue] of Object.entries(updateData)) {
+          const oldValue = order.get(key);
+          if (JSON.stringify(oldValue) !== JSON.stringify(newValue)) {
+            changes.push({ field: key, oldValue, newValue, changedBy: req.user._id, changedAt: new Date() });
+          }
+        }
+        Object.assign(order, updateData);
+        if (changes.length) order.modificationLogs.push(...changes);
+        if (changes.length && order.tallySyncStatus === 'synced') order.tallySyncStatus = 'pending';
+        await order.save({ session });
+        return;
+      }
       if (order.status !== 'draft') throw Object.assign(new Error(`Cannot edit financial details in "${order.status}" status.`), { status: 409 });
       const editable = withoutServerManagedFields(req.body);
       if (editable.orderType === 'walk_in') editable.orderType = 'retail';
@@ -376,11 +411,67 @@ router.put('/:id', requirePermission('sales.order.create'), async (req, res) => 
       });
     });
     return res.json({ success: true, message: 'Order updated.', data: order });
-  } catch (error) { return res.status(error.status || (['CastError', 'ValidationError'].includes(error.name) ? 422 : 500)).json({ success: false, message: error.message }); }
+  } catch (error) {
+    return res.status(error.status || (['CastError', 'ValidationError'].includes(error.name) ? 422 : 500)).json({
+      success: false,
+      ...(typeof error.code === 'string' ? { code: error.code } : {}),
+      message: error.message,
+    });
+  }
   finally { await session.endSession(); }
 });
 
-router.patch('/:id/status', requirePermission('sales.order.dashboard'), async (req, res) => {
+router.post('/:id/request-cancellation', requirePermission('sales.order.create'), async (req, res) => {
+  const reason = String(req.body?.reason || '').trim();
+  if (!reason) return res.status(422).json({ success: false, message: 'A cancellation reason is required.' });
+  const session = await mongoose.startSession();
+  try {
+    let approval;
+    let order;
+    await session.withTransaction(async () => {
+      order = await SalesOrder.findOne({ _id: req.params.id, branch: req.branchId }).session(session);
+      if (!order) throw Object.assign(new Error('Order not found.'), { status: 404 });
+      if (order.status === 'draft') throw Object.assign(new Error('Draft orders can be cancelled directly through the status endpoint.'), { status: 409 });
+      if (order.status === 'partial_dispatch' || Number(order.items.reduce((sum, item) => sum + Number(item.dispatchedQuantity || 0), 0)) > 0) {
+        throw Object.assign(new Error('A partially dispatched Sales Order cannot be cancelled wholesale.'), { status: 409 });
+      }
+      if (!['confirmed', 'approved', 'processing'].includes(order.status)) {
+        throw Object.assign(new Error(`Cancellation cannot be requested for a Sales Order in "${order.status}" status.`), { status: 409 });
+      }
+      if (order.cancellationRequestStatus === 'pending' && order.cancellationApprovalRequest) {
+        approval = await ApprovalRequest.findOne({ _id: order.cancellationApprovalRequest, branch: req.branchId }).session(session);
+        if (approval?.status === 'pending') return;
+      }
+      const requestNumber = await generateBranchNumber(req.branchId, 'approval', new Date());
+      [approval] = await ApprovalRequest.create([{
+        requestNumber,
+        branch: req.branchId,
+        type: 'sales_order_cancellation',
+        title: `Cancel Sales Order ${order.orderNumber}`,
+        description: reason,
+        referenceModel: 'SalesOrder',
+        referenceId: order._id,
+        referenceNumber: order.orderNumber,
+        reason,
+        requestedBy: req.user._id,
+        requestedByName: req.user.name || '',
+        status: 'pending',
+        priority: 'urgent',
+      }], { session });
+      order.cancellationReason = reason;
+      order.cancellationRequestStatus = 'pending';
+      order.cancellationApprovalRequest = approval._id;
+      order.cancellationRequestedAt = new Date();
+      order.cancellationRequestedBy = req.user._id;
+      await order.save({ session });
+    });
+    return res.status(201).json({ success: true, message: 'Cancellation submitted for approval.', data: { order, approval } });
+  } catch (error) {
+    return res.status(error.status || (['CastError', 'ValidationError'].includes(error.name) ? 422 : 500)).json({ success: false, message: error.message });
+  } finally { await session.endSession(); }
+});
+
+router.patch('/:id/status', requireSalesOrderStatusPermission, async (req, res) => {
   const { status, cancellationReason } = req.body;
   if (!SALES_ORDER_STATUSES.has(status)) return res.status(422).json({ success: false, message: 'Unknown sales order status.' });
   const session = await mongoose.startSession();
@@ -398,8 +489,12 @@ router.patch('/:id/status', requirePermission('sales.order.dashboard'), async (r
         throw Object.assign(new Error(`Sales Order cannot be confirmed while approval is ${current.approvalStatus}.`), { status: 409 });
       }
       const oldStatus = current.status;
-      if (status === 'cancelled') await releaseSalesOrderReservation(current._id, { session });
+      if (status === 'confirmed') {
+        current.confirmationRequested = true;
+        await reserveSalesOrderInventory(current, { session });
+      }
       const setFields = { status };
+      if (status === 'confirmed') setFields.confirmationRequested = true;
       if (status === 'cancelled') setFields.cancellationReason = cancellationReason || '';
       if (current.tallySyncStatus === 'synced') setFields.tallySyncStatus = 'pending';
       order = await SalesOrder.findOneAndUpdate(
@@ -426,19 +521,6 @@ router.patch('/:id/status', requirePermission('sales.order.dashboard'), async (r
           description: `Receivable for Sales Order ${order.orderNumber}`,
           referenceNumber: order.orderNumber, referenceModel: 'SalesOrder', referenceId: order._id, createdBy: req.user._id,
         });
-      }
-      if (status === 'cancelled' && order.dealer) {
-        const originalPostingKey = `sales-order:${order._id}:confirmed`;
-        const originalPosting = await DealerLedger.findOne({ branch: req.branchId, dealer: order.dealer, postingKey: originalPostingKey }).session(session).select('_id').lean();
-        if (originalPosting) {
-          await postSubledgerEntry({
-            session, branch: req.branchId, partyType: 'dealer', partyId: order.dealer,
-            postingKey: `sales-order:${order._id}:cancelled`, reversalOfPostingKey: originalPostingKey,
-            entryType: 'credit_note', entryDate: new Date(),
-            description: `Cancellation reversal for Sales Order ${order.orderNumber}`,
-            referenceNumber: order.orderNumber, referenceModel: 'SalesOrder', referenceId: order._id, createdBy: req.user._id,
-          });
-        }
       }
     });
     return res.json({ success: true, message: alreadyUpdated ? `Order is already in "${status}" status.` : `Order status updated to "${status}".`, data: order });

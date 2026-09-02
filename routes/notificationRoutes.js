@@ -1,26 +1,112 @@
 import { Router } from 'express';
+import crypto from 'crypto';
+import Notification from '../models/Notification.js';
 import NotificationTemplate from '../models/NotificationTemplate.js';
 import NotificationSettings from '../models/NotificationSettings.js';
 import { protect, requirePermission } from '../middleware/auth.js';
 import { requireBranch } from '../utils/branchScope.js';
+import { createNotificationEvent } from '../services/notificationService.js';
 
 const router = Router();
 const TEMPLATE_WRITE_FIELDS = [
   'templateCode', 'templateName', 'channel', 'event', 'subject', 'body', 'variables', 'isActive',
 ];
-const SETTINGS_WRITE_FIELDS = ['moduleName', 'isEnabled', 'events', 'dataAccess'];
+const SETTINGS_WRITE_FIELDS = ['moduleName', 'isEnabled', 'events'];
 const pick = (source, fields) => fields.reduce((result, field) => {
   if (Object.prototype.hasOwnProperty.call(source || {}, field)) result[field] = source[field];
   return result;
 }, {});
 const escapeRegex = (value) => String(value).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 const errorStatus = (error) => (error?.code === 11000 ? 409 : 500);
+const requireOwner = (req, res, next) => {
+  if (!['super_admin', 'owner'].includes(req.user.role)) {
+    return res.status(403).json({ success: false, message: 'Only Super Admin / Owner can manage notification controls.' });
+  }
+  return next();
+};
 
 router.use(protect);
 router.use(requireBranch);
-router.use(['/templates', '/send'], requirePermission('system.management'));
+router.use('/inbox', requirePermission('notification.inbox'));
 
-// Templates CRUD — every lookup and mutation is owned by the selected branch.
+// Authenticated current-user inbox.
+router.get('/inbox', async (req, res) => {
+  try {
+    const page = Math.max(1, Number.parseInt(req.query.page, 10) || 1);
+    const limit = Math.min(100, Math.max(1, Number.parseInt(req.query.limit, 10) || 20));
+    const filter = { branch: req.branchId, recipient: req.user._id };
+    if (req.query.unread === 'true') filter.readAt = null;
+    const [data, total] = await Promise.all([
+      Notification.find(filter).sort({ createdAt: -1 }).skip((page - 1) * limit).limit(limit).lean(),
+      Notification.countDocuments(filter),
+    ]);
+    return res.json({
+      success: true,
+      data,
+      pagination: { currentPage: page, totalPages: Math.ceil(total / limit), totalItems: total },
+    });
+  } catch (error) {
+    return res.status(500).json({ success: false, message: error.message });
+  }
+});
+
+router.get('/inbox/unread-count', async (req, res) => {
+  try {
+    const count = await Notification.countDocuments({ branch: req.branchId, recipient: req.user._id, readAt: null });
+    return res.json({ success: true, data: { count } });
+  } catch (error) {
+    return res.status(500).json({ success: false, message: error.message });
+  }
+});
+
+router.patch('/inbox/read-all', async (req, res) => {
+  try {
+    const result = await Notification.updateMany(
+      { branch: req.branchId, recipient: req.user._id, readAt: null },
+      { $set: { readAt: new Date() } }
+    );
+    return res.json({ success: true, message: 'All notifications marked as read.', data: { modified: result.modifiedCount } });
+  } catch (error) {
+    return res.status(500).json({ success: false, message: error.message });
+  }
+});
+
+router.patch('/inbox/:id/read', async (req, res) => {
+  try {
+    const notification = await Notification.findOneAndUpdate(
+      { _id: req.params.id, branch: req.branchId, recipient: req.user._id },
+      { $set: { readAt: new Date() } },
+      { new: true }
+    );
+    if (!notification) return res.status(404).json({ success: false, message: 'Notification not found.' });
+    return res.json({ success: true, data: notification });
+  } catch (error) {
+    return res.status(500).json({ success: false, message: error.message });
+  }
+});
+
+// All remaining controls are owner-only.
+router.use(requireOwner);
+router.use(['/templates', '/send', '/settings'], requirePermission('notification.manage'));
+
+router.get('/delivery-audit', requirePermission('notification.audit'), async (req, res) => {
+  try {
+    const page = Math.max(1, Number.parseInt(req.query.page, 10) || 1);
+    const limit = Math.min(100, Math.max(1, Number.parseInt(req.query.limit, 10) || 25));
+    const filter = { branch: req.branchId };
+    if (req.query.deliveryState) filter.deliveryState = req.query.deliveryState;
+    if (req.query.module) filter.module = req.query.module;
+    const [data, total] = await Promise.all([
+      Notification.find(filter).sort({ createdAt: -1 }).skip((page - 1) * limit).limit(limit)
+        .populate('recipient', 'name email role').populate('actor', 'name role').lean(),
+      Notification.countDocuments(filter),
+    ]);
+    return res.json({ success: true, data, pagination: { currentPage: page, totalPages: Math.ceil(total / limit), totalItems: total } });
+  } catch (error) {
+    return res.status(500).json({ success: false, message: error.message });
+  }
+});
+
 router.get('/templates', async (req, res) => {
   try {
     const { channel, event, search } = req.query;
@@ -37,12 +123,11 @@ router.get('/templates', async (req, res) => {
 
 router.post('/templates', async (req, res) => {
   try {
-    const data = {
+    const template = await NotificationTemplate.create({
       ...pick(req.body, TEMPLATE_WRITE_FIELDS),
       branch: req.branchId,
       createdBy: req.user._id,
-    };
-    const template = await NotificationTemplate.create(data);
+    });
     return res.status(201).json({ success: true, message: 'Template created.', data: template });
   } catch (error) {
     return res.status(errorStatus(error)).json({ success: false, message: error.message });
@@ -65,10 +150,7 @@ router.put('/templates/:id', async (req, res) => {
 
 router.delete('/templates/:id', async (req, res) => {
   try {
-    const template = await NotificationTemplate.findOneAndDelete({
-      _id: req.params.id,
-      branch: req.branchId,
-    });
+    const template = await NotificationTemplate.findOneAndDelete({ _id: req.params.id, branch: req.branchId });
     if (!template) return res.status(404).json({ success: false, message: 'Template not found in the selected branch.' });
     return res.json({ success: true, message: 'Deleted.', data: { _id: template._id } });
   } catch (error) {
@@ -76,15 +158,11 @@ router.delete('/templates/:id', async (req, res) => {
   }
 });
 
-// Placeholder send operation. Template selection cannot cross the selected branch.
+// Persisted test/event send. External channels are explicitly skipped until providers are configured.
 router.post('/send', async (req, res) => {
   try {
-    const { templateCode, recipients, variables } = req.body;
-    const template = await NotificationTemplate.findOne({
-      branch: req.branchId,
-      templateCode,
-      isActive: true,
-    }).lean();
+    const { templateCode, variables, recipients, recipientUserIds, recipientRoles, eventKey, module, event, deepLink, data } = req.body;
+    const template = await NotificationTemplate.findOne({ branch: req.branchId, templateCode, isActive: true }).lean();
     if (!template) return res.status(404).json({ success: false, message: 'Template not found or inactive.' });
 
     let messageBody = template.body;
@@ -94,28 +172,29 @@ router.post('/send', async (req, res) => {
       });
     }
 
-    console.log(`[NOTIFICATION] Branch: ${req.branchId}, Channel: ${template.channel}, To: ${recipients?.join(', ')}, Message: ${messageBody}`);
-    return res.json({
-      success: true,
-      message: `Notification queued via ${template.channel} to ${recipients?.length || 0} recipients.`,
-      data: { channel: template.channel, messageBody, recipients },
+    const result = await createNotificationEvent({
+      branch: req.branchId,
+      module: module || 'custom',
+      event: event || template.event,
+      eventKey: eventKey || `test:${template._id}:${crypto.randomUUID()}`,
+      title: template.subject || template.templateName,
+      body: messageBody,
+      data: data || {},
+      deepLink: deepLink || '',
+      actor: req.user._id,
+      recipientUserIds: recipientUserIds || recipients || [],
+      recipientRoles: recipientRoles || [],
+      channels: [template.channel, 'web'],
+      respectSettings: false,
     });
+    return res.status(result.created ? 201 : 200).json({ success: true, message: result.skipped ? result.reason : 'Notification event persisted.', data: result });
   } catch (error) {
-    return res.status(500).json({ success: false, message: error.message });
+    return res.status(errorStatus(error)).json({ success: false, message: error.message });
   }
 });
 
-const requireSettingsOwner = (req, res) => {
-  if (!['super_admin', 'owner'].includes(req.user.role)) {
-    res.status(403).json({ success: false, message: 'Only Super Admin / Owner can manage notification settings.' });
-    return false;
-  }
-  return true;
-};
-
 router.get('/settings', async (req, res) => {
   try {
-    if (!requireSettingsOwner(req, res)) return;
     const settings = await NotificationSettings.find({ branch: req.branchId }).sort({ module: 1 }).lean();
     return res.json({ success: true, data: settings });
   } catch (error) {
@@ -125,25 +204,14 @@ router.get('/settings', async (req, res) => {
 
 router.get('/settings/:module', async (req, res) => {
   try {
-    if (!requireSettingsOwner(req, res)) return;
-    let settings = await NotificationSettings.findOne({
+    const settings = await NotificationSettings.findOne({ branch: req.branchId, module: req.params.module }).lean();
+    return res.json({ success: true, data: settings || {
       branch: req.branchId,
       module: req.params.module,
-    }).lean();
-    if (!settings) {
-      settings = {
-        branch: req.branchId,
-        module: req.params.module,
-        isEnabled: true,
-        events: [],
-        dataAccess: {
-          restrictByTime: false,
-          accessWindowDays: 0,
-          exemptRoles: ['super_admin', 'owner'],
-        },
-      };
-    }
-    return res.json({ success: true, data: settings });
+      moduleName: req.params.module.replace(/_/g, ' '),
+      isEnabled: true,
+      events: [],
+    } });
   } catch (error) {
     return res.status(500).json({ success: false, message: error.message });
   }
@@ -151,7 +219,6 @@ router.get('/settings/:module', async (req, res) => {
 
 router.put('/settings/:module', async (req, res) => {
   try {
-    if (!requireSettingsOwner(req, res)) return;
     const settings = await NotificationSettings.findOneAndUpdate(
       { branch: req.branchId, module: req.params.module },
       {
@@ -160,11 +227,7 @@ router.put('/settings/:module', async (req, res) => {
       },
       { upsert: true, new: true, setDefaultsOnInsert: true, runValidators: true }
     );
-    return res.json({
-      success: true,
-      message: `Settings for "${req.params.module}" updated.`,
-      data: settings,
-    });
+    return res.json({ success: true, message: `Settings for "${req.params.module}" updated.`, data: settings });
   } catch (error) {
     return res.status(errorStatus(error)).json({ success: false, message: error.message });
   }
@@ -172,116 +235,37 @@ router.put('/settings/:module', async (req, res) => {
 
 router.post('/settings/initialize', async (req, res) => {
   try {
-    if (!requireSettingsOwner(req, res)) return;
+    const defaultEvents = {
+      lead: [
+        { eventCode: 'lead_created', eventName: 'Lead Created', isEnabled: true, channels: ['web'], recipientRoles: ['sales_manager'] },
+        { eventCode: 'lead_assigned', eventName: 'Lead Assigned', isEnabled: true, channels: ['web', 'push'], recipientRoles: [] },
+        { eventCode: 'lead_accepted', eventName: 'Lead Accepted', isEnabled: true, channels: ['web'], recipientRoles: ['sales_manager'] },
+        { eventCode: 'lead_declined', eventName: 'Lead Declined', isEnabled: true, channels: ['web', 'push'], recipientRoles: ['sales_manager', 'admin'] },
+      ],
+      complaint: [
+        { eventCode: 'complaint_raised', eventName: 'Complaint Raised', isEnabled: true, channels: ['web'], recipientRoles: ['sales_manager', 'warehouse_manager'] },
+      ],
+    };
     const modules = [
-      { module: 'sales_order', moduleName: 'Sales Orders', events: [
-        { eventCode: 'order_created', eventName: 'New Order Created', isEnabled: true, channels: ['web', 'push'], recipientRoles: ['admin', 'owner', 'sales_manager'] },
-        { eventCode: 'order_confirmed', eventName: 'Order Confirmed', isEnabled: true, channels: ['web', 'whatsapp'], recipientRoles: ['warehouse_manager'] },
-        { eventCode: 'credit_exceeded', eventName: 'Credit Limit Exceeded', isEnabled: true, channels: ['web', 'push', 'whatsapp'], recipientRoles: ['owner', 'finance_manager'] },
-      ] },
-      { module: 'payment', moduleName: 'Payments', events: [
-        { eventCode: 'payment_received', eventName: 'Payment Received', isEnabled: true, channels: ['web'], recipientRoles: ['finance_manager', 'owner'] },
-        { eventCode: 'cheque_bounced', eventName: 'Cheque Bounced', isEnabled: true, channels: ['web', 'push', 'whatsapp'], recipientRoles: ['owner', 'finance_manager', 'sales_manager'] },
-      ] },
-      { module: 'stock_alert', moduleName: 'Stock Alerts', events: [
-        { eventCode: 'stock_low', eventName: 'Stock Below Reorder', isEnabled: true, channels: ['web'], recipientRoles: ['purchase_manager', 'warehouse_manager'] },
-        { eventCode: 'stock_zero', eventName: 'Zero Stock', isEnabled: true, channels: ['web', 'push'], recipientRoles: ['purchase_manager', 'owner'] },
-      ] },
-      { module: 'delivery', moduleName: 'Delivery', events: [
-        { eventCode: 'delivery_failed', eventName: 'Delivery Failed', isEnabled: true, channels: ['web', 'push'], recipientRoles: ['sales_manager', 'owner'] },
-        { eventCode: 'delivery_completed', eventName: 'Delivery Completed', isEnabled: true, channels: ['web'], recipientRoles: ['finance_manager'] },
-      ] },
-      { module: 'lead', moduleName: 'Lead Management', events: [
-        { eventCode: 'lead_assigned', eventName: 'Lead Assigned to SE', isEnabled: true, channels: ['push', 'web'], recipientRoles: ['sales_executive'] },
-        { eventCode: 'lead_accepted', eventName: 'Lead Accepted by SE', isEnabled: true, channels: ['web'], recipientRoles: ['sales_manager'] },
-        { eventCode: 'lead_declined', eventName: 'Lead Declined by SE', isEnabled: true, channels: ['web', 'push'], recipientRoles: ['sales_manager', 'admin'] },
-      ] },
-      { module: 'approval', moduleName: 'Approvals', events: [
-        { eventCode: 'approval_required', eventName: 'Approval Required', isEnabled: true, channels: ['web', 'push'], recipientRoles: ['owner', 'admin'] },
-      ] },
-      { module: 'complaint', moduleName: 'Complaints', events: [
-        { eventCode: 'complaint_raised', eventName: 'New Complaint', isEnabled: true, channels: ['web'], recipientRoles: ['sales_manager', 'warehouse_manager'] },
-      ] },
-      { module: 'expense', moduleName: 'Expenses', events: [
-        { eventCode: 'expense_submitted', eventName: 'Expense Submitted for Approval', isEnabled: true, channels: ['web'], recipientRoles: ['finance_manager', 'hr_manager'] },
-      ] },
+      ['sales_order', 'Sales Orders'], ['quotation', 'Quotations'], ['invoice', 'Invoices'],
+      ['payment', 'Payments'], ['purchase_order', 'Purchase Orders'], ['grn', 'Goods Receipts'],
+      ['stock_alert', 'Stock Alerts'], ['dispatch', 'Dispatch'], ['delivery', 'Delivery'],
+      ['complaint', 'Complaints'], ['lead', 'Lead Management'], ['approval', 'Approvals'],
+      ['expense', 'Expenses'], ['attendance', 'Attendance'], ['leave', 'Leave'], ['task', 'Tasks'],
+      ['credit_limit', 'Credit Limit'], ['cheque_bounce', 'Cheque Bounce'],
     ];
-
     let created = 0;
-    for (const item of modules) {
+    for (const [module, moduleName] of modules) {
       const result = await NotificationSettings.updateOne(
-        { branch: req.branchId, module: item.module },
-        {
-          $setOnInsert: {
-            ...item,
-            branch: req.branchId,
-            isEnabled: true,
-            dataAccess: {
-              restrictByTime: false,
-              accessWindowDays: 0,
-              exemptRoles: ['super_admin', 'owner'],
-            },
-            updatedBy: req.user._id,
-          },
-        },
+        { branch: req.branchId, module },
+        { $setOnInsert: { branch: req.branchId, module, moduleName, isEnabled: true, events: defaultEvents[module] || [], updatedBy: req.user._id } },
         { upsert: true, runValidators: true }
       );
       if (result.upsertedCount) created += 1;
     }
-
-    return res.json({
-      success: true,
-      message: `Initialized ${created} module settings.`,
-      data: { created, total: modules.length },
-    });
+    return res.json({ success: true, message: `Initialized ${created} module settings.`, data: { created, total: modules.length } });
   } catch (error) {
     return res.status(errorStatus(error)).json({ success: false, message: error.message });
-  }
-});
-
-router.patch('/settings/:module/toggle', async (req, res) => {
-  try {
-    if (!requireSettingsOwner(req, res)) return;
-    const settings = await NotificationSettings.findOneAndUpdate(
-      { branch: req.branchId, module: req.params.module },
-      { $set: { isEnabled: req.body.isEnabled, updatedBy: req.user._id } },
-      { new: true, runValidators: true }
-    );
-    if (!settings) return res.status(404).json({ success: false, message: 'Module settings not found. Initialize first.' });
-    return res.json({
-      success: true,
-      message: `${req.params.module} notifications ${settings.isEnabled ? 'enabled' : 'disabled'}.`,
-      data: settings,
-    });
-  } catch (error) {
-    return res.status(500).json({ success: false, message: error.message });
-  }
-});
-
-router.patch('/settings/:module/data-access', async (req, res) => {
-  try {
-    if (!requireSettingsOwner(req, res)) return;
-    const updates = {};
-    if (Object.prototype.hasOwnProperty.call(req.body, 'restrictByTime')) {
-      updates['dataAccess.restrictByTime'] = req.body.restrictByTime;
-    }
-    if (Object.prototype.hasOwnProperty.call(req.body, 'accessWindowDays')) {
-      updates['dataAccess.accessWindowDays'] = req.body.accessWindowDays;
-    }
-    if (Object.prototype.hasOwnProperty.call(req.body, 'exemptRoles')) {
-      updates['dataAccess.exemptRoles'] = req.body.exemptRoles;
-    }
-    updates.updatedBy = req.user._id;
-
-    const settings = await NotificationSettings.findOneAndUpdate(
-      { branch: req.branchId, module: req.params.module },
-      { $set: updates },
-      { new: true, runValidators: true }
-    );
-    if (!settings) return res.status(404).json({ success: false, message: 'Module settings not found.' });
-    return res.json({ success: true, message: 'Data access settings updated.', data: settings });
-  } catch (error) {
-    return res.status(500).json({ success: false, message: error.message });
   }
 });
 

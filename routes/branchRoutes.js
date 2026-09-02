@@ -19,7 +19,7 @@ const businessCollections = [
   'salesorders', 'quotations', 'invoices', 'purchaseorders', 'grns', 'stocks',
   'expenses', 'dealerpricings', 'payments', 'salesreturns', 'purchasereturns',
   'dealerledgers', 'supplierledgers', 'supplierinvoices', 'picklists',
-  'dispatchtrips', 'deliveries',
+  'dispatchtrips', 'deliveries', 'purchaserequisitions', 'supplierquotations', 'approvalrequests',
 ];
 
 const validBranchId = (req, res) => {

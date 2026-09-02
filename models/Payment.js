@@ -14,13 +14,14 @@ const paymentSchema = new mongoose.Schema(
     supplier: { type: mongoose.Schema.Types.ObjectId, ref: 'Supplier' },
     partyName: String,
 
-    // Against which orders
+    // Against which orders/invoices
     againstOrders: [{
       order: { type: mongoose.Schema.Types.ObjectId, refPath: 'againstOrders.orderModel' },
-      orderModel: { type: String, enum: ['SalesOrder', 'PurchaseOrder'] },
+      orderModel: { type: String, enum: ['SalesOrder', 'PurchaseOrder', 'SupplierInvoice', 'Invoice'] },
       orderNumber: String,
       allocatedAmount: { type: Number, default: 0, min: 0.01 },
     }],
+    unallocatedAdvanceAmount: { type: Number, default: 0, min: 0 },
 
     // Payment details
     amount: { type: Number, required: true, min: 0.01 },
@@ -34,8 +35,15 @@ const paymentSchema = new mongoose.Schema(
     sourceKey: { type: String, unique: true, sparse: true },
     requestFingerprint: { type: String, default: '' }, // idempotency key for system-created receipts
     
+    // Reciprocal lifecycle ownership. Once set, cheque Payment transitions must go
+    // through the cheque endpoints so state, maker-checker, and accounting stay atomic.
+    cheque: { type: mongoose.Schema.Types.ObjectId, ref: 'Cheque', index: true },
+
     // Status
     status: { type: String, enum: ['pending', 'confirmed', 'bounced', 'cancelled'], default: 'confirmed' },
+    confirmedAt: Date,
+    bouncedAt: Date,
+    cancelledAt: Date,
     bounceReason: String,
     bounceCharges: { type: Number, default: 0 },
 

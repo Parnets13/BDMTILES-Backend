@@ -10,11 +10,14 @@ export function getFiscalYear(date = new Date(), startMonth = 4) {
   return `${startYear}-${String(startYear + 1).slice(-2)}`;
 }
 
-export async function generateBranchNumber(branchId, documentType, date = new Date()) {
-  const [branch, settings] = await Promise.all([
-    Branch.findById(branchId).select('branchCode').lean(),
-    BranchSettings.findOne({ branch: branchId }).lean(),
-  ]);
+export async function generateBranchNumber(branchId, documentType, date = new Date(), options = {}) {
+  let branchQuery = Branch.findById(branchId).select('branchCode').lean();
+  let settingsQuery = BranchSettings.findOne({ branch: branchId }).lean();
+  if (options.session) {
+    branchQuery = branchQuery.session(options.session);
+    settingsQuery = settingsQuery.session(options.session);
+  }
+  const [branch, settings] = await Promise.all([branchQuery, settingsQuery]);
   if (!branch) {
     const error = new Error('Branch not found.');
     error.status = 404;
@@ -28,7 +31,7 @@ export async function generateBranchNumber(branchId, documentType, date = new Da
   const counter = await BranchSequence.findOneAndUpdate(
     { branch: branchId, documentType, fiscalYear: sequenceBucket },
     { $inc: { value: 1 } },
-    { upsert: true, new: true, setDefaultsOnInsert: true }
+    { upsert: true, new: true, setDefaultsOnInsert: true, ...(options.session ? { session: options.session } : {}) }
   ).lean();
 
   const prefix = config.prefix || documentType.toUpperCase();

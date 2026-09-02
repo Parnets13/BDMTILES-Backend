@@ -1,5 +1,21 @@
 import mongoose from 'mongoose';
 
+const deliveryDiscrepancySchema = new mongoose.Schema({
+  type: { type: String, enum: ['short', 'damaged'], required: true },
+  boxes: { type: Number, required: true, min: 0.000001 },
+  remarks: { type: String, default: '' },
+  status: { type: String, enum: ['recorded', 'under_review', 'resolved'], default: 'recorded' },
+  recordedBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User' },
+  recordedAt: { type: Date, default: Date.now },
+}, { _id: true });
+
+const deliveryExceptionSchema = new mongoose.Schema({
+  used: { type: Boolean, default: false },
+  reason: { type: String, default: '' },
+  authorizedBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User' },
+  authorizedAt: Date,
+}, { _id: false });
+
 const deliverySchema = new mongoose.Schema(
   {
     deliveryNumber: { type: String, required: true },
@@ -41,6 +57,10 @@ const deliverySchema = new mongoose.Schema(
     // Proof of delivery
     podImage: { type: String, default: '' },
     podSignature: { type: String, default: '' },
+    podDocumentUrl: { type: String, default: '' },
+    receiverName: { type: String, default: '' },
+    verificationException: { type: deliveryExceptionSchema, default: () => ({}) },
+    discrepancies: { type: [deliveryDiscrepancySchema], default: [] },
     invoiceImage: { type: String, default: '' },
 
     // Payment collection at delivery

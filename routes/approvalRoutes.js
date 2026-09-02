@@ -2,6 +2,8 @@ import mongoose from 'mongoose';
 import { Router } from 'express';
 import ApprovalRequest from '../models/ApprovalRequest.js';
 import SalesOrder from '../models/SalesOrder.js';
+import DealerLedger from '../models/DealerLedger.js';
+import PickList from '../models/PickList.js';
 import Quotation from '../models/Quotation.js';
 import PurchaseOrder from '../models/PurchaseOrder.js';
 import PurchaseReturn from '../models/PurchaseReturn.js';
@@ -10,11 +12,16 @@ import { protect, requireAnyPermission, userHasPermission } from '../middleware/
 import { requireBranch } from '../utils/branchScope.js';
 import { generateBranchNumber } from '../utils/branchSequence.js';
 import { approvalExposureFingerprint } from '../services/approvalRequestService.js';
+import { actionPurchaseOrderApproval } from '../services/purchaseOrderService.js';
+import { reserveSalesOrderInventory } from '../utils/salesOrderInventory.js';
+import { releaseSalesOrderReservation } from '../utils/releaseSalesOrderReservation.js';
+import { postSubledgerEntry } from '../utils/subledgerPosting.js';
 
 const APPROVAL_TYPE_PERMISSIONS = Object.freeze({
   sales_order: 'sales.order.approve',
+  sales_order_cancellation: 'sales.order.approve',
   quotation: 'sales.order.approve',
-  purchase_order: 'po.management',
+  purchase_order: 'po.approve',
   credit_limit: 'finance.management',
   rate_override: 'dealer.discounts',
   debit_note: 'debit.note',
@@ -25,8 +32,9 @@ const APPROVAL_TYPE_PERMISSIONS = Object.freeze({
 
 const APPROVAL_REFERENCE_TYPES = Object.freeze({
   sales_order: { referenceModel: 'SalesOrder', Model: SalesOrder, displayField: 'orderNumber', required: true },
+  sales_order_cancellation: { referenceModel: 'SalesOrder', Model: SalesOrder, displayField: 'orderNumber', required: true },
   quotation: { referenceModel: 'Quotation', Model: Quotation, displayField: 'quotationNumber', required: true },
-  purchase_order: { referenceModel: 'PurchaseOrder', Model: PurchaseOrder, displayField: 'poNumber' },
+  purchase_order: { referenceModel: 'PurchaseOrder', Model: PurchaseOrder, displayField: 'poNumber', required: true },
   credit_limit: { referenceModel: 'SalesOrder', Model: SalesOrder, displayField: 'orderNumber' },
   rate_override: { referenceModel: 'SalesOrder', Model: SalesOrder, displayField: 'orderNumber' },
   debit_note: { referenceModel: 'PurchaseReturn', Model: PurchaseReturn, displayField: 'debitNoteNumber' },
@@ -173,6 +181,12 @@ router.post('/', async (req, res) => {
       throw routeError(422, 'Unsupported approval type.');
     }
 
+    if (data.type === 'sales_order_cancellation') {
+      throw routeError(422, 'Use the Sales Order cancellation-request endpoint.');
+    }
+    if (data.type === 'purchase_order') {
+      throw routeError(422, 'Use the Purchase Order submit endpoint to create its approval request.');
+    }
     const referenceNumber = await validateApprovalReference(
       req.branchId,
       data.type,
@@ -212,6 +226,29 @@ const actionApproval = async (req, res, nextStatus) => {
       }
       if (current.status !== 'pending') throw routeError(409, 'Already actioned.');
 
+      const purchaseOrderAction = current.type === 'purchase_order'
+        && current.referenceModel === 'PurchaseOrder'
+        && current.referenceId;
+      if (purchaseOrderAction) {
+        const result = await actionPurchaseOrderApproval({
+          branchId: req.branchId,
+          poId: current.referenceId,
+          actorId: req.user._id,
+          nextStatus,
+          remarks,
+          session,
+          approvalRequestId: current._id,
+        });
+        approval = await ApprovalRequest.findById(current._id).session(session);
+        if (!approval || approval.status !== nextStatus || result.po.status !== nextStatus) {
+          throw routeError(409, 'Purchase order and approval request could not be synchronized.');
+        }
+        return;
+      }
+
+      const cancellationAction = current.type === 'sales_order_cancellation'
+        && current.referenceModel === 'SalesOrder'
+        && current.referenceId;
       const autoActionSalesOrder = ['sales_order', 'credit_limit', 'rate_override', 'discount'].includes(current.type)
         && current.referenceModel === 'SalesOrder'
         && current.referenceId;
@@ -220,6 +257,19 @@ const actionApproval = async (req, res, nextStatus) => {
         && current.referenceId;
       let referencedSalesOrder = null;
       let referencedQuotation = null;
+
+      if (cancellationAction) {
+        referencedSalesOrder = await SalesOrder.findOne({
+          _id: current.referenceId,
+          branch: req.branchId,
+          cancellationRequestStatus: 'pending',
+          status: { $in: ['confirmed', 'approved', 'processing'] },
+        }).session(session).lean();
+        if (!referencedSalesOrder) throw routeError(409, 'Referenced Sales Order is unavailable or no longer pending cancellation.');
+        if ((referencedSalesOrder.items || []).some(item => Number(item.dispatchedQuantity || 0) > 0)) {
+          throw routeError(409, 'A partially dispatched Sales Order cannot be cancelled wholesale.');
+        }
+      }
 
       if (autoActionSalesOrder) {
         referencedSalesOrder = await SalesOrder.findOne({
@@ -262,6 +312,66 @@ const actionApproval = async (req, res, nextStatus) => {
       );
       if (!approval) throw routeError(409, 'Approval was actioned by another request.');
 
+      if (cancellationAction) {
+        if (nextStatus === 'approved') {
+          await releaseSalesOrderReservation(current.referenceId, { session });
+          await PickList.updateMany(
+            { branch: req.branchId, salesOrder: current.referenceId, stockConsumedAt: null },
+            {
+              $set: {
+                status: 'cancelled', stockReserved: false, reservationState: 'released',
+                reservationReleasedAt: actionedAt, cancellationProcessing: false,
+              },
+              $unset: { dispatchTrip: 1, tripClaimedAt: 1 },
+            },
+            { session }
+          );
+          const cancelledOrder = await SalesOrder.findOneAndUpdate(
+            {
+              _id: current.referenceId,
+              branch: req.branchId,
+              cancellationRequestStatus: 'pending',
+              status: { $in: ['confirmed', 'approved', 'processing'] },
+            },
+            {
+              $set: {
+                status: 'cancelled', cancellationRequestStatus: 'approved',
+                cancellationReason: current.reason || current.description || '',
+                tallySyncStatus: referencedSalesOrder.tallySyncStatus === 'synced' ? 'pending' : referencedSalesOrder.tallySyncStatus,
+              },
+              $push: { modificationLogs: { field: 'status', oldValue: referencedSalesOrder.status, newValue: 'cancelled', changedBy: req.user._id, changedAt: actionedAt, reason: current.reason || current.description || '' } },
+            },
+            { new: true, runValidators: true, session }
+          );
+          if (!cancelledOrder) throw routeError(409, 'Sales Order cancellation state changed before approval was applied.');
+          await ApprovalRequest.updateMany(
+            { branch: req.branchId, referenceModel: 'SalesOrder', referenceId: current.referenceId, type: 'sales_order', status: 'pending' },
+            { $set: { status: 'cancelled' } },
+            { session }
+          );
+          if (cancelledOrder.dealer) {
+            const originalPostingKey = `sales-order:${cancelledOrder._id}:confirmed`;
+            const originalPosting = await DealerLedger.findOne({ branch: req.branchId, dealer: cancelledOrder.dealer, postingKey: originalPostingKey }).session(session).select('_id').lean();
+            if (originalPosting) {
+              await postSubledgerEntry({
+                session, branch: req.branchId, partyType: 'dealer', partyId: cancelledOrder.dealer,
+                postingKey: `sales-order:${cancelledOrder._id}:cancelled`, reversalOfPostingKey: originalPostingKey,
+                entryType: 'credit_note', entryDate: actionedAt,
+                description: `Cancellation reversal for Sales Order ${cancelledOrder.orderNumber}`,
+                referenceNumber: cancelledOrder.orderNumber, referenceModel: 'SalesOrder', referenceId: cancelledOrder._id, createdBy: req.user._id,
+              });
+            }
+          }
+        } else {
+          const rejectedOrder = await SalesOrder.findOneAndUpdate(
+            { _id: current.referenceId, branch: req.branchId, cancellationRequestStatus: 'pending' },
+            { $set: { cancellationRequestStatus: 'rejected' } },
+            { new: true, session }
+          );
+          if (!rejectedOrder) throw routeError(409, 'Sales Order cancellation state changed before rejection was applied.');
+        }
+      }
+
       if (autoActionSalesOrder) {
         const reasonType = current.type === 'credit_limit'
           ? 'credit_limit'
@@ -297,6 +407,20 @@ const actionApproval = async (req, res, nextStatus) => {
           { new: true, runValidators: true, session }
         );
         if (!updatedOrder) throw routeError(409, 'Referenced sales order approval state changed.');
+        if (aggregateStatus === 'approved' && updatedOrder.confirmationRequested && updatedOrder.status === 'draft') {
+          await reserveSalesOrderInventory(updatedOrder, { session });
+          updatedOrder.status = 'confirmed';
+          await updatedOrder.save({ session });
+          if (updatedOrder.dealer && updatedOrder.grandTotal > 0) {
+            await postSubledgerEntry({
+              session, branch: req.branchId, partyType: 'dealer', partyId: updatedOrder.dealer,
+              amount: updatedOrder.grandTotal, side: 'debit', postingKey: `sales-order:${updatedOrder._id}:confirmed`,
+              entryType: 'invoice', entryDate: updatedOrder.orderDate,
+              description: `Receivable for Sales Order ${updatedOrder.orderNumber}`,
+              referenceNumber: updatedOrder.orderNumber, referenceModel: 'SalesOrder', referenceId: updatedOrder._id, createdBy: req.user._id,
+            });
+          }
+        }
       }
 
       if (autoActionQuotation) {

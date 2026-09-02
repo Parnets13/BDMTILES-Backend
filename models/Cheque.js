@@ -7,17 +7,25 @@ import mongoose from 'mongoose';
 
 const timelineEntrySchema = new mongoose.Schema({
   date: { type: Date, default: Date.now },
-  action: String, // 'received', 'deposited', 'cleared', 'bounced', 'returned', 'cancelled'
+  action: String,
+  previousStatus: String,
+  newStatus: String,
   performedBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User' },
   performedByName: String,
-  notes: String,
+  notes: { type: String, required: true },
+  referenceModel: String,
+  referenceId: { type: mongoose.Schema.Types.ObjectId },
+  referenceNumber: String,
 });
 
 const chequeSchema = new mongoose.Schema(
   {
-    chequeNumber: { type: String, required: true },
+    // Optional at schema level so legacy branchless documents remain readable by maintenance
+    // tooling; every API create/query is branch-scoped and new records always set this field.
+    branch: { type: mongoose.Schema.Types.ObjectId, ref: 'Branch', index: true },
+    chequeNumber: { type: String, required: true, trim: true },
     chequeDate: { type: Date, required: true },
-    amount: { type: Number, required: true, min: 0 },
+    amount: { type: Number, required: true, min: 0.01 },
 
     // Drawer's bank details (person who wrote the cheque)
     bankName: { type: String, required: true },
@@ -54,8 +62,8 @@ const chequeSchema = new mongoose.Schema(
     // Status lifecycle
     status: {
       type: String,
-      enum: ['received', 'deposited', 'cleared', 'bounced', 'returned', 'cancelled', 're_deposited'],
-      default: 'received',
+      enum: ['received', 'issued', 'deposited', 'cleared', 'bounced', 'returned', 'cancelled', 're_deposited'],
+      default() { return this.chequeType === 'issued' ? 'issued' : 'received'; },
     },
 
     // Deposit info
@@ -104,11 +112,21 @@ const chequeSchema = new mongoose.Schema(
   { timestamps: true }
 );
 
-chequeSchema.index({ chequeNumber: 1, bankName: 1 });
-chequeSchema.index({ dealer: 1, status: 1 });
-chequeSchema.index({ supplier: 1, status: 1 });
-chequeSchema.index({ chequeDate: -1 });
-chequeSchema.index({ status: 1, chequeDate: -1 });
-chequeSchema.index({ isPDC: 1, pdcDueDate: 1 });
+chequeSchema.index({ branch: 1, chequeNumber: 1, bankName: 1 });
+chequeSchema.index(
+  { branch: 1, payment: 1 },
+  {
+    unique: true,
+    partialFilterExpression: {
+      branch: { $type: 'objectId' },
+      payment: { $type: 'objectId' },
+    },
+  }
+);
+chequeSchema.index({ branch: 1, dealer: 1, status: 1 });
+chequeSchema.index({ branch: 1, supplier: 1, status: 1 });
+chequeSchema.index({ branch: 1, chequeDate: -1 });
+chequeSchema.index({ branch: 1, status: 1, chequeDate: -1 });
+chequeSchema.index({ branch: 1, isPDC: 1, pdcDueDate: 1 });
 
 export default mongoose.model('Cheque', chequeSchema);

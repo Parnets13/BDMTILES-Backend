@@ -16,7 +16,7 @@ export const DELETE_OWNERSHIP = Object.freeze({
   DealerType: 'global',
   DealerCategory: 'global',
   ExpenseCategory: 'global',
-  DiscountMapping: 'global',
+  DiscountMapping: 'branch',
   Customer: 'global-compatible',
   Route: 'global-compatible',
   Vehicle: 'global-compatible',

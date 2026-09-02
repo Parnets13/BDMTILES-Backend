@@ -1,15 +1,23 @@
 import { Router } from 'express';
 import mongoose from 'mongoose';
 import PurchaseOrder from '../models/PurchaseOrder.js';
+import Product from '../models/Product.js';
 import GRN from '../models/GRN.js';
 import Stock from '../models/Stock.js';
 import Supplier from '../models/Supplier.js';
-import Product from '../models/Product.js';
-import { protect, requirePermission } from '../middleware/auth.js';
+import BranchSettings from '../models/BranchSettings.js';
+import { protect, requirePermission, requireAnyPermission } from '../middleware/auth.js';
 import { assertWarehousesInBranch, requireBranch } from '../utils/branchScope.js';
 import { generateBranchNumber } from '../utils/branchSequence.js';
 import { requestFingerprint as fingerprintRequest } from '../utils/idempotency.js';
-import { postSubledgerEntry } from '../utils/subledgerPosting.js';
+import {
+  actionPurchaseOrderApproval,
+  amendmentDiff,
+  assertPurchaseOrderSourceIntegrity,
+  calculatePurchaseOrder,
+  purchaseOrderSnapshot,
+  submitPurchaseOrder,
+} from '../services/purchaseOrderService.js';
 
 const router = Router();
 router.use(protect);
@@ -18,12 +26,16 @@ router.use(requireBranch);
 // ═══════════════════════════════════════
 // PURCHASE ORDERS
 // ═══════════════════════════════════════
-router.get('/purchase-orders', requirePermission('po.management'), async (req, res) => {
+router.get('/purchase-orders', requireAnyPermission('po.management', 'po.approve'), async (req, res) => {
   try {
     const { page = 1, limit = 20, search, status, supplier } = req.query;
     const p = Math.max(1, parseInt(page)); const l = Math.min(100, parseInt(limit) || 20);
     let filter = { branch: req.branchId };
-    if (search) { const r = new RegExp(search, 'i'); filter.$or = [{ poNumber: r }, { supplierName: r }]; }
+    if (search) {
+      const escaped = String(search).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+      const r = new RegExp(escaped, 'i');
+      filter.$or = [{ poNumber: r }, { supplierName: r }];
+    }
     if (status) filter.status = status;
     if (supplier) filter.supplier = supplier;
     const [orders, total] = await Promise.all([
@@ -34,149 +46,301 @@ router.get('/purchase-orders', requirePermission('po.management'), async (req, r
   } catch (e) { res.status(500).json({ success: false, message: e.message }); }
 });
 
-router.get('/purchase-orders/stats', requirePermission('po.management'), async (req, res) => {
+router.get('/purchase-orders/stats', requireAnyPermission('po.management', 'po.approve'), async (req, res) => {
   try {
     const scope = { branch: req.branchId };
-    const [total, draft, approved, received, cancelled] = await Promise.all([
-      PurchaseOrder.countDocuments(scope), PurchaseOrder.countDocuments({ ...scope, status: 'draft' }),
-      PurchaseOrder.countDocuments({ ...scope, status: 'approved' }), PurchaseOrder.countDocuments({ ...scope, status: 'received' }),
+    const [total, draft, pendingApproval, approved, rejected, partialReceived, received, cancelled] = await Promise.all([
+      PurchaseOrder.countDocuments(scope),
+      PurchaseOrder.countDocuments({ ...scope, status: 'draft' }),
+      PurchaseOrder.countDocuments({ ...scope, status: { $in: ['submitted', 'pending_approval'] } }),
+      PurchaseOrder.countDocuments({ ...scope, status: 'approved' }),
+      PurchaseOrder.countDocuments({ ...scope, status: 'rejected' }),
+      PurchaseOrder.countDocuments({ ...scope, status: 'partial_received' }),
+      PurchaseOrder.countDocuments({ ...scope, status: 'received' }),
       PurchaseOrder.countDocuments({ ...scope, status: 'cancelled' }),
     ]);
-    res.json({ success: true, data: { total, draft, approved, received, cancelled } });
+    res.json({ success: true, data: { total, draft, pendingApproval, approved, rejected, partialReceived, received, cancelled } });
   } catch (e) { res.status(500).json({ success: false, message: e.message }); }
 });
 
-router.get('/purchase-orders/:id', requirePermission('po.management'), async (req, res) => {
+router.get('/purchase-orders/:id', requireAnyPermission('po.management', 'po.approve'), async (req, res) => {
   try {
-    const po = await PurchaseOrder.findOne({ _id: req.params.id, branch: req.branchId }).populate('supplier', 'companyName supplierCode mobile').populate('items.product', 'productCode itemName').lean();
+    const po = await PurchaseOrder.findOne({ _id: req.params.id, branch: req.branchId }).populate('supplier', 'companyName supplierCode mobile').populate('items.product', 'productCode itemName images').lean();
     if (!po) return res.status(404).json({ success: false, message: 'PO not found.' });
     res.json({ success: true, data: po });
   } catch (e) { res.status(500).json({ success: false, message: e.message }); }
 });
 
-router.post('/purchase-orders', requirePermission('po.management'), async (req, res) => {
+router.get('/purchase-orders/:id/print', requireAnyPermission('po.management', 'po.approve'), async (req, res) => {
   try {
-    const { branch, poNumber, createdBy, ...input } = req.body;
-    const data = { ...input, branch: req.branchId, createdBy: req.user._id };
-    data.poNumber = await generateBranchNumber(req.branchId, 'purchaseOrder', data.poDate || new Date());
-    if (data.receivingWarehouse) {
-      await assertWarehousesInBranch([data.receivingWarehouse], req.branchId);
-    }
-
-    // Validate purchase rate against max (basicPrice + excessPrice)
-    if (data.items?.length) {
-      const rateWarnings = [];
-      for (const item of data.items) {
-        if (item.product) {
-          const prod = await Product.findById(item.product).select('basicPrice excessPrice maxPurchaseRate itemName productCode').lean();
-          if (prod && prod.maxPurchaseRate > 0 && item.rate > prod.maxPurchaseRate) {
-            rateWarnings.push(`${prod.productCode || prod.itemName}: Rate ₹${item.rate} exceeds max ₹${prod.maxPurchaseRate} (Basic ₹${prod.basicPrice} + Excess ₹${prod.excessPrice})`);
-          }
-        }
-      }
-      if (rateWarnings.length > 0) {
-        return res.status(400).json({
-          success: false,
-          message: 'Purchase rate exceeds allowed maximum for some items.',
-          data: { warnings: rateWarnings },
-        });
-      }
-    }
-
-    // Calc totals
-    if (data.items?.length) {
-      let subtotal = 0, totalTax = 0;
-      data.items = data.items.map(item => {
-        const base = item.quantity * item.rate;
-        const disc = item.discount || 0;
-        const taxable = base - disc;
-        const gst = (taxable * (item.gstPercentage || 18)) / 100;
-        subtotal += taxable; totalTax += gst;
-        return { ...item, gstAmount: gst, totalAmount: taxable + gst, pendingQty: item.quantity };
-      });
-      data.subtotal = subtotal; data.totalTax = totalTax;
-      data.grandTotal = Math.round(subtotal + totalTax + (data.freight || 0) + (data.loading || 0) + (data.insurance || 0));
-    }
-    if (data.supplier) {
-      const sup = await Supplier.findById(data.supplier).lean();
-      if (sup) data.supplierName = sup.companyName;
-    }
-    data.tallySyncStatus = 'not_synced';
-    const po = await PurchaseOrder.create(data);
-    res.status(201).json({ success: true, message: 'Purchase Order created.', data: po });
-  } catch (e) { res.status(500).json({ success: false, message: e.message }); }
+    const po = await PurchaseOrder.findOne({ _id: req.params.id, branch: req.branchId })
+      .populate('supplier', 'companyName supplierCode contactPerson mobile email gstin address city state pinCode')
+      .populate('receivingWarehouse', 'warehouseCode name address city state pinCode')
+      .populate('createdBy approvedBy', 'name email').lean();
+    if (!po) return res.status(404).json({ success: false, message: 'PO not found.' });
+    return res.json({
+      success: true,
+      data: {
+        documentType: 'PURCHASE_ORDER',
+        documentNumber: po.poNumber,
+        documentDate: po.poDate,
+        status: po.status,
+        branch: req.branch,
+        supplier: po.supplier,
+        receivingWarehouse: po.receivingWarehouse,
+        items: po.items,
+        commercialTerms: {
+          paymentTerms: po.paymentTerms,
+          creditDays: po.creditDays,
+          expectedDeliveryDate: po.expectedDeliveryDate,
+          deliveryAddress: po.deliveryAddress,
+          remarks: po.remarks,
+        },
+        totals: {
+          subtotal: po.subtotal, totalDiscount: po.totalDiscount, totalTax: po.totalTax,
+          freight: po.freight, loading: po.loading, insurance: po.insurance, grandTotal: po.grandTotal,
+        },
+        audit: { createdAt: po.createdAt, createdBy: po.createdBy, approvedAt: po.approvedAt, approvedBy: po.approvedBy },
+      },
+    });
+  } catch (error) {
+    return res.status(error.name === 'CastError' ? 422 : 500).json({ success: false, message: error.name === 'CastError' ? 'Invalid identifier.' : error.message });
+  }
 });
+
+router.post('/purchase-orders', requirePermission('po.management'), (_req, res) => res.status(405).json({
+  success: false,
+  code: 'PR_SUPPLIER_QUOTATION_REQUIRED',
+  message: 'Create a purchase requisition, compare supplier quotations, and convert the selected quotation to a purchase order.',
+}));
 
 router.put('/purchase-orders/:id', requirePermission('po.management'), async (req, res) => {
+  const session = await mongoose.startSession();
   try {
-    const { branch, poNumber, createdBy, ...updates } = req.body;
-    if (updates.receivingWarehouse) await assertWarehousesInBranch([updates.receivingWarehouse], req.branchId);
-    const po = await PurchaseOrder.findOneAndUpdate(
-      { _id: req.params.id, branch: req.branchId },
-      updates,
-      { new: true, runValidators: true }
-    );
-    if (!po) return res.status(404).json({ success: false, message: 'Not found.' });
-    res.json({ success: true, message: 'PO updated.', data: po });
-  } catch (e) { res.status(500).json({ success: false, message: e.message }); }
+    let updated;
+    await session.withTransaction(async () => {
+      const po = await PurchaseOrder.findOne({ _id: req.params.id, branch: req.branchId }).session(session);
+      if (!po) throw Object.assign(new Error('Purchase order not found.'), { status: 404 });
+      if (po.status !== 'draft') throw Object.assign(new Error('Only a draft purchase order can be amended.'), { status: 409 });
+      const reason = String(req.body.amendmentReason || '').trim();
+      if (!reason) throw Object.assign(new Error('amendmentReason is required.'), { status: 422 });
+      const before = purchaseOrderSnapshot(po);
+      const calculated = await calculatePurchaseOrder({ branchId: req.branchId, input: req.body, session });
+      await assertPurchaseOrderSourceIntegrity({ branchId: req.branchId, po, calculated, session });
+      Object.assign(po, calculated);
+      const after = purchaseOrderSnapshot(po);
+      const diff = amendmentDiff(before, after);
+      if (!diff.length) throw Object.assign(new Error('No purchase order changes were supplied.'), { status: 422 });
+      po.amendmentHistory.push({ snapshot: before, diff, reason, amendedBy: req.user._id, amendedAt: new Date() });
+      updated = await po.save({ session });
+    });
+    return res.json({ success: true, message: 'PO amended.', data: updated });
+  } catch (error) {
+    const status = error.status || (error.name === 'CastError' || error.name === 'ValidationError' ? 422 : 500);
+    return res.status(status).json({ success: false, message: error.message });
+  } finally { await session.endSession(); }
 });
 
-router.patch('/purchase-orders/:id/status', requirePermission('po.management'), async (req, res) => {
+router.patch('/purchase-orders/:id/submit', requirePermission('po.management'), async (req, res) => {
+  const session = await mongoose.startSession();
   try {
-    const po = await PurchaseOrder.findOneAndUpdate(
-      { _id: req.params.id, branch: req.branchId },
-      { status: req.body.status },
-      { new: true, runValidators: true }
-    );
-    res.json({ success: true, message: `Status updated to ${req.body.status}.`, data: po });
-  } catch (e) { res.status(500).json({ success: false, message: e.message }); }
+    let result;
+    await session.withTransaction(async () => {
+      result = await submitPurchaseOrder({ branchId: req.branchId, poId: req.params.id, actor: req.user, remarks: String(req.body.remarks || ''), session });
+    });
+    return res.json({ success: true, message: result.replayed ? 'Purchase order is already submitted.' : 'Purchase order submitted for approval.', data: result });
+  } catch (error) {
+    return res.status(error.status || (error.name === 'CastError' ? 422 : 500)).json({ success: false, message: error.message });
+  } finally { await session.endSession(); }
+});
+
+const directPurchaseOrderAction = async (req, res, nextStatus) => {
+  const session = await mongoose.startSession();
+  try {
+    let result;
+    await session.withTransaction(async () => {
+      result = await actionPurchaseOrderApproval({
+        branchId: req.branchId, poId: req.params.id, actorId: req.user._id,
+        nextStatus, remarks: String(req.body.remarks || ''), session,
+      });
+    });
+    return res.json({ success: true, message: result.replayed ? `Purchase order is already ${nextStatus}.` : `Purchase order ${nextStatus}.`, data: result.po });
+  } catch (error) {
+    return res.status(error.status || (error.name === 'CastError' ? 422 : 500)).json({ success: false, message: error.message });
+  } finally { await session.endSession(); }
+};
+
+router.patch('/purchase-orders/:id/approve', requirePermission('po.approve'), (req, res) => directPurchaseOrderAction(req, res, 'approved'));
+router.patch('/purchase-orders/:id/reject', requirePermission('po.approve'), (req, res) => directPurchaseOrderAction(req, res, 'rejected'));
+
+router.patch('/purchase-orders/:id/status', requirePermission('po.management'), async (req, res) => {
+  const requested = req.body.status;
+  if (requested === 'pending_approval' || requested === 'submitted') {
+    const session = await mongoose.startSession();
+    try {
+      let result;
+      await session.withTransaction(async () => {
+        result = await submitPurchaseOrder({ branchId: req.branchId, poId: req.params.id, actor: req.user, remarks: String(req.body.remarks || ''), session });
+      });
+      return res.json({ success: true, message: 'Purchase order submitted for approval.', data: result.po });
+    } catch (error) {
+      return res.status(error.status || 500).json({ success: false, message: error.message });
+    } finally { await session.endSession(); }
+  }
+  if (requested === 'approved' || requested === 'rejected') {
+    return res.status(422).json({ success: false, message: `Use the explicit /${requested === 'approved' ? 'approve' : 'reject'} endpoint.` });
+  }
+  return res.status(422).json({ success: false, message: 'Unsupported status transition. Use an explicit purchase order action endpoint.' });
 });
 
 router.delete('/purchase-orders/:id', requirePermission('po.management'), async (req, res) => {
   try {
+    const po = await PurchaseOrder.findOne({ _id: req.params.id, branch: req.branchId }).select('status').lean();
+    if (!po) return res.status(404).json({ success: false, message: 'Purchase order not found.' });
+    if (po.status !== 'draft') return res.status(409).json({ success: false, message: 'Only a draft purchase order can be deleted.' });
     const { safeDelete } = await import('../middleware/safeDelete.js');
     const result = await safeDelete(PurchaseOrder, req.params.id, {
-      user: req.user,
-      module: 'purchase',
-      titleField: 'supplierName',
-      codeField: 'poNumber',
-      scope: { branch: req.branchId },
+      user: req.user, module: 'purchase', titleField: 'supplierName', codeField: 'poNumber', scope: { branch: req.branchId },
     });
-    res.status(result.status || 200).json(result);
-  } catch (e) { res.status(500).json({ success: false, message: e.message }); }
+    return res.status(result.status || 200).json(result);
+  } catch (error) { return res.status(500).json({ success: false, message: error.message }); }
 });
 
 // ═══════════════════════════════════════
 // GRN (Goods Receipt Note)
 // ═══════════════════════════════════════
+const grnError = (status, message) => Object.assign(new Error(message), { status });
+const receiptQuantity = (value, field) => {
+  const parsed = Number(value ?? 0);
+  if (!Number.isFinite(parsed) || parsed < 0) throw grnError(422, `${field} must be a finite nonnegative number.`);
+  return parsed;
+};
+const receiptId = value => String(value?._id || value || '');
+const receiptRound = value => Math.round((Number(value) + Number.EPSILON) * 1000000) / 1000000;
+
+function normalizeGRNItems({ items, po, branchId, grnNumber }) {
+  if (!Array.isArray(items) || !items.length) throw grnError(422, 'At least one GRN item is required.');
+  const usedPOLines = new Set();
+  let totalReceived = 0;
+
+  const normalized = items.map((item, index) => {
+    let poItem = item.purchaseOrderItem ? po.items.id(item.purchaseOrderItem) : null;
+    if (!poItem) {
+      const matches = po.items.filter(line => receiptId(line.product) === receiptId(item.product));
+      if (matches.length === 1) poItem = matches[0];
+    }
+    if (!poItem) throw grnError(422, `items[${index}] must identify one exact purchase order line.`);
+    const poLineId = receiptId(poItem._id);
+    if (usedPOLines.has(poLineId)) throw grnError(422, `Purchase order line ${index + 1} appears more than once in the GRN.`);
+    usedPOLines.add(poLineId);
+
+    const receivedQty = receiptQuantity(item.receivedQty, `items[${index}].receivedQty`);
+    const rejectedQty = receiptQuantity(item.rejectedQty, `items[${index}].rejectedQty`);
+    const damagedQty = receiptQuantity(item.damagedQty, `items[${index}].damagedQty`);
+    let heldQty = item.heldQty === undefined
+      ? 0
+      : receiptQuantity(item.heldQty, `items[${index}].heldQty`);
+    if (item.heldQty === undefined && item.acceptedQty !== undefined) {
+      const suppliedAccepted = receiptQuantity(item.acceptedQty, `items[${index}].acceptedQty`);
+      heldQty = receiptRound(receivedQty - suppliedAccepted - rejectedQty - damagedQty);
+      if (heldQty < 0) throw grnError(422, `items[${index}] disposition quantities exceed received quantity.`);
+    }
+    const acceptedQty = receiptRound(receivedQty - rejectedQty - damagedQty - heldQty);
+    if (acceptedQty < 0) throw grnError(422, `items[${index}] received quantity must equal accepted, rejected, damaged, and held quantities.`);
+    if (item.acceptedQty !== undefined && Math.abs(Number(item.acceptedQty) - acceptedQty) > 0.000001) {
+      throw grnError(422, `items[${index}].acceptedQty does not match the receipt disposition quantities.`);
+    }
+
+    const pendingQty = Number(poItem.pendingQty ?? Math.max(0, Number(poItem.quantity) - Number(poItem.receivedQty || 0)));
+    if (!Number.isFinite(pendingQty) || receivedQty > pendingQty + 0.000001) {
+      throw grnError(422, `items[${index}].receivedQty exceeds the purchase order line pending quantity.`);
+    }
+    if (receivedQty > 0 && !item.warehouse) throw grnError(422, `items[${index}].warehouse is required.`);
+    totalReceived = receiptRound(totalReceived + receivedQty);
+
+    return {
+      purchaseOrderItem: poItem._id,
+      product: poItem.product,
+      productCode: poItem.productCode,
+      productName: poItem.productName,
+      unit: poItem.unit || 'Box',
+      orderedQty: Number(poItem.quantity),
+      receivedQty,
+      acceptedQty,
+      shortQty: receiptRound(Math.max(0, pendingQty - receivedQty)),
+      excessQty: 0,
+      damagedQty,
+      rejectedQty,
+      heldQty,
+      shade: String(item.shade || ''),
+      batch: String(item.batch || ''),
+      qualityStatus: heldQty > 0 ? 'hold' : acceptedQty > 0 ? 'accepted' : 'rejected',
+      warehouse: item.warehouse || po.receivingWarehouse,
+      zone: String(item.zone || ''),
+      rack: String(item.rack || ''),
+      bin: String(item.bin || ''),
+      rate: Number(poItem.rate),
+      discount: Number(poItem.discount || 0),
+      schemeDiscount: Number(poItem.schemeDiscount || 0),
+      gstPercentage: Number(poItem.gstPercentage || 0),
+      receiptCode: `${receiptId(branchId)}:${grnNumber}:${poLineId}`,
+      remarks: String(item.remarks || ''),
+    };
+  });
+
+  if (totalReceived <= 0) throw grnError(422, 'At least one GRN line must have a positive received quantity.');
+  return normalized;
+}
+
 router.get('/grn', requirePermission('grn.entry'), async (req, res) => {
   try {
     const { page = 1, limit = 20, search, status, supplier } = req.query;
     const p = Math.max(1, parseInt(page)); const l = Math.min(100, parseInt(limit) || 20);
     let filter = { branch: req.branchId };
-    if (search) { const r = new RegExp(search, 'i'); filter.$or = [{ grnNumber: r }, { supplierName: r }, { poNumber: r }]; }
+    if (search) {
+      const escaped = String(search).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+      const r = new RegExp(escaped, 'i');
+      filter.$or = [{ grnNumber: r }, { supplierName: r }, { poNumber: r }];
+    }
     if (status) filter.status = status;
     if (supplier) filter.supplier = supplier;
-    const [grns, total] = await Promise.all([
+    const scope = { branch: req.branchId };
+    const [grns, total, draft, verified, approved, posted] = await Promise.all([
       GRN.find(filter).sort({ createdAt: -1 }).skip((p-1)*l).limit(l).populate('supplier', 'companyName').lean(),
       GRN.countDocuments(filter),
+      GRN.countDocuments({ ...scope, status: 'draft' }),
+      GRN.countDocuments({ ...scope, status: 'verified' }),
+      GRN.countDocuments({ ...scope, status: 'approved' }),
+      GRN.countDocuments({ ...scope, status: 'posted' }),
     ]);
-    res.json({ success: true, data: grns, pagination: { currentPage: p, totalPages: Math.ceil(total/l), totalItems: total, itemsPerPage: l } });
+    res.json({
+      success: true,
+      data: grns,
+      stats: { total: await GRN.countDocuments(scope), draft, verified, approved: approved + posted, posted },
+      pagination: { currentPage: p, totalPages: Math.ceil(total/l), totalItems: total, itemsPerPage: l },
+    });
   } catch (e) { res.status(500).json({ success: false, message: e.message }); }
 });
 
 // Get approved POs for GRN creation — MUST be before /grn/:id to avoid route conflict
 router.get('/grn/available-pos', requirePermission('grn.entry'), async (req, res) => {
   try {
-    const pos = await PurchaseOrder.find({ branch: req.branchId, status: { $in: ['approved', 'sent', 'partial_received'] } })
-      .select('poNumber supplierName poDate items grandTotal status').populate('supplier', 'companyName').lean();
+    const pos = await PurchaseOrder.find({
+      branch: req.branchId,
+      status: { $in: ['approved', 'sent', 'partial_received'] },
+      items: { $elemMatch: { pendingQty: { $gt: 0 } } },
+    })
+      .select('poNumber supplierName poDate items grandTotal status')
+      .populate('supplier', 'companyName')
+      .populate('items.product', 'productCode itemName images')
+      .lean();
     res.json({ success: true, data: pos });
   } catch (e) { res.status(500).json({ success: false, message: e.message }); }
 });
 
 router.get('/grn/:id', requirePermission('grn.entry'), async (req, res) => {
   try {
-    const grn = await GRN.findOne({ _id: req.params.id, branch: req.branchId }).populate('supplier', 'companyName').populate('items.product', 'productCode itemName').populate('items.warehouse', 'name').lean();
+    const grn = await GRN.findOne({ _id: req.params.id, branch: req.branchId }).populate('supplier', 'companyName').populate('items.product', 'productCode itemName images').populate('items.warehouse', 'name').lean();
     if (!grn) return res.status(404).json({ success: false, message: 'GRN not found.' });
     res.json({ success: true, data: grn });
   } catch (e) { res.status(500).json({ success: false, message: e.message }); }
@@ -187,58 +351,85 @@ router.post('/grn', requirePermission('grn.entry'), async (req, res) => {
   if (!rawIdempotencyKey || rawIdempotencyKey.length > 200) {
     return res.status(422).json({ success: false, message: 'A valid Idempotency-Key header is required.' });
   }
-  const sourceKey = `${String(req.branchId)}:${rawIdempotencyKey}`;
+  const sourceKey = `${String(req.branchId)}:grn:${rawIdempotencyKey}`;
   const requestFingerprint = fingerprintRequest(req.body);
+  const session = await mongoose.startSession();
   try {
-    const existing = await GRN.findOne({ branch: req.branchId, sourceKey });
-    if (existing) {
-      if (existing.requestFingerprint && existing.requestFingerprint !== requestFingerprint) {
-        return res.status(409).json({ success: false, message: 'This Idempotency-Key was already used with a different request payload.' });
+    let result;
+    let replayed = false;
+    await session.withTransaction(async () => {
+      const existing = await GRN.findOne({ branch: req.branchId, sourceKey }).session(session);
+      if (existing) {
+        if (existing.requestFingerprint && existing.requestFingerprint !== requestFingerprint) {
+          throw grnError(409, 'This Idempotency-Key was already used with a different request payload.');
+        }
+        result = existing;
+        replayed = true;
+        return;
       }
-      return res.json({ success: true, message: 'GRN already created.', data: existing });
-    }
-    const requestedStatus = req.body.status ?? 'draft';
-    if (['approved', 'posted'].includes(requestedStatus)) {
-      return res.status(422).json({ success: false, message: 'Create the GRN as draft or verified, then use the approval endpoint.' });
-    }
-    if (!['draft', 'verified'].includes(requestedStatus)) {
-      return res.status(422).json({ success: false, message: 'GRN status must be draft or verified on creation.' });
-    }
 
-    const { branch, grnNumber, createdBy, ...input } = req.body;
-    const data = {
-      ...input,
-      branch: req.branchId,
-      sourceKey,
-      requestFingerprint,
-      status: requestedStatus,
-      createdBy: req.user._id,
-    };
-    data.grnNumber = await generateBranchNumber(req.branchId, 'grn', data.grnDate || new Date());
-
-    if (!data.supplier) return res.status(422).json({ success: false, message: 'Supplier is required.' });
-    const supplier = await Supplier.findById(data.supplier).lean();
-    if (!supplier) return res.status(404).json({ success: false, message: 'Supplier not found.' });
-    data.supplierName = supplier.companyName;
-
-    if (data.purchaseOrder) {
-      const po = await PurchaseOrder.findOne({ _id: data.purchaseOrder, branch: req.branchId }).lean();
-      if (!po) return res.status(404).json({ success: false, message: 'Purchase order not found.' });
-      if (String(po.supplier) !== String(data.supplier)) {
-        return res.status(422).json({ success: false, message: 'Purchase order does not belong to the selected supplier.' });
+      const requestedStatus = req.body.status ?? 'draft';
+      if (requestedStatus !== 'draft') {
+        throw grnError(422, 'Create the GRN as draft, then use the verification endpoint.');
       }
-      data.poNumber = po.poNumber;
-    }
+      if (!req.body.purchaseOrder) throw grnError(422, 'An approved purchase order is required for a GRN.');
 
-    data.tallySyncStatus = 'not_synced';
-    await assertWarehousesInBranch(
-      (data.items || []).filter((item) => Number(item.acceptedQty || item.receivedQty) > 0).map((item) => item.warehouse),
-      req.branchId
-    );
-    const grn = await GRN.create(data);
-    res.status(201).json({ success: true, message: 'GRN created without posting effects.', data: grn });
-  } catch (e) {
-    if (e.code === 11000) {
+      const po = await PurchaseOrder.findOne({ _id: req.body.purchaseOrder, branch: req.branchId }).session(session);
+      if (!po) throw grnError(404, 'Purchase order not found.');
+      if (!['approved', 'sent', 'partial_received'].includes(po.status)) {
+        throw grnError(409, 'Only an approved purchase order with pending quantities can be used for a GRN.');
+      }
+      if (!po.items.some(item => Number(item.pendingQty) > 0)) throw grnError(409, 'Purchase order has no pending quantity.');
+      if (req.body.supplier && receiptId(req.body.supplier) !== receiptId(po.supplier)) {
+        throw grnError(422, 'Purchase order does not belong to the selected supplier.');
+      }
+
+      const supplier = await Supplier.findOne({ _id: po.supplier, status: 'active' }).session(session).lean();
+      if (!supplier) throw grnError(404, 'Active supplier not found.');
+      const grnDate = req.body.grnDate || new Date();
+      const grnNumber = await generateBranchNumber(req.branchId, 'grn', grnDate, { session });
+      const items = normalizeGRNItems({
+        items: req.body.items,
+        po,
+        branchId: req.branchId,
+        grnNumber,
+      });
+      await assertWarehousesInBranch(
+        items.filter(item => item.receivedQty > 0).map(item => item.warehouse),
+        req.branchId,
+        { session }
+      );
+
+      [result] = await GRN.create([{
+        grnNumber,
+        branch: req.branchId,
+        grnDate,
+        sourceKey,
+        requestFingerprint,
+        purchaseOrder: po._id,
+        poNumber: po.poNumber,
+        supplier: po.supplier,
+        supplierName: supplier.companyName,
+        supplierInvoiceNo: String(req.body.supplierInvoiceNo || ''),
+        vehicleNo: String(req.body.vehicleNo || ''),
+        driverName: String(req.body.driverName || ''),
+        driverMobile: String(req.body.driverMobile || ''),
+        lrNumber: String(req.body.lrNumber || ''),
+        qcPhotos: Array.isArray(req.body.qcPhotos) ? req.body.qcPhotos.map(String) : [],
+        items,
+        status: requestedStatus,
+        qcRemarks: String(req.body.qcRemarks || req.body.remarks || ''),
+        tallySyncStatus: 'not_synced',
+        createdBy: req.user._id,
+      }], { session });
+    });
+    return res.status(replayed ? 200 : 201).json({
+      success: true,
+      message: replayed ? 'GRN already created.' : 'GRN created without posting effects.',
+      data: result,
+    });
+  } catch (error) {
+    if (error.code === 11000) {
       const existing = await GRN.findOne({ branch: req.branchId, sourceKey });
       if (existing) {
         if (existing.requestFingerprint && existing.requestFingerprint !== requestFingerprint) {
@@ -247,109 +438,88 @@ router.post('/grn', requirePermission('grn.entry'), async (req, res) => {
         return res.json({ success: true, message: 'GRN already created.', data: existing });
       }
     }
-    const status = e.status || (e.name === 'CastError' ? 422 : 500);
-    return res.status(status).json({ success: false, message: e.name === 'CastError' ? 'Invalid identifier.' : e.message });
+    const status = error.status || (error.name === 'CastError' || error.name === 'ValidationError' ? 422 : 500);
+    return res.status(status).json({ success: false, message: error.name === 'CastError' ? 'Invalid identifier.' : error.message });
+  } finally {
+    await session.endSession();
   }
 });
 
-router.patch('/grn/:id/approve', requirePermission('grn.entry'), async (req, res) => {
+router.patch('/grn/:id/verify', requirePermission('grn.entry'), async (req, res) => {
+  try {
+    const grn = await GRN.findOneAndUpdate(
+      { _id: req.params.id, branch: req.branchId, status: 'draft' },
+      { $set: { status: 'verified', verifiedBy: req.user._id, verifiedAt: new Date() } },
+      { new: true, runValidators: true }
+    );
+    if (!grn) throw grnError(409, 'Only a draft GRN can be verified.');
+    return res.json({ success: true, message: 'GRN verified and ready for posting approval.', data: grn });
+  } catch (error) {
+    const status = error.status || (error.name === 'CastError' || error.name === 'ValidationError' ? 422 : 500);
+    return res.status(status).json({ success: false, message: error.name === 'CastError' ? 'Invalid identifier.' : error.message });
+  }
+});
+
+router.patch('/grn/:id/approve', requirePermission('grn.approve'), async (req, res) => {
   const session = await mongoose.startSession();
   try {
-    let approved;
-    let alreadyApproved = false;
+    let posted;
+    let replayed = false;
     await session.withTransaction(async () => {
       const grn = await GRN.findOne({ _id: req.params.id, branch: req.branchId }).session(session);
-      if (!grn) throw Object.assign(new Error('GRN not found.'), { status: 404 });
-      if (['approved', 'posted'].includes(grn.status)) {
-        approved = grn;
-        alreadyApproved = true;
+      if (!grn) throw grnError(404, 'GRN not found.');
+      if (grn.status === 'posted') {
+        posted = grn;
+        replayed = true;
         return;
       }
-      if (!['draft', 'verified'].includes(grn.status)) {
-        throw Object.assign(new Error(`Cannot approve a GRN in ${grn.status} status.`), { status: 409 });
+      if (!['verified', 'approved'].includes(grn.status)) {
+        throw grnError(409, `Verify the GRN before posting it from ${grn.status} status.`);
       }
+      if (!grn.purchaseOrder) throw grnError(409, 'A purchase order is required before a GRN can be posted.');
 
-      const supplier = await Supplier.findById(grn.supplier).session(session).lean();
-      if (!supplier) throw Object.assign(new Error('Supplier not found.'), { status: 404 });
+      const po = await PurchaseOrder.findOne({ _id: grn.purchaseOrder, branch: req.branchId }).session(session);
+      if (!po) throw grnError(404, 'Purchase order not found in the active branch.');
+      if (!['approved', 'sent', 'partial_received'].includes(po.status)) {
+        throw grnError(409, 'Only an approved purchase order can be received.');
+      }
+      if (receiptId(po.supplier) !== receiptId(grn.supplier)) {
+        throw grnError(422, 'GRN supplier does not match the purchase order supplier.');
+      }
+      const supplier = await Supplier.findOne({ _id: grn.supplier, status: 'active' }).session(session).lean();
+      if (!supplier) throw grnError(404, 'Active supplier not found.');
+
+      const normalizedItems = normalizeGRNItems({
+        items: grn.items,
+        po,
+        branchId: req.branchId,
+        grnNumber: grn.grnNumber,
+      });
       await assertWarehousesInBranch(
-        grn.items.filter((item) => Number(item.acceptedQty) > 0).map((item) => item.warehouse),
+        normalizedItems.filter(item => item.receivedQty > 0).map(item => item.warehouse),
         req.branchId,
         { session }
       );
-
-      const acceptedByProduct = new Map();
-      for (let index = 0; index < grn.items.length; index += 1) {
-        const item = grn.items[index];
-        const acceptedQty = Number(item.acceptedQty);
-        const rate = Number(item.rate);
-        if (!Number.isFinite(acceptedQty) || acceptedQty < 0) {
-          throw Object.assign(new Error(`items[${index}].acceptedQty must be finite and nonnegative.`), { status: 422 });
-        }
-        if (!Number.isFinite(rate) || rate < 0) {
-          throw Object.assign(new Error(`items[${index}].rate must be finite and nonnegative.`), { status: 422 });
-        }
-        if (acceptedQty > 0 && (!item.product || !item.warehouse)) {
-          throw Object.assign(new Error(`Accepted item ${index + 1} requires product and warehouse.`), { status: 422 });
-        }
-        if (acceptedQty > 0) {
-          const key = String(item.product);
-          acceptedByProduct.set(key, (acceptedByProduct.get(key) ?? 0) + acceptedQty);
-        }
-      }
-
-      let po = null;
-      if (grn.purchaseOrder) {
-        po = await PurchaseOrder.findOne({ _id: grn.purchaseOrder, branch: req.branchId }).session(session);
-        if (!po) throw Object.assign(new Error('Purchase order not found in the active branch.'), { status: 404 });
-        if (String(po.supplier) !== String(grn.supplier)) {
-          throw Object.assign(new Error('GRN supplier does not match the purchase order supplier.'), { status: 422 });
-        }
-        for (const [productId, acceptedQty] of acceptedByProduct) {
-          const pendingQty = po.items
-            .filter((item) => String(item.product) === productId)
-            .reduce((sum, item) => sum + Number(item.pendingQty ?? Math.max(0, item.quantity - (item.receivedQty ?? 0))), 0);
-          if (!Number.isFinite(pendingQty) || acceptedQty > pendingQty) {
-            throw Object.assign(new Error('Accepted quantity exceeds the matching purchase order pending quantity.'), { status: 422 });
-          }
-        }
-      }
+      grn.items = normalizedItems;
 
       await updateStockFromGRN(grn, session);
-      if (po) await updatePOReceivedQty(po, grn.items, session);
-      const totalGRNValue = grn.items.reduce(
-        (sum, item) => sum + (Number(item.acceptedQty) * Number(item.rate)),
-        0
-      );
-      if (totalGRNValue > 0) {
-        await postSubledgerEntry({
-          session,
-          branch: req.branchId,
-          partyType: 'supplier',
-          partyId: grn.supplier,
-          amount: totalGRNValue,
-          side: 'credit',
-          postingKey: `grn:${grn._id}:approved`,
-          entryType: 'purchase',
-          entryDate: grn.grnDate,
-          description: `Purchase received through GRN ${grn.grnNumber}`,
-          referenceNumber: grn.grnNumber,
-          referenceModel: 'GRN',
-          referenceId: grn._id,
-          createdBy: req.user._id,
-        });
-      }
-
-      grn.status = 'approved';
+      await updatePOReceivedQty(po, grn.items, session);
+      grn.status = 'posted';
+      grn.postedBy = req.user._id;
+      grn.postedAt = new Date();
+      grn.payableRecognition = 'none';
       await grn.save({ session });
-      approved = grn;
+      posted = grn;
     });
     return res.json({
       success: true,
-      message: alreadyApproved ? `GRN is already ${approved.status}.` : 'GRN approved. Stock, PO, and supplier outstanding updated.',
-      data: approved,
+      message: replayed
+        ? 'GRN is already posted.'
+        : 'GRN posted. Stock and PO quantities updated; supplier payable will be recognized after invoice verification.',
+      data: posted,
     });
   } catch (error) {
-    const status = error.status || (error.name === 'CastError' ? 422 : 500);
+    const status = error.status || (error.name === 'CastError' || error.name === 'ValidationError' ? 422 : 500);
     return res.status(status).json({ success: false, message: error.name === 'CastError' ? 'Invalid identifier.' : error.message });
   } finally {
     await session.endSession();
@@ -374,26 +544,23 @@ async function updateStockFromGRN(grn, session) {
 
 // Helper: Update PO quantities using acceptedQty only
 async function updatePOReceivedQty(po, grnItems, session) {
-  const acceptedByProduct = new Map();
-  for (const item of grnItems) {
-    const key = String(item.product);
-    acceptedByProduct.set(key, (acceptedByProduct.get(key) ?? 0) + Number(item.acceptedQty));
-  }
-
-  for (const [productId, totalAccepted] of acceptedByProduct) {
-    let remaining = totalAccepted;
-    for (const poItem of po.items.filter((item) => String(item.product) === productId)) {
-      if (remaining <= 0) break;
-      const pendingQty = Number(poItem.pendingQty ?? Math.max(0, poItem.quantity - (poItem.receivedQty ?? 0)));
-      const appliedQty = Math.min(remaining, pendingQty);
-      poItem.receivedQty = Number(poItem.receivedQty ?? 0) + appliedQty;
-      poItem.pendingQty = Math.max(0, Number(poItem.quantity) - poItem.receivedQty);
-      remaining -= appliedQty;
+  for (const [index, item] of grnItems.entries()) {
+    const acceptedQty = Number(item.acceptedQty || 0);
+    if (acceptedQty <= 0) continue;
+    const poItem = po.items.id(item.purchaseOrderItem);
+    if (!poItem || receiptId(poItem.product) !== receiptId(item.product)) {
+      throw grnError(422, `GRN item ${index + 1} does not match its purchase order line.`);
     }
+    const pendingQty = Number(poItem.pendingQty ?? Math.max(0, Number(poItem.quantity) - Number(poItem.receivedQty || 0)));
+    if (acceptedQty > pendingQty + 0.000001) {
+      throw grnError(422, `GRN item ${index + 1} accepted quantity exceeds its purchase order line pending quantity.`);
+    }
+    poItem.receivedQty = receiptRound(Number(poItem.receivedQty || 0) + acceptedQty);
+    poItem.pendingQty = receiptRound(Math.max(0, Number(poItem.quantity) - poItem.receivedQty));
   }
 
-  const allReceived = po.items.every((item) => item.pendingQty <= 0);
-  const someReceived = po.items.some((item) => item.receivedQty > 0);
+  const allReceived = po.items.every(item => Number(item.pendingQty) <= 0.000001);
+  const someReceived = po.items.some(item => Number(item.receivedQty) > 0);
   if (allReceived) po.status = 'received';
   else if (someReceived) po.status = 'partial_received';
   await po.save({ session });
@@ -417,7 +584,7 @@ router.get('/stock', requirePermission('stock.view'), async (req, res) => {
     }
     const [stocks, total] = await Promise.all([
       Stock.find(filter).sort({ updatedAt: -1 }).skip((p-1)*l).limit(l)
-        .populate('product', 'productCode itemName tileSize finish brand')
+        .populate('product', 'productCode itemName tileSize finish brand images reorderLevel minStockLevel')
         .populate('warehouse', 'name')
         .lean(),
       Stock.countDocuments(filter),
@@ -590,137 +757,123 @@ router.post('/audit/submit', requirePermission('stock.adjustment'), async (req, 
 // REORDER SUGGESTIONS (Out-of-stock → PO)
 // ═══════════════════════════════════════
 
-// GET /api/v1/purchase/stock/reorder-suggestions — products below reorder level with suggested PO
+// GET /api/v1/purchase/stock/reorder-suggestions — branch/warehouse scoped, server-authoritative guidance
 router.get('/stock/reorder-suggestions', requirePermission('stock.view'), async (req, res) => {
   try {
     const { warehouse } = req.query;
+    let warehouseRecord = null;
+    if (warehouse) [warehouseRecord] = await assertWarehousesInBranch([warehouse], req.branchId);
 
-    // 1. Get all products with reorderLevel > 0
-    const products = await Product.find({ reorderLevel: { $gt: 0 }, status: 'active' })
-      .select('productCode itemName brand category tileSize reorderLevel minStockLevel images basicPrice')
-      .populate('brand', 'name')
-      .lean();
-
+    const [settings, products] = await Promise.all([
+      BranchSettings.findOne({ branch: req.branchId }).select('inventory').lean(),
+      Product.find({ status: 'active' })
+        .select('productCode itemName brand category tileSize reorderLevel minStockLevel images basicPrice')
+        .populate('brand', 'name')
+        .lean(),
+    ]);
     if (!products.length) return res.json({ success: true, data: [] });
 
-    // 2. Get current stock per product (aggregated across all warehouses or specific)
-    if (warehouse) await assertWarehousesInBranch([warehouse], req.branchId);
-    const stockFilter = { branch: req.branchId, ...(warehouse ? { warehouse } : {}) };
-    const stockAgg = await Stock.aggregate([
-      { $match: stockFilter },
-      { $group: { _id: '$product', currentStock: { $sum: '$availableQty' }, lastRate: { $max: '$purchaseRate' } } },
+    const fallbackLevel = Math.max(1, Number(settings?.inventory?.reorderFallbackLevel || 10));
+    const minimumReorderQuantity = Math.max(1, Number(settings?.inventory?.minimumReorderQuantity || 10));
+    const productIds = products.map(product => product._id);
+    const stockFilter = { branch: req.branchId, ...(warehouse ? { warehouse: warehouseRecord._id } : {}) };
+    const grnMatch = {
+      branch: new mongoose.Types.ObjectId(String(req.branchId)),
+      status: { $in: ['approved', 'posted'] },
+    };
+    const grnItemMatch = {
+      'items.product': { $in: productIds },
+      ...(warehouse ? { 'items.warehouse': warehouseRecord._id } : {}),
+    };
+    const [stockAgg, supplierHistory] = await Promise.all([
+      Stock.aggregate([
+        { $match: stockFilter },
+        { $group: { _id: '$product', currentStock: { $sum: '$availableQty' }, stockRate: { $max: '$purchaseRate' } } },
+      ]),
+      GRN.aggregate([
+        { $match: grnMatch },
+        { $unwind: '$items' },
+        { $match: grnItemMatch },
+        { $sort: { createdAt: -1, _id: -1 } },
+        { $group: {
+          _id: '$items.product',
+          supplier: { $first: '$supplier' },
+          supplierName: { $first: '$supplierName' },
+          rate: { $first: '$items.rate' },
+          grn: { $first: '$_id' },
+          receivedAt: { $first: '$createdAt' },
+        } },
+      ]),
     ]);
-    const stockMap = {};
-    stockAgg.forEach(s => { stockMap[String(s._id)] = s; });
+    const stockMap = new Map(stockAgg.map(stock => [String(stock._id), stock]));
+    const historyMap = new Map(supplierHistory.map(history => [String(history._id), history]));
+    const snapshotAt = new Date();
+    const scopeWarehouse = warehouseRecord?._id || null;
+    const scopeWarehouseName = warehouseRecord?.name || 'All branch warehouses';
 
-    // 3. Find products below reorder level
-    const suggestions = [];
-    for (const prod of products) {
-      const stock = stockMap[String(prod._id)] || { currentStock: 0, lastRate: 0 };
-      if (stock.currentStock <= prod.reorderLevel) {
-        // Suggested quantity = reorderLevel × 2 - current stock (replenish to 2× reorder level)
-        const suggestedQty = Math.max(prod.reorderLevel * 2 - stock.currentStock, prod.minStockLevel || 10);
+    const suggestions = products.flatMap(product => {
+      const stock = stockMap.get(String(product._id)) || { currentStock: 0, stockRate: 0 };
+      const currentStock = Number(stock.currentStock || 0);
+      const configuredReorderLevel = Number(product.reorderLevel || 0);
+      const effectiveReorderLevel = configuredReorderLevel > 0 ? configuredReorderLevel : fallbackLevel;
+      if (currentStock > effectiveReorderLevel) return [];
+      const minimumStockLevel = Number(product.minStockLevel || 0);
+      const minimumQty = minimumStockLevel > 0 ? minimumStockLevel : minimumReorderQuantity;
+      const suggestedQty = Math.max(effectiveReorderLevel * 2 - currentStock, minimumQty);
+      const history = historyMap.get(String(product._id));
+      const provenanceKey = [req.branchId, scopeWarehouse || 'all', product._id].map(String).join(':');
+      return [{
+        product: product._id,
+        productCode: product.productCode,
+        productName: product.itemName,
+        productImage: product.images?.[0] || '',
+        brand: product.brand?.name || '',
+        tileSize: product.tileSize || '',
+        warehouse: scopeWarehouse,
+        warehouseName: scopeWarehouseName,
+        stockScope: warehouse ? 'warehouse' : 'branch',
+        configuredReorderLevel,
+        reorderLevel: effectiveReorderLevel,
+        reorderLevelSource: configuredReorderLevel > 0 ? 'product' : 'branch_fallback',
+        minimumStockLevel,
+        currentStock,
+        deficit: Math.max(0, effectiveReorderLevel - currentStock),
+        suggestedQty,
+        lastPurchaseRate: Number(history?.rate || stock.stockRate || product.basicPrice || 0),
+        suggestedSupplier: history?.supplier || null,
+        suggestedSupplierName: history?.supplierName || 'No supplier history',
+        lastReceiptAt: history?.receivedAt || null,
+        isZeroStock: currentStock <= 0,
+        urgency: currentStock <= 0 ? 'critical' : currentStock <= effectiveReorderLevel / 2 ? 'high' : 'medium',
+        provenance: {
+          source: 'reorder_suggestion', key: provenanceKey, snapshotAt,
+          branch: req.branchId, warehouse: scopeWarehouse,
+          configuredReorderLevel, effectiveReorderLevel, minimumStockLevel,
+        },
+      }];
+    });
 
-        // Find last supplier from GRN
-        const lastGRN = await GRN.findOne({ branch: req.branchId, 'items.product': prod._id, status: { $in: ['approved', 'posted'] } })
-          .sort({ createdAt: -1 }).select('supplier supplierName').lean();
-
-        suggestions.push({
-          product: prod._id,
-          productCode: prod.productCode,
-          productName: prod.itemName,
-          productImage: prod.images?.[0] || '',
-          brand: prod.brand?.name || '',
-          tileSize: prod.tileSize || '',
-          reorderLevel: prod.reorderLevel,
-          currentStock: stock.currentStock,
-          deficit: prod.reorderLevel - stock.currentStock,
-          suggestedQty,
-          lastPurchaseRate: stock.lastRate || prod.basicPrice || 0,
-          suggestedSupplier: lastGRN?.supplier || null,
-          suggestedSupplierName: lastGRN?.supplierName || 'No supplier history',
-          isZeroStock: stock.currentStock <= 0,
-          urgency: stock.currentStock <= 0 ? 'critical' : stock.currentStock <= prod.reorderLevel / 2 ? 'high' : 'medium',
-        });
-      }
-    }
-
-    // Sort by urgency (critical first)
     const urgencyOrder = { critical: 0, high: 1, medium: 2 };
-    suggestions.sort((a, b) => urgencyOrder[a.urgency] - urgencyOrder[b.urgency]);
-
+    suggestions.sort((a, b) => urgencyOrder[a.urgency] - urgencyOrder[b.urgency] || a.productName.localeCompare(b.productName));
     res.json({
       success: true,
       data: suggestions,
+      scope: { branch: req.branchId, warehouse: scopeWarehouse, warehouseName: scopeWarehouseName, snapshotAt, fallbackLevel, minimumReorderQuantity },
       summary: {
         total: suggestions.length,
-        critical: suggestions.filter(s => s.urgency === 'critical').length,
-        high: suggestions.filter(s => s.urgency === 'high').length,
-        medium: suggestions.filter(s => s.urgency === 'medium').length,
+        critical: suggestions.filter(item => item.urgency === 'critical').length,
+        high: suggestions.filter(item => item.urgency === 'high').length,
+        medium: suggestions.filter(item => item.urgency === 'medium').length,
       },
     });
-  } catch (e) { res.status(500).json({ success: false, message: e.message }); }
+  } catch (e) { res.status(e.status || 500).json({ success: false, message: e.message }); }
 });
 
-// POST /api/v1/purchase/stock/create-po-from-suggestions — one-click PO creation from suggestions
-router.post('/stock/create-po-from-suggestions', requirePermission('po.management'), async (req, res) => {
-  try {
-    const { supplier, items, remarks } = req.body;
-    // items: [{ product, productName, productCode, quantity, rate, gstPercentage }]
-
-    if (!supplier) return res.status(400).json({ success: false, message: 'Supplier is required.' });
-    if (!items?.length) return res.status(400).json({ success: false, message: 'At least one item is required.' });
-
-    const poNumber = await generateBranchNumber(req.branchId, 'purchaseOrder', new Date());
-
-    // Get supplier name
-    const sup = await Supplier.findById(supplier).lean();
-    const supplierName = sup?.companyName || '';
-
-    // Calculate totals
-    let subtotal = 0, totalTax = 0;
-    const processedItems = items.map(item => {
-      const base = (item.quantity || 0) * (item.rate || 0);
-      const gst = (base * (item.gstPercentage || 18)) / 100;
-      subtotal += base;
-      totalTax += gst;
-      return {
-        product: item.product,
-        productName: item.productName || '',
-        productCode: item.productCode || '',
-        quantity: item.quantity || 0,
-        rate: item.rate || 0,
-        gstPercentage: item.gstPercentage || 18,
-        gstAmount: Math.round(gst * 100) / 100,
-        totalAmount: Math.round((base + gst) * 100) / 100,
-        pendingQty: item.quantity || 0,
-      };
-    });
-
-    const grandTotal = Math.round(subtotal + totalTax);
-
-    const po = await PurchaseOrder.create({
-      poNumber,
-      branch: req.branchId,
-      poDate: new Date(),
-      supplier,
-      supplierName,
-      items: processedItems,
-      subtotal: Math.round(subtotal * 100) / 100,
-      totalTax: Math.round(totalTax * 100) / 100,
-      grandTotal,
-      status: 'draft',
-      remarks: remarks || 'Auto-generated from stock reorder suggestions',
-      tallySyncStatus: 'not_synced',
-      createdBy: req.user._id,
-    });
-
-    res.status(201).json({
-      success: true,
-      message: `Purchase Order ${poNumber} created from reorder suggestions.`,
-      data: po,
-    });
-  } catch (e) { res.status(500).json({ success: false, message: e.message }); }
-});
+// Direct purchase-order creation from stock suggestions is intentionally disabled.
+router.post('/stock/create-po-from-suggestions', requirePermission('po.management'), (_req, res) => res.status(405).json({
+  success: false,
+  code: 'PR_SUPPLIER_QUOTATION_REQUIRED',
+  message: 'Create a purchase requisition, compare supplier quotations, and convert the selected quotation to a purchase order.',
+}));
 
 export default router;

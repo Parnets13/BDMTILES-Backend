@@ -2,186 +2,220 @@ import { Router } from 'express';
 import Incentive from '../models/Incentive.js';
 import IncentiveEarning from '../models/IncentiveEarning.js';
 import { protect, requirePermission } from '../middleware/auth.js';
+import { requireBranch } from '../utils/branchScope.js';
+import { generateBranchNumber } from '../utils/branchSequence.js';
 
 const router = Router();
 router.use(protect);
+router.use(requireBranch);
 
-// ═══════════════════════════════════════
-// INCENTIVE RULES CRUD
-// ═══════════════════════════════════════
+function sendError(res, error) {
+  const status = error.status || (error.name === 'CastError' ? 422 : 500);
+  return res.status(status).json({ success: false, message: error.name === 'CastError' ? 'Invalid identifier.' : error.message });
+}
 
-// GET /api/v1/incentives — list all incentive rules
-router.get('/', requirePermission('dealer.scheme'), async (req, res) => {
+function routeError(status, message) {
+  const error = new Error(message);
+  error.status = status;
+  return error;
+}
+
+function assertNonDealerRule(rule) {
+  if (rule?.applicableTo === 'dealer') {
+    throw routeError(410, 'Dealer monetary incentives must use the authoritative branch scheme and credit-note settlement workflow.');
+  }
+}
+
+function ruleBody(body) {
+  if (body.applicableTo === 'dealer') assertNonDealerRule(body);
+  const allowed = [
+    'incentiveName', 'applicableTo', 'specificUsers', 'incentiveType', 'triggerEvent',
+    'flatAmount', 'percentage', 'maxCap', 'perUnitAmount', 'thresholdQty',
+    'targetValue', 'targetQty', 'bonusOnTarget', 'slabs', 'milestones', 'period',
+    'validFrom', 'validTo', 'remarks',
+  ];
+  return Object.fromEntries(allowed.filter(field => body[field] !== undefined).map(field => [field, body[field]]));
+}
+
+router.get('/', requirePermission('incentive.rules.view'), async (req, res) => {
   try {
-    const { applicableTo, incentiveType, status, triggerEvent } = req.query;
-    let filter = {};
-    if (applicableTo) filter.applicableTo = applicableTo;
-    if (incentiveType) filter.incentiveType = incentiveType;
-    if (status) filter.status = status;
-    if (triggerEvent) filter.triggerEvent = triggerEvent;
-
+    const filter = { branch: req.branchId, applicableTo: { $ne: 'dealer' } };
+    for (const field of ['applicableTo', 'incentiveType', 'status', 'triggerEvent']) {
+      if (req.query[field] !== undefined) filter[field] = req.query[field];
+    }
+    if (filter.applicableTo === 'dealer') assertNonDealerRule(filter);
     const incentives = await Incentive.find(filter).sort({ createdAt: -1 }).lean();
-    res.json({ success: true, data: incentives });
-  } catch (e) { res.status(500).json({ success: false, message: e.message }); }
+    return res.json({ success: true, data: incentives });
+  } catch (error) { return sendError(res, error); }
 });
 
-// GET /api/v1/incentives/stats
-router.get('/stats', requirePermission('dealer.scheme'), async (req, res) => {
+router.get('/stats', requirePermission('incentive.rules.view'), async (req, res) => {
   try {
-    const [total, active, totalEarned, totalPaid, totalPending] = await Promise.all([
-      Incentive.countDocuments(),
-      Incentive.countDocuments({ status: 'active' }),
-      IncentiveEarning.aggregate([{ $group: { _id: null, total: { $sum: '$earnedAmount' } } }]),
-      IncentiveEarning.aggregate([{ $match: { paymentStatus: 'paid' } }, { $group: { _id: null, total: { $sum: '$earnedAmount' } } }]),
-      IncentiveEarning.aggregate([{ $match: { paymentStatus: 'pending' } }, { $group: { _id: null, total: { $sum: '$earnedAmount' } } }]),
+    const earningMatch = { branch: req.branchId, dealer: null };
+    const [total, active, totals] = await Promise.all([
+      Incentive.countDocuments({ branch: req.branchId, applicableTo: { $ne: 'dealer' } }),
+      Incentive.countDocuments({ branch: req.branchId, applicableTo: { $ne: 'dealer' }, status: 'active' }),
+      IncentiveEarning.aggregate([
+        { $match: earningMatch },
+        { $group: {
+          _id: null,
+          earned: { $sum: '$earnedAmount' },
+          paid: { $sum: { $cond: [{ $eq: ['$paymentStatus', 'paid'] }, '$earnedAmount', 0] } },
+          pending: { $sum: { $cond: [{ $in: ['$paymentStatus', ['pending', 'approved']] }, '$earnedAmount', 0] } },
+        } },
+      ]),
     ]);
-    res.json({ success: true, data: {
+    return res.json({ success: true, data: {
       totalRules: total, activeRules: active,
-      totalEarned: totalEarned[0]?.total || 0,
-      totalPaid: totalPaid[0]?.total || 0,
-      totalPending: totalPending[0]?.total || 0,
-    }});
-  } catch (e) { res.status(500).json({ success: false, message: e.message }); }
+      totalEarned: totals[0]?.earned || 0, totalPaid: totals[0]?.paid || 0, totalPending: totals[0]?.pending || 0,
+    } });
+  } catch (error) { return sendError(res, error); }
 });
 
-// POST /api/v1/incentives — create incentive rule
-router.post('/', requirePermission('dealer.scheme'), async (req, res) => {
+router.post('/', requirePermission('incentive.rules.manage'), async (req, res) => {
   try {
-    const data = { ...req.body, createdBy: req.user._id };
-    const count = await Incentive.countDocuments();
-    data.incentiveCode = `INC-${String(count + 1).padStart(4, '0')}`;
+    const data = ruleBody(req.body);
+    assertNonDealerRule(data);
+    data.branch = req.branchId;
+    data.incentiveCode = await generateBranchNumber(req.branchId, 'staff_incentive_rule', data.validFrom || new Date());
+    data.status = 'active';
+    data.createdBy = req.user._id;
     const incentive = await Incentive.create(data);
-    res.status(201).json({ success: true, message: `Incentive ${incentive.incentiveCode} created.`, data: incentive });
-  } catch (e) { res.status(500).json({ success: false, message: e.message }); }
+    return res.status(201).json({ success: true, message: `Incentive ${incentive.incentiveCode} created.`, data: incentive });
+  } catch (error) { return sendError(res, error); }
 });
 
-// GET /api/v1/incentives/my-earnings — current user's earnings (for SE app)
-// MUST be before /:id to avoid route conflict
-router.get('/my-earnings', async (req, res) => {
+router.get('/my-earnings', requirePermission('incentive.earnings.self'), async (req, res) => {
   try {
-    const earnings = await IncentiveEarning.find({ earnedBy: req.user._id })
-      .sort({ createdAt: -1 }).limit(50)
-      .populate('incentive', 'incentiveName incentiveType')
-      .lean();
-    const totalEarned = earnings.reduce((s, e) => s + e.earnedAmount, 0);
-    const totalPaid = earnings.filter(e => e.paymentStatus === 'paid').reduce((s, e) => s + e.earnedAmount, 0);
-    const totalPending = earnings.filter(e => e.paymentStatus === 'pending' || e.paymentStatus === 'approved').reduce((s, e) => s + e.earnedAmount, 0);
-
-    res.json({ success: true, data: { earnings, summary: { totalEarned, totalPaid, totalPending } } });
-  } catch (e) { res.status(500).json({ success: false, message: e.message }); }
+    const earnings = await IncentiveEarning.find({ branch: req.branchId, earnedBy: req.user._id, dealer: null })
+      .sort({ createdAt: -1 }).limit(50).populate('incentive', 'incentiveName incentiveType').lean();
+    const totalEarned = earnings.reduce((sum, row) => sum + row.earnedAmount, 0);
+    const totalPaid = earnings.filter(row => row.paymentStatus === 'paid').reduce((sum, row) => sum + row.earnedAmount, 0);
+    const totalPending = earnings.filter(row => ['pending', 'approved'].includes(row.paymentStatus)).reduce((sum, row) => sum + row.earnedAmount, 0);
+    return res.json({ success: true, data: { earnings, summary: { totalEarned, totalPaid, totalPending } } });
+  } catch (error) { return sendError(res, error); }
 });
 
-// GET /api/v1/incentives/:id
-router.get('/:id', requirePermission('dealer.scheme'), async (req, res) => {
+router.get('/earnings/list', requirePermission('incentive.earnings.view'), async (req, res) => {
   try {
-    const incentive = await Incentive.findById(req.params.id).lean();
-    if (!incentive) return res.status(404).json({ success: false, message: 'Not found.' });
-    res.json({ success: true, data: incentive });
-  } catch (e) { res.status(500).json({ success: false, message: e.message }); }
-});
-
-// PUT /api/v1/incentives/:id
-router.put('/:id', requirePermission('dealer.scheme'), async (req, res) => {
-  try {
-    const incentive = await Incentive.findByIdAndUpdate(req.params.id, req.body, { new: true });
-    if (!incentive) return res.status(404).json({ success: false, message: 'Not found.' });
-    res.json({ success: true, message: 'Incentive updated.', data: incentive });
-  } catch (e) { res.status(500).json({ success: false, message: e.message }); }
-});
-
-// PATCH /api/v1/incentives/:id/status — toggle active/paused
-router.patch('/:id/status', requirePermission('dealer.scheme'), async (req, res) => {
-  try {
-    const incentive = await Incentive.findByIdAndUpdate(req.params.id, { status: req.body.status }, { new: true });
-    res.json({ success: true, message: `Incentive ${req.body.status}.`, data: incentive });
-  } catch (e) { res.status(500).json({ success: false, message: e.message }); }
-});
-
-// DELETE
-router.delete('/:id', requirePermission('dealer.scheme'), async (req, res) => {
-  try {
-    await Incentive.findByIdAndDelete(req.params.id);
-    res.json({ success: true, message: 'Incentive deleted.' });
-  } catch (e) { res.status(500).json({ success: false, message: e.message }); }
-});
-
-// ═══════════════════════════════════════
-// INCENTIVE EARNINGS
-// ═══════════════════════════════════════
-
-// GET /api/v1/incentives/earnings — list all earnings
-router.get('/earnings/list', requirePermission('dealer.scheme'), async (req, res) => {
-  try {
-    const { earnedBy, dealer, paymentStatus, triggerEvent, page = 1, limit = 20 } = req.query;
-    const p = Math.max(1, parseInt(page)), l = Math.min(100, parseInt(limit) || 20);
-    let filter = {};
-    if (earnedBy) filter.earnedBy = earnedBy;
-    if (dealer) filter.dealer = dealer;
-    if (paymentStatus) filter.paymentStatus = paymentStatus;
-    if (triggerEvent) filter.triggerEvent = triggerEvent;
-
+    const page = Math.max(1, Number.parseInt(req.query.page, 10) || 1);
+    const limit = Math.min(100, Math.max(1, Number.parseInt(req.query.limit, 10) || 20));
+    const filter = { branch: req.branchId, dealer: null };
+    for (const field of ['earnedBy', 'paymentStatus', 'triggerEvent']) if (req.query[field]) filter[field] = req.query[field];
     const [data, total] = await Promise.all([
-      IncentiveEarning.find(filter).sort({ createdAt: -1 }).skip((p-1)*l).limit(l)
+      IncentiveEarning.find(filter).sort({ createdAt: -1 }).skip((page - 1) * limit).limit(limit)
         .populate('earnedBy', 'name').populate('incentive', 'incentiveName incentiveType').lean(),
       IncentiveEarning.countDocuments(filter),
     ]);
-    res.json({ success: true, data, pagination: { currentPage: p, totalPages: Math.ceil(total/l), totalItems: total } });
-  } catch (e) { res.status(500).json({ success: false, message: e.message }); }
+    return res.json({ success: true, data, pagination: { currentPage: page, totalPages: Math.ceil(total / limit), totalItems: total } });
+  } catch (error) { return sendError(res, error); }
 });
 
-// POST /api/v1/incentives/earnings/record — manually record an earning
-router.post('/earnings/record', requirePermission('dealer.scheme'), async (req, res) => {
+router.post('/earnings/record', requirePermission('incentive.earnings.record'), (_req, res) => res.status(410).json({
+  success: false,
+  message: 'Manual earnings are disabled. Earnings must be created idempotently by an authoritative business event; dealer incentives use scheme settlements.',
+}));
+
+router.post('/earnings/calculate', requirePermission('incentive.earnings.record'), async (req, res) => {
   try {
-    const data = req.body;
-    const earning = await IncentiveEarning.create(data);
-    // Update incentive totals
-    if (data.incentive) {
-      await Incentive.findByIdAndUpdate(data.incentive, {
-        $inc: { totalEarned: earning.earnedAmount, totalPending: earning.earnedAmount },
-      });
+    const incentive = await Incentive.findOne({ _id: req.body.incentiveId, branch: req.branchId });
+    if (!incentive) throw routeError(404, 'Incentive rule not found in the active branch.');
+    assertNonDealerRule(incentive);
+    const value = Number(req.body.value || 0);
+    const qty = Number(req.body.qty || 0);
+    if (!Number.isFinite(value) || !Number.isFinite(qty) || value < 0 || qty < 0) throw routeError(422, 'value and qty must be finite nonnegative numbers.');
+    const amount = incentive.calculate(value, qty);
+    return res.json({ success: true, data: {
+      incentiveId: incentive._id, value, qty,
+      calculatedAmount: Math.round((amount + Number.EPSILON) * 100) / 100,
+      incentiveType: incentive.incentiveType,
+      previewOnly: true,
+    } });
+  } catch (error) { return sendError(res, error); }
+});
+
+router.patch('/earnings/:id/approve', requirePermission('incentive.earnings.approve'), async (req, res) => {
+  try {
+    const current = await IncentiveEarning.findOne({ _id: req.params.id, branch: req.branchId, dealer: null });
+    if (!current) throw routeError(404, 'Earning not found in the active branch.');
+    if (current.paymentStatus !== 'pending') throw routeError(409, `Only pending earnings can be approved; this record is ${current.paymentStatus}.`);
+    if ([current.createdBy, current.earnedBy].filter(Boolean).some(actor => String(actor) === String(req.user._id))) {
+      throw routeError(403, 'The earning creator or beneficiary cannot approve it.');
     }
-    res.status(201).json({ success: true, message: 'Earning recorded.', data: earning });
-  } catch (e) { res.status(500).json({ success: false, message: e.message }); }
+    const earning = await IncentiveEarning.findOneAndUpdate(
+      { _id: current._id, branch: req.branchId, paymentStatus: 'pending' },
+      { $set: { paymentStatus: 'approved', approvedBy: req.user._id, approvedAt: new Date() } },
+      { new: true, runValidators: true }
+    );
+    if (!earning) throw routeError(409, 'Earning state changed before approval.');
+    return res.json({ success: true, message: 'Earning approved for payment.', data: earning });
+  } catch (error) { return sendError(res, error); }
 });
 
-// POST /api/v1/incentives/earnings/calculate — calculate incentive for a given value/qty
-router.post('/earnings/calculate', requirePermission('dealer.scheme'), async (req, res) => {
+router.patch('/earnings/:id/pay', requirePermission('incentive.earnings.pay'), async (req, res) => {
   try {
-    const { incentiveId, value, qty } = req.body;
-    const incentive = await Incentive.findById(incentiveId);
-    if (!incentive) return res.status(404).json({ success: false, message: 'Incentive rule not found.' });
-
-    const amount = incentive.calculate(value || 0, qty || 0);
-    res.json({ success: true, data: { incentiveId, value, qty, calculatedAmount: Math.round(amount * 100) / 100, incentiveType: incentive.incentiveType } });
-  } catch (e) { res.status(500).json({ success: false, message: e.message }); }
-});
-
-// PATCH /api/v1/incentives/earnings/:id/approve — approve earning for payment
-router.patch('/earnings/:id/approve', requirePermission('dealer.scheme'), async (req, res) => {
-  try {
-    const earning = await IncentiveEarning.findByIdAndUpdate(req.params.id, {
-      paymentStatus: 'approved', approvedBy: req.user._id, approvedAt: new Date(),
-    }, { new: true });
-    if (!earning) return res.status(404).json({ success: false, message: 'Not found.' });
-    res.json({ success: true, message: 'Earning approved for payment.', data: earning });
-  } catch (e) { res.status(500).json({ success: false, message: e.message }); }
-});
-
-// PATCH /api/v1/incentives/earnings/:id/pay — mark as paid
-router.patch('/earnings/:id/pay', requirePermission('dealer.scheme'), async (req, res) => {
-  try {
-    const earning = await IncentiveEarning.findByIdAndUpdate(req.params.id, {
-      paymentStatus: 'paid', paidAt: new Date(), paymentRef: req.body.paymentRef || '',
-    }, { new: true });
-    if (!earning) return res.status(404).json({ success: false, message: 'Not found.' });
-    // Update incentive totals
-    if (earning.incentive) {
-      await Incentive.findByIdAndUpdate(earning.incentive, {
-        $inc: { totalPaid: earning.earnedAmount, totalPending: -earning.earnedAmount },
-      });
+    const current = await IncentiveEarning.findOne({ _id: req.params.id, branch: req.branchId, dealer: null });
+    if (!current) throw routeError(404, 'Earning not found in the active branch.');
+    if (current.paymentStatus !== 'approved') throw routeError(409, `Only approved earnings can be paid; this record is ${current.paymentStatus}.`);
+    if ([current.createdBy, current.approvedBy, current.earnedBy].filter(Boolean).some(actor => String(actor) === String(req.user._id))) {
+      throw routeError(403, 'Payment requires an actor who is not the creator, approver, or beneficiary.');
     }
-    res.json({ success: true, message: 'Marked as paid.', data: earning });
-  } catch (e) { res.status(500).json({ success: false, message: e.message }); }
+    const earning = await IncentiveEarning.findOneAndUpdate(
+      { _id: current._id, branch: req.branchId, paymentStatus: 'approved' },
+      { $set: { paymentStatus: 'paid', paidAt: new Date(), paymentRef: String(req.body.paymentRef || '').trim() } },
+      { new: true, runValidators: true }
+    );
+    if (!earning) throw routeError(409, 'Earning state changed before payment.');
+    await Incentive.updateOne(
+      { _id: earning.incentive, branch: req.branchId },
+      { $inc: { totalPaid: earning.earnedAmount, totalPending: -earning.earnedAmount } }
+    );
+    return res.json({ success: true, message: 'Earning marked paid.', data: earning });
+  } catch (error) { return sendError(res, error); }
+});
+
+router.get('/:id', requirePermission('incentive.rules.view'), async (req, res) => {
+  try {
+    const incentive = await Incentive.findOne({ _id: req.params.id, branch: req.branchId, applicableTo: { $ne: 'dealer' } }).lean();
+    if (!incentive) throw routeError(404, 'Incentive rule not found in the active branch.');
+    return res.json({ success: true, data: incentive });
+  } catch (error) { return sendError(res, error); }
+});
+
+router.put('/:id', requirePermission('incentive.rules.manage'), async (req, res) => {
+  try {
+    const current = await Incentive.findOne({ _id: req.params.id, branch: req.branchId });
+    if (!current) throw routeError(404, 'Incentive rule not found in the active branch.');
+    assertNonDealerRule(current);
+    const updates = ruleBody(req.body);
+    assertNonDealerRule(updates);
+    Object.assign(current, updates);
+    await current.save();
+    return res.json({ success: true, message: 'Incentive updated.', data: current });
+  } catch (error) { return sendError(res, error); }
+});
+
+router.patch('/:id/status', requirePermission('incentive.rules.manage'), async (req, res) => {
+  try {
+    if (!['active', 'paused', 'expired', 'closed'].includes(req.body.status)) throw routeError(422, 'Invalid status.');
+    const incentive = await Incentive.findOneAndUpdate(
+      { _id: req.params.id, branch: req.branchId, applicableTo: { $ne: 'dealer' } },
+      { $set: { status: req.body.status } },
+      { new: true, runValidators: true }
+    );
+    if (!incentive) throw routeError(404, 'Incentive rule not found in the active branch.');
+    return res.json({ success: true, message: `Incentive ${req.body.status}.`, data: incentive });
+  } catch (error) { return sendError(res, error); }
+});
+
+router.delete('/:id', requirePermission('incentive.rules.manage'), async (req, res) => {
+  try {
+    const incentive = await Incentive.findOne({ _id: req.params.id, branch: req.branchId, applicableTo: { $ne: 'dealer' } });
+    if (!incentive) throw routeError(404, 'Incentive rule not found in the active branch.');
+    if (await IncentiveEarning.exists({ branch: req.branchId, incentive: incentive._id })) throw routeError(409, 'Cannot delete an incentive rule with earning history. Close it instead.');
+    await incentive.deleteOne();
+    return res.json({ success: true, message: 'Incentive deleted.' });
+  } catch (error) { return sendError(res, error); }
 });
 
 export default router;

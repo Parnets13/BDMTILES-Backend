@@ -1,10 +1,12 @@
 import { Router } from 'express';
+import mongoose from 'mongoose';
 import PickList from '../models/PickList.js';
 import SalesOrder from '../models/SalesOrder.js';
 import Stock from '../models/Stock.js';
 import { protect, requirePermission, requireAnyPermission } from '../middleware/auth.js';
 import { requireBranch } from '../utils/branchScope.js';
 import { generateBranchNumber } from '../utils/branchSequence.js';
+import { QUANTITY_TOLERANCE, refreshSalesOrderLine, reserveSalesOrderInventory } from '../utils/salesOrderInventory.js';
 
 const router = Router();
 router.use(protect);
@@ -18,136 +20,6 @@ router.patch(
 );
 router.patch(['/:id/sort', '/:id/pack'], requirePermission('sorting.management'));
 router.patch('/:id/ready', requireAnyPermission('sorting.management', 'dispatch.management'));
-
-const stockKey = item => [
-  item.product?._id || item.product,
-  item.warehouse?._id || item.warehouse,
-  item.shade || '',
-  item.batch || '',
-].map(String).join('|');
-
-const aggregateItems = (items, quantitySelector, branch) => {
-  const requirements = new Map();
-  for (const item of items) {
-    const quantity = Number(quantitySelector(item));
-    if (!(quantity > 0)) continue;
-    if (!item.product || !item.warehouse) {
-      throw new Error(`Warehouse is required for ${item.productName || item.productCode || 'every item'}.`);
-    }
-    const key = stockKey(item);
-    const current = requirements.get(key);
-    if (current) current.quantity += quantity;
-    else requirements.set(key, {
-      branch,
-      product: item.product?._id || item.product,
-      warehouse: item.warehouse?._id || item.warehouse,
-      shade: item.shade || '',
-      batch: item.batch || '',
-      productName: item.productName || item.productCode || 'item',
-      quantity,
-    });
-  }
-  return [...requirements.values()];
-};
-
-const rollbackReservation = async changes => {
-  for (const change of [...changes].reverse()) {
-    await Stock.updateOne(
-      { branch: change.branch, product: change.product, warehouse: change.warehouse, shade: change.shade, batch: change.batch },
-      { $inc: { availableQty: change.quantity, reservedQty: -change.quantity } }
-    );
-  }
-};
-
-const reserveStock = async (items, branch) => {
-  const applied = [];
-  try {
-    for (const requirement of aggregateItems(items, item => item.quantity, branch)) {
-      const stock = await Stock.findOneAndUpdate(
-        {
-          branch: requirement.branch,
-          product: requirement.product,
-          warehouse: requirement.warehouse,
-          shade: requirement.shade,
-          batch: requirement.batch,
-          availableQty: { $gte: requirement.quantity },
-        },
-        { $inc: { availableQty: -requirement.quantity, reservedQty: requirement.quantity } },
-        { new: true }
-      );
-      if (!stock) {
-        throw new Error(`Insufficient available stock for ${requirement.productName} (shade ${requirement.shade || 'default'}, batch ${requirement.batch || 'default'}).`);
-      }
-      applied.push(requirement);
-    }
-    return applied;
-  } catch (error) {
-    await rollbackReservation(applied);
-    throw error;
-  }
-};
-
-const releaseReservation = async (pickList, updatedItems) => {
-  if (!pickList.stockReserved) return [];
-  const requirements = new Map();
-  for (const item of updatedItems) {
-    for (const [type, quantity] of [['short', Number(item.shortQty)], ['damaged', Number(item.damagedQty)]]) {
-      if (!(quantity > 0)) continue;
-      const key = `${stockKey(item)}|${type}`;
-      const existing = requirements.get(key);
-      if (existing) existing.quantity += quantity;
-      else requirements.set(key, {
-        branch: pickList.branch,
-        product: item.product?._id || item.product,
-        warehouse: item.warehouse?._id || item.warehouse,
-        shade: item.shade || '',
-        batch: item.batch || '',
-        productName: item.productName || item.productCode || 'item',
-        quantity,
-        type,
-      });
-    }
-  }
-
-  const applied = [];
-  try {
-    for (const requirement of requirements.values()) {
-      const quantityMove = requirement.type === 'short'
-        ? { reservedQty: -requirement.quantity, availableQty: requirement.quantity }
-        : { reservedQty: -requirement.quantity, damagedQty: requirement.quantity };
-      const stock = await Stock.findOneAndUpdate(
-        {
-          branch: requirement.branch,
-          product: requirement.product,
-          warehouse: requirement.warehouse,
-          shade: requirement.shade,
-          batch: requirement.batch,
-          reservedQty: { $gte: requirement.quantity },
-        },
-        { $inc: quantityMove },
-        { new: true }
-      );
-      if (!stock) throw new Error(`Reserved stock is inconsistent for ${requirement.productName}.`);
-      applied.push(requirement);
-    }
-    return applied;
-  } catch (error) {
-    await rollbackReleasedReservation(applied);
-    throw error;
-  }
-};
-
-const rollbackReleasedReservation = async changes => {
-  for (const change of [...changes].reverse()) {
-    const quantityMove = change.type === 'short'
-      ? { reservedQty: change.quantity, availableQty: -change.quantity }
-      : { reservedQty: change.quantity, damagedQty: -change.quantity };
-    await Stock.updateOne(
-      { branch: change.branch, product: change.product, warehouse: change.warehouse, shade: change.shade, batch: change.batch },
-      { $inc: quantityMove }
-    );
-  }
-};
 
 const stateError = (res, record, expected, action) => res.status(409).json({
   success: false,
@@ -195,74 +67,119 @@ router.get('/stats', async (req, res) => {
   } catch (e) { res.status(500).json({ success: false, message: e.message }); }
 });
 
-router.post('/generate/:soId', async (req, res) => {
-  let reservation = [];
-  let pickList = null;
+router.post('/reserve-backorder/:soId', requireAnyPermission('sales.order.approve', 'picking.management'), async (req, res) => {
+  const session = await mongoose.startSession();
   try {
-    const so = await SalesOrder.findOne({ _id: req.params.soId, branch: req.branchId })
-      .populate('items.product', 'productCode itemName images hsnCode')
-      .populate('items.warehouse', 'name')
-      .lean();
-    if (!so) return res.status(404).json({ success: false, message: 'Sales Order not found.' });
-    if (!['confirmed', 'approved', 'processing'].includes(so.status)) {
-      return res.status(409).json({ success: false, message: `Cannot generate pick list for "${so.status}" order.` });
-    }
+    let order;
+    await session.withTransaction(async () => {
+      order = await SalesOrder.findOne({ _id: req.params.soId, branch: req.branchId }).session(session);
+      if (!order) throw Object.assign(new Error('Sales Order not found.'), { status: 404 });
+      if (!['confirmed', 'approved', 'processing', 'partial_dispatch'].includes(order.status)) {
+        throw Object.assign(new Error(`Cannot reserve a backorder for a Sales Order in "${order.status}" status.`), { status: 409 });
+      }
+      if (['pending', 'rejected'].includes(order.approvalStatus)) {
+        throw Object.assign(new Error(`Sales Order cannot reserve backorder stock while approval is ${order.approvalStatus}.`), { status: 409 });
+      }
+      await reserveSalesOrderInventory(order, { session });
+    });
+    return res.json({ success: true, message: 'Remaining backorder quantity is reserved and available for pick-list allocation.', data: order });
+  } catch (error) {
+    return res.status(error.status || (['CastError', 'ValidationError'].includes(error.name) ? 422 : 500)).json({ success: false, message: error.message });
+  } finally { await session.endSession(); }
+});
 
-    const existing = await PickList.findOne({ branch: req.branchId, $or: [{ fulfillmentKey: `SO:${so._id}` }, { salesOrder: so._id }] }).lean();
-    if (existing) return res.status(409).json({ success: false, message: `Pick list ${existing.pickListNumber} already exists for this order.` });
-
+router.post('/generate/:soId', async (req, res) => {
+  const session = await mongoose.startSession();
+  try {
     const pickListNumber = await generateBranchNumber(req.branchId, 'pickList', new Date());
-    const items = so.items.map(item => {
-      const product = item.product || {};
-      return {
-        product: product._id || item.product,
-        productCode: item.productCode || product.productCode || '',
-        productName: item.productName || product.itemName || '',
-        productImage: item.productImage || product.images?.[0] || '',
-        hsnCode: product.hsnCode || '',
-        shade: item.shade || '',
-        batch: item.batch || '',
-        requestedQty: item.quantity,
-        unit: item.unit || 'Box',
-        warehouse: item.warehouse?._id || item.warehouse,
-        warehouseName: item.warehouse?.name || '',
-        status: 'pending',
-      };
-    });
+    let pickList;
+    await session.withTransaction(async () => {
+      const so = await SalesOrder.findOne({ _id: req.params.soId, branch: req.branchId })
+        .session(session)
+        .populate('items.product', 'productCode itemName images hsnCode')
+        .populate('items.warehouse', 'name');
+      if (!so) throw Object.assign(new Error('Sales Order not found.'), { status: 404 });
+      if (!['confirmed', 'approved', 'processing', 'partial_dispatch'].includes(so.status)) {
+        throw Object.assign(new Error(`Cannot generate pick list for "${so.status}" order.`), { status: 409 });
+      }
+      if (!['reserved', 'partial'].includes(so.reservationStatus)) {
+        throw Object.assign(new Error('Sales Order has no active stock reservation to allocate.'), { status: 409 });
+      }
 
-    // The unique fulfillment key claims this Sales Order before any stock is moved.
-    pickList = await PickList.create({
-      pickListNumber,
-      branch: so.branch,
-      fulfillmentKey: `SO:${so._id}`,
-      salesOrder: so._id,
-      orderNumber: so.orderNumber,
-      dealerName: so.dealerName || so.customerName || '',
-      dealerCode: so.dealerCode || '',
-      items,
-      priority: so.deliveryPriority || 'normal',
-      deliveryAddress: so.deliveryAddress || '',
-      totalItems: items.length,
-      totalRequestedQty: items.reduce((sum, item) => sum + item.requestedQty, 0),
-      reservationState: 'pending',
-      createdBy: req.user._id,
-    });
+      const requestedRows = Array.isArray(req.body.items) ? req.body.items : null;
+      const requestedByLine = new Map();
+      if (requestedRows) {
+        for (const row of requestedRows) {
+          const lineId = String(row.salesOrderItem || row.itemId || '');
+          const quantity = Number(row.quantity ?? row.allocatedQty);
+          if (!lineId || !Number.isFinite(quantity) || quantity <= 0 || requestedByLine.has(lineId)) {
+            throw Object.assign(new Error('Each requested allocation needs one unique salesOrderItem and a positive quantity.'), { status: 422 });
+          }
+          requestedByLine.set(lineId, quantity);
+        }
+      }
 
-    reservation = await reserveStock(so.items, so.branch);
-    pickList.stockReserved = true;
-    pickList.reservationState = 'reserved';
-    pickList.reservedAt = new Date();
-    await pickList.save();
-    await SalesOrder.findOneAndUpdate({ _id: so._id, branch: req.branchId }, { status: 'processing' });
-    res.status(201).json({ success: true, message: `Pick list ${pickListNumber} generated and stock reserved.`, data: pickList });
+      const items = [];
+      for (const line of so.items) {
+        const lineId = String(line._id);
+        const availableToAllocate = Number(line.reservedQuantity || 0) - Number(line.allocatedQuantity || 0);
+        const requestedQty = requestedRows ? requestedByLine.get(lineId) : availableToAllocate;
+        if (requestedQty === undefined || requestedQty <= QUANTITY_TOLERANCE) continue;
+        if (requestedQty - availableToAllocate > QUANTITY_TOLERANCE) {
+          throw Object.assign(new Error(`${line.productName || line.productCode}: allocation exceeds the line's unallocated reservation.`), { status: 409 });
+        }
+        if (!line.warehouse) throw Object.assign(new Error(`Warehouse is required for ${line.productName || line.productCode}.`), { status: 409 });
+        const product = line.product || {};
+        items.push({
+          salesOrderItem: line._id,
+          product: product._id || line.product,
+          productCode: line.productCode || product.productCode || '',
+          productName: line.productName || product.itemName || '',
+          productImage: line.productImage || product.images?.[0] || '',
+          hsnCode: product.hsnCode || '',
+          shade: line.shade || '',
+          batch: line.batch || '',
+          allocatedQty: requestedQty,
+          requestedQty,
+          unit: line.unit || 'Box',
+          warehouse: line.warehouse?._id || line.warehouse,
+          warehouseName: line.warehouse?.name || '',
+          status: 'pending',
+        });
+        line.allocatedQuantity = Number(line.allocatedQuantity || 0) + requestedQty;
+        refreshSalesOrderLine(line);
+        requestedByLine.delete(lineId);
+      }
+      if (requestedByLine.size) throw Object.assign(new Error('One or more requested Sales Order items were not found.'), { status: 422 });
+      if (!items.length) throw Object.assign(new Error('No unallocated reserved quantity remains for a new pick list.'), { status: 409 });
+
+      [pickList] = await PickList.create([{
+        pickListNumber,
+        branch: so.branch,
+        fulfillmentKey: `SO:${so._id}:${pickListNumber}`,
+        salesOrder: so._id,
+        orderNumber: so.orderNumber,
+        dealerName: so.dealerName || so.customerName || '',
+        dealerCode: so.dealerCode || '',
+        items,
+        priority: so.deliveryPriority || 'normal',
+        deliveryAddress: so.deliveryAddress || '',
+        totalItems: items.length,
+        totalRequestedQty: items.reduce((sum, item) => sum + item.requestedQty, 0),
+        stockReserved: true,
+        reservationState: 'reserved',
+        reservedAt: so.reservedAt || new Date(),
+        createdBy: req.user._id,
+      }], { session });
+      if (so.status !== 'partial_dispatch') so.status = 'processing';
+      await so.save({ session });
+    });
+    return res.status(201).json({ success: true, message: `Pick list ${pickListNumber} allocated from the Sales Order reservation.`, data: pickList });
   } catch (e) {
-    if (reservation.length) await rollbackReservation(reservation);
-    if (pickList?._id) await PickList.deleteOne({ _id: pickList._id, stockConsumedAt: null });
-    if (e.code === 11000) {
-      const existing = await PickList.findOne({ branch: req.branchId, fulfillmentKey: `SO:${req.params.soId}` }).lean();
-      return res.status(409).json({ success: false, message: existing ? `Pick list ${existing.pickListNumber} already exists for this order.` : 'Pick-list generation conflicted with another request. Refresh and retry.' });
-    }
-    res.status(e.message.startsWith('Insufficient') || e.message.includes('Warehouse') ? 409 : 500).json({ success: false, message: e.message });
+    const status = e.status || (e.code === 11000 ? 409 : ['CastError', 'ValidationError'].includes(e.name) ? 422 : 500);
+    return res.status(status).json({ success: false, message: e.code === 11000 ? 'Pick-list generation conflicted with another request. Refresh and retry.' : e.message });
+  } finally {
+    await session.endSession();
   }
 });
 
@@ -310,92 +227,107 @@ router.patch('/:id/start', async (req, res) => {
 });
 
 router.patch('/:id/complete-picking', async (req, res) => {
-  let released = [];
-  let claimedPickList = null;
+  const session = await mongoose.startSession();
   try {
-    const current = await PickList.findOne({ _id: req.params.id, branch: req.branchId });
-    if (!current) return res.status(404).json({ success: false, message: 'Pick list not found.' });
-    if (current.status === 'picked') return res.json({ success: true, message: 'Picking already completed.', data: current });
-    if (current.status !== 'in_progress') return stateError(res, current, 'in_progress', 'complete picking');
-
-    const submitted = req.body.items;
-    if (!Array.isArray(submitted) || submitted.length !== current.items.length) {
-      return res.status(400).json({ success: false, message: 'Submit explicit verification for every pick-list item.' });
-    }
-    const submittedById = new Map(submitted.map(item => [String(item._id), item]));
-    if (submittedById.size !== current.items.length) {
-      return res.status(400).json({ success: false, message: 'Every pick-list item must appear exactly once.' });
-    }
-
-    const updates = [];
-    for (const existing of current.items) {
-      const item = submittedById.get(String(existing._id));
-      if (!item) return res.status(400).json({ success: false, message: `Missing verification for ${existing.productName}.` });
-      const pickedQty = Number(item.pickedQty);
-      const shortQty = Number(item.shortQty || 0);
-      const damagedQty = Number(item.damagedQty || 0);
-      if (![pickedQty, shortQty, damagedQty].every(value => Number.isFinite(value) && value >= 0)) {
-        return res.status(400).json({ success: false, message: `Invalid quantities for ${existing.productName}.` });
+    let completed;
+    await session.withTransaction(async () => {
+      const current = await PickList.findOne({ _id: req.params.id, branch: req.branchId }).session(session);
+      if (!current) throw Object.assign(new Error('Pick list not found.'), { status: 404 });
+      if (current.status === 'picked') { completed = current; return; }
+      if (current.status !== 'in_progress') throw Object.assign(new Error(`Cannot complete picking while pick list is "${current.status}". Expected "in_progress".`), { status: 409 });
+      const submitted = req.body.items;
+      if (!Array.isArray(submitted) || submitted.length !== current.items.length) {
+        throw Object.assign(new Error('Submit explicit verification for every pick-list item.'), { status: 400 });
       }
-      if (Math.abs(pickedQty + shortQty + damagedQty - existing.requestedQty) > 0.0001) {
-        return res.status(400).json({ success: false, message: `${existing.productName}: picked + short + damaged must equal requested quantity.` });
-      }
-      if (item.barcodeVerified !== true || item.shadeConfirmed !== true || item.batchConfirmed !== true) {
-        return res.status(400).json({ success: false, message: `Confirm barcode, shade, and batch for ${existing.productName}.` });
-      }
-      updates.push({
-        _id: existing._id,
-        product: existing.product,
-        productName: existing.productName,
-        productCode: existing.productCode,
-        warehouse: existing.warehouse,
-        shade: existing.shade,
-        batch: existing.batch,
-        requestedQty: existing.requestedQty,
-        pickedQty,
-        shortQty,
-        damagedQty,
-        remarks: item.remarks || '',
-      });
-    }
+      const submittedById = new Map(submitted.map(item => [String(item._id), item]));
+      if (submittedById.size !== current.items.length) throw Object.assign(new Error('Every pick-list item must appear exactly once.'), { status: 400 });
 
-    claimedPickList = await PickList.findOneAndUpdate(
-      { _id: current._id, branch: req.branchId, status: 'in_progress', pickingCompletionProcessing: { $ne: true } },
-      { $set: { pickingCompletionProcessing: true, reservationState: current.stockReserved ? 'adjusting' : current.reservationState } },
-      { new: true }
-    );
-    if (!claimedPickList) return res.status(409).json({ success: false, message: 'Picking completion is already being processed. Refresh before retrying.' });
-
-    released = await releaseReservation(claimedPickList, updates);
-    for (const update of updates) {
-      const existing = claimedPickList.items.id(update._id);
-      existing.pickedQty = update.pickedQty;
-      existing.shortQty = update.shortQty;
-      existing.damagedQty = update.damagedQty;
-      existing.barcodeVerified = true;
-      existing.shadeConfirmed = true;
-      existing.batchConfirmed = true;
-      existing.status = update.damagedQty > 0 ? 'damaged' : update.shortQty > 0 ? 'short' : 'picked';
-      existing.remarks = update.remarks;
-    }
-    claimedPickList.status = 'picked';
-    claimedPickList.pickingEndTime = new Date();
-    claimedPickList.reservationAdjustedAt = claimedPickList.stockReserved ? new Date() : undefined;
-    claimedPickList.reservationState = claimedPickList.stockReserved ? 'adjusted' : claimedPickList.reservationState;
-    claimedPickList.pickingCompletionProcessing = false;
-    claimedPickList.totalPickedQty = claimedPickList.items.reduce((sum, item) => sum + item.pickedQty, 0);
-    claimedPickList.totalShortQty = claimedPickList.items.reduce((sum, item) => sum + item.shortQty, 0);
-    await claimedPickList.save();
-    res.json({ success: true, message: 'Picking completed with item-level verification.', data: claimedPickList });
-  } catch (e) {
-    if (released.length) await rollbackReleasedReservation(released);
-    if (claimedPickList?._id) {
-      await PickList.updateOne(
-        { _id: claimedPickList._id, branch: req.branchId, status: 'in_progress' },
-        { $set: { pickingCompletionProcessing: false, reservationState: claimedPickList.stockReserved ? 'reserved' : claimedPickList.reservationState } }
+      const claimed = await PickList.findOneAndUpdate(
+        { _id: current._id, branch: req.branchId, status: 'in_progress', pickingCompletionProcessing: { $ne: true } },
+        { $set: { pickingCompletionProcessing: true, reservationState: 'adjusting' } },
+        { new: true, session }
       );
-    }
-    res.status(e.message.includes('Reserved stock') ? 409 : 500).json({ success: false, message: e.message });
+      if (!claimed) throw Object.assign(new Error('Picking completion is already being processed. Refresh before retrying.'), { status: 409 });
+      const order = await SalesOrder.findOne({ _id: claimed.salesOrder, branch: req.branchId }).session(session);
+      if (!order) throw Object.assign(new Error('Linked Sales Order not found.'), { status: 409 });
+
+      for (const pickItem of claimed.items) {
+        const submittedItem = submittedById.get(String(pickItem._id));
+        if (!submittedItem) throw Object.assign(new Error(`Missing verification for ${pickItem.productName}.`), { status: 400 });
+        const pickedQty = Number(submittedItem.pickedQty);
+        const shortQty = Number(submittedItem.shortQty || 0);
+        const damagedQty = Number(submittedItem.damagedQty || 0);
+        if (![pickedQty, shortQty, damagedQty].every(value => Number.isFinite(value) && value >= 0)) {
+          throw Object.assign(new Error(`Invalid quantities for ${pickItem.productName}.`), { status: 400 });
+        }
+        if (Math.abs(pickedQty + shortQty + damagedQty - pickItem.requestedQty) > QUANTITY_TOLERANCE) {
+          throw Object.assign(new Error(`${pickItem.productName}: picked + short + damaged must equal requested quantity.`), { status: 400 });
+        }
+        if (submittedItem.barcodeVerified !== true || submittedItem.shadeConfirmed !== true || submittedItem.batchConfirmed !== true) {
+          throw Object.assign(new Error(`Confirm barcode, shade, and batch for ${pickItem.productName}.`), { status: 400 });
+        }
+        const orderLine = order.items.id(pickItem.salesOrderItem);
+        if (!orderLine) throw Object.assign(new Error(`Source Sales Order item is missing for ${pickItem.productName}.`), { status: 409 });
+        const unfulfilled = shortQty + damagedQty;
+        if (Number(orderLine.allocatedQuantity || 0) + QUANTITY_TOLERANCE < pickItem.requestedQty
+            || Number(orderLine.reservedQuantity || 0) + QUANTITY_TOLERANCE < pickItem.requestedQty) {
+          throw Object.assign(new Error(`Sales Order allocation changed for ${pickItem.productName}.`), { status: 409 });
+        }
+
+        for (const [type, quantity] of [['short', shortQty], ['damaged', damagedQty]]) {
+          if (!(quantity > QUANTITY_TOLERANCE)) continue;
+          const quantityMove = type === 'short'
+            ? { reservedQty: -quantity, availableQty: quantity }
+            : { reservedQty: -quantity, damagedQty: quantity };
+          const stock = await Stock.findOneAndUpdate(
+            {
+              branch: req.branchId,
+              product: pickItem.product,
+              warehouse: pickItem.warehouse,
+              shade: pickItem.shade || '',
+              batch: pickItem.batch || '',
+              reservedQty: { $gte: quantity },
+            },
+            { $inc: quantityMove },
+            { new: true, session }
+          );
+          if (!stock) throw Object.assign(new Error(`Reserved stock is inconsistent for ${pickItem.productName}.`), { status: 409 });
+        }
+
+        orderLine.allocatedQuantity = Math.max(0, Number(orderLine.allocatedQuantity || 0) - unfulfilled);
+        orderLine.reservedQuantity = Math.max(0, Number(orderLine.reservedQuantity || 0) - unfulfilled);
+        orderLine.pickedQuantity = Number(orderLine.pickedQuantity || 0) + pickedQty;
+        orderLine.shortQuantity = Number(orderLine.shortQuantity || 0) + shortQty;
+        orderLine.damagedQuantity = Number(orderLine.damagedQuantity || 0) + damagedQty;
+        refreshSalesOrderLine(orderLine);
+
+        pickItem.pickedQty = pickedQty;
+        pickItem.shortQty = shortQty;
+        pickItem.damagedQty = damagedQty;
+        pickItem.barcodeVerified = true;
+        pickItem.shadeConfirmed = true;
+        pickItem.batchConfirmed = true;
+        pickItem.status = damagedQty > 0 ? 'damaged' : shortQty > 0 ? 'short' : 'picked';
+        pickItem.remarks = submittedItem.remarks || '';
+      }
+
+      order.reservationStatus = order.items.some(item => Number(item.reservedQuantity || 0) > QUANTITY_TOLERANCE) ? 'partial' : 'released';
+      await order.save({ session });
+      claimed.status = 'picked';
+      claimed.pickingEndTime = new Date();
+      claimed.reservationAdjustedAt = new Date();
+      claimed.reservationState = 'adjusted';
+      claimed.pickingCompletionProcessing = false;
+      claimed.totalPickedQty = claimed.items.reduce((sum, item) => sum + Number(item.pickedQty || 0), 0);
+      claimed.totalShortQty = claimed.items.reduce((sum, item) => sum + Number(item.shortQty || 0), 0);
+      await claimed.save({ session });
+      completed = claimed;
+    });
+    return res.json({ success: true, message: completed.status === 'picked' ? 'Picking completed with item-level verification.' : 'Picking already completed.', data: completed });
+  } catch (e) {
+    return res.status(e.status || (['CastError', 'ValidationError'].includes(e.name) ? 422 : 500)).json({ success: false, message: e.message });
+  } finally {
+    await session.endSession();
   }
 });
 
@@ -419,20 +351,73 @@ router.patch('/:id/verify', async (req, res) => {
 });
 
 router.patch('/:id/sort', async (req, res) => {
+  const session = await mongoose.startSession();
   try {
-    const pickList = await PickList.findOne({ _id: req.params.id, branch: req.branchId });
-    if (!pickList) return res.status(404).json({ success: false, message: 'Pick list not found.' });
-    if (pickList.status === 'sorted') return res.json({ success: true, message: 'Pick list already sorted.', data: pickList });
-    if (pickList.status !== 'verified') return stateError(res, pickList, 'verified', 'complete sorting');
-    pickList.status = 'sorted';
-    pickList.sortedBy = req.user._id;
-    pickList.sortingStartTime = pickList.sortingStartTime || new Date();
-    pickList.sortingEndTime = new Date();
-    pickList.deliveryRoute = req.body.deliveryRoute ?? pickList.deliveryRoute;
-    pickList.remarks = req.body.remarks ?? pickList.remarks;
-    await pickList.save();
-    res.json({ success: true, message: 'Sorting completed.', data: pickList });
-  } catch (e) { res.status(500).json({ success: false, message: e.message }); }
+    let sorted;
+    await session.withTransaction(async () => {
+      const current = await PickList.findOne({ _id: req.params.id, branch: req.branchId }).session(session);
+      if (!current) throw Object.assign(new Error('Pick list not found.'), { status: 404 });
+      if (current.status === 'sorted') { sorted = current; return; }
+      if (current.status !== 'verified') throw Object.assign(new Error(`Cannot complete sorting while pick list is "${current.status}". Expected "verified".`), { status: 409 });
+      const submitted = req.body.items;
+      if (!Array.isArray(submitted) || submitted.length !== current.items.length) {
+        throw Object.assign(new Error('Submit explicit sorting verification for every pick-list item.'), { status: 400 });
+      }
+      const submittedById = new Map(submitted.map(item => [String(item._id), item]));
+      if (submittedById.size !== current.items.length) throw Object.assign(new Error('Every pick-list item must appear exactly once.'), { status: 400 });
+      const claimed = await PickList.findOneAndUpdate(
+        { _id: current._id, branch: req.branchId, status: 'verified', sortingVerificationProcessing: { $ne: true } },
+        { $set: { sortingVerificationProcessing: true, sortingStartTime: current.sortingStartTime || new Date() } },
+        { new: true, session }
+      );
+      if (!claimed) throw Object.assign(new Error('Sorting verification is already being processed. Refresh before retrying.'), { status: 409 });
+
+      const verifiedAt = new Date();
+      for (const item of claimed.items) {
+        const evidence = submittedById.get(String(item._id));
+        if (!evidence) throw Object.assign(new Error(`Missing sorting verification for ${item.productName}.`), { status: 400 });
+        const sortedQty = Number(evidence.sortedQty);
+        const sortingShortQty = Number(evidence.shortQty || 0);
+        const sortingDamagedQty = Number(evidence.damagedQty || 0);
+        if (![sortedQty, sortingShortQty, sortingDamagedQty].every(value => Number.isFinite(value) && value >= 0)) {
+          throw Object.assign(new Error(`Invalid sorting quantities for ${item.productName}.`), { status: 400 });
+        }
+        if (Math.abs(sortedQty + sortingShortQty + sortingDamagedQty - Number(item.pickedQty || 0)) > QUANTITY_TOLERANCE) {
+          throw Object.assign(new Error(`${item.productName}: sorted + short + damaged must equal the picked quantity.`), { status: 400 });
+        }
+        if (evidence.barcodeConfirmed !== true || evidence.shadeConfirmed !== true || evidence.batchConfirmed !== true) {
+          throw Object.assign(new Error(`Confirm barcode, shade, and batch for ${item.productName}.`), { status: 400 });
+        }
+        item.sortedQty = sortedQty;
+        item.sortingShortQty = sortingShortQty;
+        item.sortingDamagedQty = sortingDamagedQty;
+        item.sortingBarcodeConfirmed = true;
+        item.sortingShadeConfirmed = true;
+        item.sortingBatchConfirmed = true;
+        item.sortingRemarks = String(evidence.remarks || '');
+        item.sortingVerifiedBy = req.user._id;
+        item.sortingVerifiedAt = verifiedAt;
+      }
+      const hasSortingDiscrepancy = claimed.items.some(item => Number(item.sortingShortQty || 0) > QUANTITY_TOLERANCE || Number(item.sortingDamagedQty || 0) > QUANTITY_TOLERANCE);
+      claimed.status = hasSortingDiscrepancy ? 'verified' : 'sorted';
+      claimed.sortedBy = req.user._id;
+      claimed.sortingEndTime = verifiedAt;
+      claimed.deliveryRoute = req.body.deliveryRoute ?? claimed.deliveryRoute;
+      claimed.remarks = req.body.remarks ?? claimed.remarks;
+      claimed.sortingVerificationProcessing = false;
+      await claimed.save({ session });
+      sorted = claimed;
+    });
+    return res.json({
+      success: true,
+      message: sorted.status === 'sorted'
+        ? 'Sorting completed with item-level quantity and identity verification.'
+        : 'Sorting discrepancies recorded. Correct or resolve short/damaged quantities before packing.',
+      data: sorted,
+    });
+  } catch (e) {
+    return res.status(e.status || (['CastError', 'ValidationError'].includes(e.name) ? 422 : 500)).json({ success: false, message: e.message });
+  } finally { await session.endSession(); }
 });
 
 router.patch('/:id/pack', async (req, res) => {

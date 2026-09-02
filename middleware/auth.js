@@ -4,6 +4,12 @@ import Branch from '../models/Branch.js';
 import { resolveBranchContext } from '../utils/branchScope.js';
 import { ROLE_DEFAULT_PERMISSIONS } from '../config/permissions.js';
 
+const LEGACY_PERMISSION_ALIASES = {
+  'lead.management': ['lead.view', 'lead.create', 'lead.update', 'lead.assign', 'lead.app', 'lead.respond', 'lead.followup', 'lead.convert', 'lead.delete'],
+  'cheque.management': ['cheque.view', 'cheque.create', 'cheque.deposit', 'cheque.clear', 'cheque.bounce', 'cheque.return'],
+  'delivery.management': ['delivery.view', 'delivery.execute', 'delivery.verify', 'delivery.complete', 'delivery.fail'],
+};
+
 const tokenFromRequest = (req) => {
   if (req.headers.authorization?.startsWith('Bearer ')) return req.headers.authorization.split(' ')[1];
   return req.cookies?.token || null;
@@ -113,7 +119,9 @@ export const userHasPermission = (user, permission) => {
 
   const perms = user.permissions || [];
   const mod = permission.split('.')[0];
-  return perms.includes(permission) || perms.includes('*') || perms.includes(`${mod}.*`);
+  const hasLegacyAlias = Object.entries(LEGACY_PERMISSION_ALIASES)
+    .some(([legacy, aliases]) => perms.includes(legacy) && aliases.includes(permission));
+  return perms.includes(permission) || perms.includes('*') || perms.includes(`${mod}.*`) || hasLegacyAlias;
 };
 
 export const requirePermission = (permission) => (req, res, next) => {

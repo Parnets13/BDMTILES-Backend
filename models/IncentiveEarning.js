@@ -6,6 +6,8 @@ import mongoose from 'mongoose';
  */
 const incentiveEarningSchema = new mongoose.Schema(
   {
+    branch: { type: mongoose.Schema.Types.ObjectId, ref: 'Branch', index: true },
+    idempotencyKey: { type: String, trim: true },
     incentive: { type: mongoose.Schema.Types.ObjectId, ref: 'Incentive', required: true },
     incentiveName: String,
     incentiveType: String,
@@ -35,6 +37,7 @@ const incentiveEarningSchema = new mongoose.Schema(
     periodEnd: Date,
 
     // Payment status
+    createdBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User' },
     paymentStatus: { type: String, enum: ['pending', 'approved', 'paid', 'rejected'], default: 'pending' },
     approvedBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User' },
     approvedAt: Date,
@@ -49,6 +52,8 @@ const incentiveEarningSchema = new mongoose.Schema(
 incentiveEarningSchema.index({ earnedBy: 1, paymentStatus: 1 });
 incentiveEarningSchema.index({ dealer: 1, paymentStatus: 1 });
 incentiveEarningSchema.index({ incentive: 1 });
+incentiveEarningSchema.index({ idempotencyKey: 1 }, { unique: true, sparse: true });
+incentiveEarningSchema.index({ branch: 1, referenceModel: 1, referenceId: 1 });
 incentiveEarningSchema.index({ triggerEvent: 1, createdAt: -1 });
 
 export default mongoose.model('IncentiveEarning', incentiveEarningSchema);

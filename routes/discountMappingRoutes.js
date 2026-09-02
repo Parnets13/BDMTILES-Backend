@@ -2,20 +2,23 @@ import { Router } from 'express';
 import DiscountMapping from '../models/DiscountMapping.js';
 import Product from '../models/Product.js';
 import { protect, requirePermission } from '../middleware/auth.js';
+import { requireBranch } from '../utils/branchScope.js';
+import { generateBranchNumber } from '../utils/branchSequence.js';
 
 const router = Router();
 router.use(protect);
+router.use(requireBranch);
 
 // ══════════════════════════════════════════════════════
 // GET /api/v1/discount-mappings — list all rules (paginated + filters)
 // ══════════════════════════════════════════════════════
-router.get('/', requirePermission('product.master'), async (req, res) => {
+router.get('/', requirePermission('dealer.discounts'), async (req, res) => {
   try {
     const { page = 1, limit = 50, targetType, status, search, dealerType } = req.query;
     const p = Math.max(1, parseInt(page));
     const l = Math.min(100, parseInt(limit) || 50);
 
-    let filter = {};
+    const filter = { branch: req.branchId };
     if (targetType) filter.targetType = targetType;
     if (status) filter.status = status;
     if (dealerType) {
@@ -60,16 +63,17 @@ router.get('/', requirePermission('product.master'), async (req, res) => {
 // ══════════════════════════════════════════════════════
 // GET /api/v1/discount-mappings/stats — summary counts
 // ══════════════════════════════════════════════════════
-router.get('/stats', requirePermission('product.master'), async (req, res) => {
+router.get('/stats', requirePermission('dealer.discounts'), async (req, res) => {
   try {
     const now = new Date();
+    const scope = { branch: req.branchId };
     const [total, active, inactive, expired, byType] = await Promise.all([
-      DiscountMapping.countDocuments(),
-      DiscountMapping.countDocuments({ status: 'active', validFrom: { $lte: now }, validTo: { $gte: now } }),
-      DiscountMapping.countDocuments({ status: 'inactive' }),
-      DiscountMapping.countDocuments({ $or: [{ status: 'expired' }, { validTo: { $lt: now } }] }),
+      DiscountMapping.countDocuments(scope),
+      DiscountMapping.countDocuments({ ...scope, status: 'active', validFrom: { $lte: now }, validTo: { $gte: now } }),
+      DiscountMapping.countDocuments({ ...scope, status: 'inactive' }),
+      DiscountMapping.countDocuments({ ...scope, $or: [{ status: 'expired' }, { validTo: { $lt: now } }] }),
       DiscountMapping.aggregate([
-        { $match: { status: 'active' } },
+        { $match: { ...scope, status: 'active' } },
         { $group: { _id: '$targetType', count: { $sum: 1 } } },
       ]),
     ]);
@@ -98,7 +102,7 @@ router.get('/calculate', requirePermission('sales.order.create'), async (req, re
       .lean();
     if (!productDoc) return res.status(404).json({ success: false, message: 'Product not found' });
 
-    const rule = await DiscountMapping.findBestDiscount(productDoc, dealerType);
+    const rule = await DiscountMapping.findBestDiscount(productDoc, dealerType, req.branchId);
 
     if (!rule) {
       return res.json({
@@ -196,7 +200,7 @@ router.post('/bulk-calculate', requirePermission('sales.order.create'), async (r
       .select('_id brand category subcategory')
       .lean();
 
-    const discountMap = await DiscountMapping.bulkResolveDiscounts(productDocs, dealerType);
+    const discountMap = await DiscountMapping.bulkResolveDiscounts(productDocs, dealerType, req.branchId);
 
     const results = {};
     for (const item of productItems) {
@@ -238,9 +242,9 @@ router.post('/bulk-calculate', requirePermission('sales.order.create'), async (r
 // ══════════════════════════════════════════════════════
 // GET /api/v1/discount-mappings/:id — get single rule
 // ══════════════════════════════════════════════════════
-router.get('/:id', requirePermission('product.master'), async (req, res) => {
+router.get('/:id', requirePermission('dealer.discounts'), async (req, res) => {
   try {
-    const rule = await DiscountMapping.findById(req.params.id)
+    const rule = await DiscountMapping.findOne({ _id: req.params.id, branch: req.branchId })
       .populate('product', 'itemName productCode')
       .populate('brand', 'name')
       .populate('category', 'name')
@@ -255,14 +259,13 @@ router.get('/:id', requirePermission('product.master'), async (req, res) => {
 // ══════════════════════════════════════════════════════
 // POST /api/v1/discount-mappings — create new rule
 // ══════════════════════════════════════════════════════
-router.post('/', requirePermission('product.master'), async (req, res) => {
+router.post('/', requirePermission('dealer.discounts'), async (req, res) => {
   try {
-    const data = { ...req.body, createdBy: req.user._id };
+    const data = { ...req.body, branch: req.branchId, createdBy: req.user._id };
 
     // Auto-generate ruleCode if not provided
     if (!data.ruleCode) {
-      const count = await DiscountMapping.countDocuments();
-      data.ruleCode = `DISC-${String(count + 1).padStart(4, '0')}`;
+      data.ruleCode = await generateBranchNumber(req.branchId, 'discountMapping', data.validFrom || new Date());
     }
 
     // Resolve targetName for display
@@ -294,9 +297,14 @@ router.post('/', requirePermission('product.master'), async (req, res) => {
 // ══════════════════════════════════════════════════════
 // PUT /api/v1/discount-mappings/:id — update rule
 // ══════════════════════════════════════════════════════
-router.put('/:id', requirePermission('product.master'), async (req, res) => {
+router.put('/:id', requirePermission('dealer.discounts'), async (req, res) => {
   try {
-    const rule = await DiscountMapping.findByIdAndUpdate(req.params.id, req.body, { new: true, runValidators: true });
+    const { branch, ...updates } = req.body;
+    const rule = await DiscountMapping.findOneAndUpdate(
+      { _id: req.params.id, branch: req.branchId },
+      updates,
+      { new: true, runValidators: true }
+    );
     if (!rule) return res.status(404).json({ success: false, message: 'Not found' });
     res.json({ success: true, message: 'Discount rule updated.', data: rule });
   } catch (e) { res.status(500).json({ success: false, message: e.message }); }
@@ -305,13 +313,17 @@ router.put('/:id', requirePermission('product.master'), async (req, res) => {
 // ══════════════════════════════════════════════════════
 // PATCH /api/v1/discount-mappings/:id/status — toggle active/inactive
 // ══════════════════════════════════════════════════════
-router.patch('/:id/status', requirePermission('product.master'), async (req, res) => {
+router.patch('/:id/status', requirePermission('dealer.discounts'), async (req, res) => {
   try {
     const { status } = req.body;
     if (!['active', 'inactive', 'expired'].includes(status)) {
       return res.status(400).json({ success: false, message: 'Invalid status' });
     }
-    const rule = await DiscountMapping.findByIdAndUpdate(req.params.id, { status }, { new: true });
+    const rule = await DiscountMapping.findOneAndUpdate(
+      { _id: req.params.id, branch: req.branchId },
+      { status },
+      { new: true }
+    );
     if (!rule) return res.status(404).json({ success: false, message: 'Not found' });
     res.json({ success: true, message: `Rule status changed to "${status}".`, data: rule });
   } catch (e) { res.status(500).json({ success: false, message: e.message }); }
@@ -320,10 +332,17 @@ router.patch('/:id/status', requirePermission('product.master'), async (req, res
 // ══════════════════════════════════════════════════════
 // DELETE /api/v1/discount-mappings/:id — delete rule
 // ══════════════════════════════════════════════════════
-router.delete('/:id', requirePermission('product.master'), async (req, res) => {
+router.delete('/:id', requirePermission('dealer.discounts'), async (req, res) => {
   try {
     const { safeDelete } = await import('../middleware/safeDelete.js');
-    const result = await safeDelete(DiscountMapping, req.params.id, { user: req.user, module: 'discount_mapping', titleField: 'ruleName', codeField: 'ruleCode', skipDependencyCheck: true });
+    const result = await safeDelete(DiscountMapping, req.params.id, {
+      user: req.user,
+      module: 'discount_mapping',
+      titleField: 'ruleName',
+      codeField: 'ruleCode',
+      skipDependencyCheck: true,
+      scope: { branch: req.branchId },
+    });
     res.status(result.status || 200).json(result);
   } catch (e) { res.status(500).json({ success: false, message: e.message }); }
 });

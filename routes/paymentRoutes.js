@@ -1,8 +1,10 @@
 import { Router } from 'express';
 import mongoose from 'mongoose';
 import Payment from '../models/Payment.js';
+import Cheque from '../models/Cheque.js';
 import SalesOrder from '../models/SalesOrder.js';
-import PurchaseOrder from '../models/PurchaseOrder.js';
+import SupplierInvoice from '../models/SupplierInvoice.js';
+import Invoice from '../models/Invoice.js';
 import Dealer from '../models/Dealer.js';
 import Supplier from '../models/Supplier.js';
 import { protect, requirePermission } from '../middleware/auth.js';
@@ -10,6 +12,7 @@ import { requireBranch } from '../utils/branchScope.js';
 import { generateBranchNumber } from '../utils/branchSequence.js';
 import { requestFingerprint as fingerprintRequest } from '../utils/idempotency.js';
 import { postSubledgerEntry } from '../utils/subledgerPosting.js';
+import { applyDealerInvoiceAllocation, reverseDealerInvoiceAllocation } from '../services/dealerInvoicePaymentService.js';
 
 const router = Router();
 router.use(protect);
@@ -27,6 +30,23 @@ function finitePositive(value, field) {
     throw paymentError(422, `${field} must be a finite number greater than zero.`);
   }
   return number;
+}
+
+async function assertPaymentNotChequeManaged(payment, session) {
+  const linkedCheque = payment.cheque || await Cheque.exists({
+    payment: payment._id,
+    $or: [
+      { branch: payment.branch },
+      { branch: null },
+      { branch: { $exists: false } },
+    ],
+  }).session(session);
+  if (linkedCheque) {
+    throw paymentError(
+      409,
+      'This Payment is managed by a linked cheque. Use Cheque Management so lifecycle, maker-checker, and accounting remain atomic.'
+    );
+  }
 }
 
 async function refreshSalesOrderPaymentStatus(orderId, session = null) {
@@ -52,7 +72,7 @@ async function refreshSalesOrderPaymentStatus(orderId, session = null) {
   );
 }
 
-async function validatePaymentData(source, session = null) {
+async function validatePaymentData(source, session = null, { allowLegacySalesOrder = false } = {}) {
   const paymentType = source.paymentType;
   if (!['dealer_receipt', 'supplier_payment'].includes(paymentType)) {
     throw paymentError(422, 'paymentType must be dealer_receipt or supplier_payment.');
@@ -60,17 +80,13 @@ async function validatePaymentData(source, session = null) {
 
   let party;
   if (paymentType === 'dealer_receipt') {
-    if (!source.dealer || source.supplier) {
-      throw paymentError(422, 'Dealer receipts require dealer only.');
-    }
+    if (!source.dealer || source.supplier) throw paymentError(422, 'Dealer receipts require dealer only.');
     party = await Dealer.findById(source.dealer).session(session).lean();
     if (!party) throw paymentError(404, 'Dealer not found.');
   } else {
-    if (!source.supplier || source.dealer) {
-      throw paymentError(422, 'Supplier payments require supplier only.');
-    }
-    party = await Supplier.findById(source.supplier).session(session).lean();
-    if (!party) throw paymentError(404, 'Supplier not found.');
+    if (!source.supplier || source.dealer) throw paymentError(422, 'Supplier payments require supplier only.');
+    party = await Supplier.findOne({ _id: source.supplier, status: 'active' }).session(session).lean();
+    if (!party) throw paymentError(404, 'Active supplier not found.');
   }
 
   const amount = finitePositive(source.amount, 'amount');
@@ -85,20 +101,22 @@ async function validatePaymentData(source, session = null) {
     if (!allocation.order || !orderModel) {
       throw paymentError(422, `againstOrders[${index}] requires order and orderModel.`);
     }
-    if (paymentType === 'dealer_receipt' && orderModel !== 'SalesOrder') {
-      throw paymentError(422, 'Dealer receipt allocations may only reference SalesOrder.');
+    if (paymentType === 'dealer_receipt'
+      && orderModel !== 'Invoice'
+      && !(allowLegacySalesOrder && orderModel === 'SalesOrder')) {
+      throw paymentError(422, 'New dealer receipt allocations may only reference customer invoices.');
     }
-    if (paymentType === 'supplier_payment' && orderModel !== 'PurchaseOrder') {
-      throw paymentError(422, 'Supplier payment allocations may only reference PurchaseOrder.');
+    if (paymentType === 'supplier_payment' && orderModel !== 'SupplierInvoice') {
+      throw paymentError(422, 'Supplier payment allocations may only reference verified SupplierInvoice records.');
     }
 
     const key = `${orderModel}:${String(allocation.order)}`;
-    if (seen.has(key)) throw paymentError(422, 'Each allocated order may appear only once.');
+    if (seen.has(key)) throw paymentError(422, 'Each allocation target may appear only once.');
     seen.add(key);
 
     const allocatedAmount = finitePositive(allocation.allocatedAmount, `againstOrders[${index}].allocatedAmount`);
-    allocatedTotal += allocatedAmount;
-    if (allocatedTotal > amount) throw paymentError(422, 'Allocated total cannot exceed payment amount.');
+    allocatedTotal = Math.round((allocatedTotal + allocatedAmount + Number.EPSILON) * 100) / 100;
+    if (allocatedTotal > amount + 0.01) throw paymentError(422, 'Allocated total cannot exceed payment amount.');
 
     if (orderModel === 'SalesOrder') {
       const order = await SalesOrder.findOne({ _id: allocation.order, branch: source.branch }).session(session).lean();
@@ -110,34 +128,71 @@ async function validatePaymentData(source, session = null) {
         throw paymentError(422, `Sales order ${order.orderNumber} cannot receive allocations in ${order.status} status.`);
       }
       const currentBalance = Number(order.balanceAmount);
-      if (!Number.isFinite(currentBalance) || allocatedAmount > currentBalance) {
+      if (!Number.isFinite(currentBalance) || allocatedAmount > currentBalance + 0.01) {
         throw paymentError(422, `Allocation for sales order ${order.orderNumber} exceeds its current balance.`);
       }
+      againstOrders.push({ order: order._id, orderModel, orderNumber: order.orderNumber, allocatedAmount });
+    } else if (orderModel === 'Invoice') {
+      const invoice = await Invoice.findOne({
+        _id: allocation.order,
+        branch: source.branch,
+        dealer: source.dealer,
+        status: { $ne: 'cancelled' },
+      }).session(session).lean();
+      if (!invoice) throw paymentError(404, `Active customer invoice for allocation ${index + 1} not found.`);
+      const currentBalance = Number(invoice.balanceAmount);
+      if (!Number.isFinite(currentBalance) || allocatedAmount > currentBalance + 0.01) {
+        throw paymentError(422, `Allocation for invoice ${invoice.invoiceNumber} exceeds its current balance.`);
+      }
       againstOrders.push({
-        order: order._id,
+        order: invoice._id,
         orderModel,
-        orderNumber: order.orderNumber,
+        orderNumber: invoice.invoiceNumber,
         allocatedAmount,
       });
     } else {
-      const order = await PurchaseOrder.findOne({ _id: allocation.order, branch: source.branch }).session(session).lean();
-      if (!order) throw paymentError(404, `Purchase order for allocation ${index + 1} not found.`);
-      if (String(order.supplier) !== String(source.supplier)) {
-        throw paymentError(422, `Purchase order ${order.poNumber} does not belong to the selected supplier.`);
+      const invoice = await SupplierInvoice.findOne({
+        _id: allocation.order,
+        branch: source.branch,
+        supplier: source.supplier,
+        status: { $in: ['verified', 'partial'] },
+      }).session(session).lean();
+      if (!invoice) throw paymentError(404, `Verified supplier invoice for allocation ${index + 1} not found.`);
+      const currentBalance = Number(invoice.balanceAmount);
+      if (!Number.isFinite(currentBalance) || allocatedAmount > currentBalance + 0.01) {
+        throw paymentError(422, `Allocation for supplier invoice ${invoice.invoiceRefNumber} exceeds its current balance.`);
       }
-      // PurchaseOrder has no allocation balance field, so ownership/existence is validated without invented over-allocation logic.
       againstOrders.push({
-        order: order._id,
+        order: invoice._id,
         orderModel,
-        orderNumber: order.poNumber,
+        orderNumber: invoice.invoiceRefNumber,
         allocatedAmount,
       });
     }
   }
 
+  const hasLegacySalesOrder = againstOrders.some(allocation => allocation.orderModel === 'SalesOrder');
+  if (paymentType === 'dealer_receipt' && !hasLegacySalesOrder && Math.abs(amount - allocatedTotal) > 0.01) {
+    throw paymentError(422, 'Dealer receipt amount must be fully allocated to customer invoices.');
+  }
+
+  let unallocatedAdvanceAmount = 0;
+  if (paymentType === 'supplier_payment') {
+    const expectedAdvance = Math.round((amount - allocatedTotal + Number.EPSILON) * 100) / 100;
+    const requestedAdvance = Number(source.unallocatedAdvanceAmount ?? 0);
+    if (!Number.isFinite(requestedAdvance) || requestedAdvance < 0) {
+      throw paymentError(422, 'unallocatedAdvanceAmount must be a finite nonnegative number.');
+    }
+    if (Math.abs(requestedAdvance - expectedAdvance) > 0.01) {
+      throw paymentError(422, 'Supplier payment remainder must be explicitly classified as unallocatedAdvanceAmount.');
+    }
+    unallocatedAdvanceAmount = expectedAdvance;
+  }
+
   return {
     amount,
     againstOrders,
+    unallocatedAdvanceAmount,
     partyName: paymentType === 'dealer_receipt' ? party.businessName : party.companyName,
   };
 }
@@ -164,20 +219,72 @@ async function applyPaymentEffects(payment, session) {
   });
 
   for (const allocation of payment.againstOrders ?? []) {
-    if (allocation.orderModel !== 'SalesOrder') continue;
-    const order = await SalesOrder.findOneAndUpdate(
-      {
-        _id: allocation.order,
+    if (allocation.orderModel === 'SalesOrder') {
+      const activeInvoice = await Invoice.findOne({
         branch: payment.branch,
         dealer: payment.dealer,
-        status: { $nin: ['draft', 'cancelled'] },
-        balanceAmount: { $gte: allocation.allocatedAmount },
-      },
-      { $inc: { advanceAmount: allocation.allocatedAmount, balanceAmount: -allocation.allocatedAmount } },
-      { new: true, session }
-    );
-    if (!order) throw paymentError(409, 'A sales order balance changed before the payment could be applied.');
-    await refreshSalesOrderPaymentStatus(order._id, session);
+        salesOrder: allocation.order,
+        status: { $ne: 'cancelled' },
+      }).select('_id').session(session).lean();
+      if (activeInvoice) {
+        await applyDealerInvoiceAllocation({
+          invoiceId: activeInvoice._id,
+          branch: payment.branch,
+          dealer: payment.dealer,
+          amount: allocation.allocatedAmount,
+          session,
+        });
+        continue;
+      }
+
+      const order = await SalesOrder.findOneAndUpdate(
+        {
+          _id: allocation.order,
+          branch: payment.branch,
+          dealer: payment.dealer,
+          status: { $nin: ['draft', 'cancelled'] },
+          balanceAmount: { $gte: allocation.allocatedAmount },
+        },
+        { $inc: { advanceAmount: allocation.allocatedAmount, balanceAmount: -allocation.allocatedAmount } },
+        { new: true, session }
+      );
+      if (!order) throw paymentError(409, 'A sales order balance changed before the payment could be applied.');
+      await refreshSalesOrderPaymentStatus(order._id, session);
+      continue;
+    }
+
+    if (allocation.orderModel === 'Invoice') {
+      await applyDealerInvoiceAllocation({
+        invoiceId: allocation.order,
+        branch: payment.branch,
+        dealer: payment.dealer,
+        amount: allocation.allocatedAmount,
+        session,
+      });
+      continue;
+    }
+
+    if (allocation.orderModel === 'SupplierInvoice') {
+      const invoice = await SupplierInvoice.findOneAndUpdate(
+        {
+          _id: allocation.order,
+          branch: payment.branch,
+          supplier: payment.supplier,
+          status: { $in: ['verified', 'partial'] },
+          balanceAmount: { $gte: allocation.allocatedAmount },
+        },
+        { $inc: { paidAmount: allocation.allocatedAmount, balanceAmount: -allocation.allocatedAmount } },
+        { new: true, session }
+      );
+      if (!invoice) throw paymentError(409, 'A supplier invoice balance changed before the payment could be applied.');
+      if (Number(invoice.balanceAmount) <= 0.01) {
+        invoice.balanceAmount = 0;
+        invoice.status = 'paid';
+      } else {
+        invoice.status = 'partial';
+      }
+      await invoice.save({ session });
+    }
   }
 }
 
@@ -219,13 +326,60 @@ async function reversePaymentEffects(payment, bounceCharges, session) {
   }
 
   for (const allocation of payment.againstOrders ?? []) {
-    if (allocation.orderModel !== 'SalesOrder') continue;
-    const order = await SalesOrder.findOne({ _id: allocation.order, branch: payment.branch }).session(session);
-    if (!order) throw paymentError(409, 'An allocated sales order no longer exists.');
-    order.advanceAmount = Math.max(0, (Number(order.advanceAmount) || 0) - allocation.allocatedAmount);
-    order.balanceAmount = Math.max(0, (Number(order.grandTotal) || 0) - order.advanceAmount);
-    await order.save({ session });
-    await refreshSalesOrderPaymentStatus(order._id, session);
+    if (allocation.orderModel === 'SalesOrder') {
+      const activeInvoice = await Invoice.findOne({
+        branch: payment.branch,
+        dealer: payment.dealer,
+        salesOrder: allocation.order,
+        status: { $ne: 'cancelled' },
+      }).select('_id').session(session).lean();
+      if (activeInvoice) {
+        await reverseDealerInvoiceAllocation({
+          invoiceId: activeInvoice._id,
+          branch: payment.branch,
+          dealer: payment.dealer,
+          amount: allocation.allocatedAmount,
+          session,
+        });
+        continue;
+      }
+
+      const order = await SalesOrder.findOne({ _id: allocation.order, branch: payment.branch }).session(session);
+      if (!order) throw paymentError(409, 'An allocated sales order no longer exists.');
+      order.advanceAmount = Math.max(0, (Number(order.advanceAmount) || 0) - allocation.allocatedAmount);
+      order.balanceAmount = Math.max(0, (Number(order.grandTotal) || 0) - order.advanceAmount);
+      await order.save({ session });
+      await refreshSalesOrderPaymentStatus(order._id, session);
+      continue;
+    }
+
+    if (allocation.orderModel === 'Invoice') {
+      await reverseDealerInvoiceAllocation({
+        invoiceId: allocation.order,
+        branch: payment.branch,
+        dealer: payment.dealer,
+        amount: allocation.allocatedAmount,
+        session,
+      });
+      continue;
+    }
+
+    if (allocation.orderModel === 'SupplierInvoice') {
+      const invoice = await SupplierInvoice.findOne({
+        _id: allocation.order,
+        branch: payment.branch,
+        supplier: payment.supplier,
+        status: { $in: ['verified', 'partial', 'paid'] },
+      }).session(session);
+      if (!invoice) throw paymentError(409, 'An allocated supplier invoice no longer exists.');
+      if (Number(invoice.paidAmount) + 0.01 < Number(allocation.allocatedAmount)) {
+        throw paymentError(409, 'Supplier invoice paid amount is lower than the payment allocation being reversed.');
+      }
+      invoice.paidAmount = Math.max(0, Number(invoice.paidAmount) - Number(allocation.allocatedAmount));
+      invoice.balanceAmount = Math.min(Number(invoice.grandTotal), Number(invoice.balanceAmount) + Number(allocation.allocatedAmount));
+      invoice.status = invoice.paidAmount <= 0.01 ? 'verified' : 'partial';
+      await invoice.save({ session });
+    }
   }
 }
 
@@ -289,17 +443,33 @@ router.get('/stats', requirePermission('payment'), async (req, res) => {
   } catch (e) { sendPaymentError(res, e); }
 });
 
-// GET /api/v1/payments/dealer-orders/:dealerId — pending orders for allocation
-router.get('/dealer-orders/:dealerId', requirePermission('payment'), async (req, res) => {
+// GET /api/v1/payments/dealer-invoices/:dealerId — active customer invoices for allocation
+router.get('/dealer-invoices/:dealerId', requirePermission('payment'), async (req, res) => {
   try {
-    const orders = await SalesOrder.find({
+    const invoices = await Invoice.find({
       branch: req.branchId,
       dealer: req.params.dealerId,
+      status: { $ne: 'cancelled' },
       paymentStatus: { $in: ['pending', 'partial'] },
-      status: { $nin: ['cancelled', 'draft'] },
-    }).select('orderNumber orderDate grandTotal advanceAmount balanceAmount').sort({ orderDate: -1 }).lean();
-    res.json({ success: true, data: orders });
+      balanceAmount: { $gt: 0 },
+    }).select('invoiceNumber invoiceDate orderNumber dispatchNumbers grandTotal paidAmount balanceAmount paymentStatus')
+      .sort({ invoiceDate: 1, createdAt: 1 }).lean();
+    res.json({ success: true, data: invoices });
   } catch (e) { sendPaymentError(res, e); }
+});
+
+// GET /api/v1/payments/supplier-invoices/:supplierId — verified invoices for allocation
+router.get('/supplier-invoices/:supplierId', requirePermission('payment'), async (req, res) => {
+  try {
+    const invoices = await SupplierInvoice.find({
+      branch: req.branchId,
+      supplier: req.params.supplierId,
+      status: { $in: ['verified', 'partial'] },
+      balanceAmount: { $gt: 0 },
+    }).select('invoiceRefNumber invoiceNumber invoiceDate dueDate grandTotal paidAmount balanceAmount status')
+      .sort({ dueDate: 1, invoiceDate: 1 }).lean();
+    return res.json({ success: true, data: invoices });
+  } catch (error) { return sendPaymentError(res, error); }
 });
 
 // GET /api/v1/payments/:id
@@ -320,7 +490,7 @@ router.post('/', requirePermission('payment'), async (req, res) => {
   if (!rawIdempotencyKey || rawIdempotencyKey.length > 200) {
     return res.status(422).json({ success: false, message: 'A valid Idempotency-Key header is required.' });
   }
-  const sourceKey = `${String(req.branchId)}:${rawIdempotencyKey}`;
+  const sourceKey = `${String(req.branchId)}:payment:${rawIdempotencyKey}`;
   const requestFingerprint = fingerprintRequest(req.body);
   const existingPayment = await Payment.findOne({ branch: req.branchId, sourceKey });
   if (existingPayment) {
@@ -331,11 +501,10 @@ router.post('/', requirePermission('payment'), async (req, res) => {
   }
   const session = await mongoose.startSession();
   try {
-    await validatePaymentData({ ...req.body, branch: req.branchId });
-    const paymentNumber = await generateBranchNumber(req.branchId, 'payment', req.body.paymentDate || new Date());
     let payment;
     await session.withTransaction(async () => {
       const validated = await validatePaymentData({ ...req.body, branch: req.branchId }, session);
+      const paymentNumber = await generateBranchNumber(req.branchId, 'payment', req.body.paymentDate || new Date(), { session });
       const data = {
         ...req.body,
         ...validated,
@@ -345,6 +514,7 @@ router.post('/', requirePermission('payment'), async (req, res) => {
         branch: req.branchId,
         transactionRef: req.body.transactionRef ?? req.body.utrNumber,
         status: req.body.paymentMode === 'cheque' ? 'pending' : 'confirmed',
+        confirmedAt: req.body.paymentMode === 'cheque' ? null : new Date(),
         tallySyncStatus: 'not_synced',
         createdBy: req.user._id,
       };
@@ -386,11 +556,12 @@ router.patch('/:id/confirm', requirePermission('payment'), async (req, res) => {
         return;
       }
       if (current.status !== 'pending') throw paymentError(409, `Cannot confirm a payment in ${current.status} status.`);
+      await assertPaymentNotChequeManaged(current, session);
 
-      await validatePaymentData(current.toObject(), session);
+      await validatePaymentData(current.toObject(), session, { allowLegacySalesOrder: true });
       payment = await Payment.findOneAndUpdate(
         { _id: current._id, branch: req.branchId, status: 'pending' },
-        { $set: { status: 'confirmed' } },
+        { $set: { status: 'confirmed', confirmedAt: new Date(), bouncedAt: null, cancelledAt: null } },
         { new: true, runValidators: true, session }
       );
       if (!payment) throw paymentError(409, 'Payment state changed before confirmation.');
@@ -418,6 +589,7 @@ router.patch('/:id/bounce', requirePermission('payment'), async (req, res) => {
     await session.withTransaction(async () => {
       const current = await Payment.findOne({ _id: req.params.id, branch: req.branchId }).session(session);
       if (!current) throw paymentError(404, 'Payment not found.');
+      if (current.paymentMode !== 'cheque') throw paymentError(422, 'Only cheque payments can use the bounce action.');
       if (current.status === 'bounced') {
         payment = current;
         alreadyBounced = true;
@@ -427,11 +599,12 @@ router.patch('/:id/bounce', requirePermission('payment'), async (req, res) => {
       if (!['pending', 'confirmed'].includes(current.status)) {
         throw paymentError(409, `Cannot bounce a payment in ${current.status} status.`);
       }
+      await assertPaymentNotChequeManaged(current, session);
 
       const previousStatus = current.status;
       payment = await Payment.findOneAndUpdate(
         { _id: current._id, branch: req.branchId, status: previousStatus },
-        { $set: { status: 'bounced', bounceReason: req.body.reason || '', bounceCharges } },
+        { $set: { status: 'bounced', bouncedAt: new Date(), bounceReason: req.body.reason || '', bounceCharges } },
         { new: true, runValidators: true, session }
       );
       if (!payment) throw paymentError(409, 'Payment state changed before bounce processing.');
@@ -445,4 +618,5 @@ router.patch('/:id/bounce', requirePermission('payment'), async (req, res) => {
   }
 });
 
+export { validatePaymentData, applyPaymentEffects, reversePaymentEffects };
 export default router;

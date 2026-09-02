@@ -1,16 +1,19 @@
 import mongoose from 'mongoose';
 
 const grnItemSchema = new mongoose.Schema({
+  purchaseOrderItem: { type: mongoose.Schema.Types.ObjectId },
   product: { type: mongoose.Schema.Types.ObjectId, ref: 'Product', required: true },
   productCode: String,
   productName: String,
-  orderedQty: { type: Number, default: 0 },
+  unit: { type: String, default: 'Box' },
+  orderedQty: { type: Number, default: 0, min: 0 },
   receivedQty: { type: Number, required: true, min: 0 },
-  acceptedQty: { type: Number, default: 0 },
-  shortQty: { type: Number, default: 0 },
-  excessQty: { type: Number, default: 0 },
-  damagedQty: { type: Number, default: 0 },
-  rejectedQty: { type: Number, default: 0 },
+  acceptedQty: { type: Number, default: 0, min: 0 },
+  shortQty: { type: Number, default: 0, min: 0 },
+  excessQty: { type: Number, default: 0, min: 0 },
+  damagedQty: { type: Number, default: 0, min: 0 },
+  rejectedQty: { type: Number, default: 0, min: 0 },
+  heldQty: { type: Number, default: 0, min: 0 },
   shade: { type: String, default: '' },
   batch: { type: String, default: '' },
   qualityStatus: { type: String, enum: ['accepted', 'rejected', 'hold'], default: 'accepted' },
@@ -18,7 +21,11 @@ const grnItemSchema = new mongoose.Schema({
   zone: String,
   rack: String,
   bin: String,
-  rate: { type: Number, default: 0 },
+  rate: { type: Number, default: 0, min: 0 },
+  discount: { type: Number, default: 0, min: 0 },
+  schemeDiscount: { type: Number, default: 0, min: 0 },
+  gstPercentage: { type: Number, default: 0, min: 0, max: 100 },
+  receiptCode: { type: String, default: '' },
   remarks: String,
 });
 
@@ -44,6 +51,11 @@ const grnSchema = new mongoose.Schema(
 
     status: { type: String, enum: ['draft', 'verified', 'approved', 'posted'], default: 'draft' },
     qcRemarks: { type: String, default: '' },
+    verifiedBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User' },
+    verifiedAt: Date,
+    postedBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User' },
+    postedAt: Date,
+    payableRecognition: { type: String, enum: ['none', 'grn', 'invoice'], default: 'none' },
 
     tallySyncStatus: { type: String, enum: ['not_synced', 'pending', 'synced', 'failed'], default: 'not_synced' },
     tallyVoucherNumber: String,

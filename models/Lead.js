@@ -17,6 +17,8 @@ const assignmentHistorySchema = new mongoose.Schema({
   assignedAt: { type: Date, default: Date.now },
   response: { type: String, enum: ['pending', 'accepted', 'declined', 'reassigned', 'timeout'], default: 'pending' },
   respondedAt: Date,
+  endedAt: Date,
+  endReason: { type: String, enum: ['reassigned', 'declined', 'timeout', 'closed'] },
   declineReason: String,
   seStatus: String, // SE's status at time of assignment
 });
@@ -38,12 +40,20 @@ const leadSchema = new mongoose.Schema(
     address: String,
     pinCode: String,
 
-    // Customer Type — how they came to us
+    // Legacy capture value retained for backward compatibility.
     customerType: {
       type: String,
       enum: ['walk_in', 'phone_enquiry', 'referral', 'online_enquiry', 'whatsapp', 'exhibition', 'architect_referral', 'dealer_referral', 'google_ads', 'facebook', 'instagram', 'existing_customer', 'other'],
       default: 'walk_in',
     },
+    leadSource: { type: String, trim: true, default: '' },
+    leadChannel: {
+      type: String,
+      enum: ['', 'store_visit', 'phone', 'whatsapp', 'online', 'referral', 'exhibition', 'social', 'other'],
+      default: '',
+    },
+    leadType: { type: String, trim: true, default: '' },
+    campaign: { type: String, trim: true, default: '' },
     referredBy: String, // name of person who referred
 
     // Interest
@@ -67,6 +77,8 @@ const leadSchema = new mongoose.Schema(
     assignedToName: String,
     assignmentStatus: { type: String, enum: ['unassigned', 'pending', 'accepted', 'declined', 'reassigned'], default: 'unassigned' },
     assignedAt: Date,
+    acceptanceDeadlineAt: Date,
+    assignmentVersion: { type: Number, default: 0, min: 0 },
     acceptedAt: Date,
     declinedAt: Date,
     declineReason: String,
@@ -89,6 +101,8 @@ const leadSchema = new mongoose.Schema(
     // Incentive Tracking
     incentiveEligible: { type: Boolean, default: false },
     incentiveAmount: { type: Number, default: 0 },
+    incentiveStatus: { type: String, enum: ['pending', 'earned', 'no_rule'], default: 'pending' },
+    incentiveEarning: { type: mongoose.Schema.Types.ObjectId, ref: 'IncentiveEarning' },
     incentivePaid: { type: Boolean, default: false },
     incentivePaidDate: Date,
 

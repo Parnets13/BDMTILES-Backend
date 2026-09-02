@@ -12,6 +12,8 @@ import Dealer from '../models/Dealer.js';
 import DealerLedger from '../models/DealerLedger.js';
 import DealerPricing from '../models/DealerPricing.js';
 import Delivery from '../models/Delivery.js';
+import DiscountMapping from '../models/DiscountMapping.js';
+import Dispatch from '../models/Dispatch.js';
 import DispatchTrip from '../models/DispatchTrip.js';
 import Employee from '../models/Employee.js';
 import Expense from '../models/Expense.js';
@@ -25,7 +27,10 @@ import NotificationSettings from '../models/NotificationSettings.js';
 import NotificationTemplate from '../models/NotificationTemplate.js';
 import Payment from '../models/Payment.js';
 import PickList from '../models/PickList.js';
+import Product from '../models/Product.js';
 import PurchaseOrder from '../models/PurchaseOrder.js';
+import PurchaseRequisition from '../models/PurchaseRequisition.js';
+import SupplierQuotation from '../models/SupplierQuotation.js';
 import PurchaseReturn from '../models/PurchaseReturn.js';
 import Quotation from '../models/Quotation.js';
 import RecycleBin from '../models/RecycleBin.js';
@@ -48,6 +53,7 @@ const DEFAULT_NUMBERING = {
   quotation: { prefix: 'QT', padding: 5, includeBranchCode: true, includeFiscalYear: true },
   invoice: { prefix: 'INV', padding: 5, includeBranchCode: true, includeFiscalYear: true },
   purchaseOrder: { prefix: 'PO', padding: 5, includeBranchCode: true, includeFiscalYear: true },
+  supplierQuotation: { prefix: 'SQ', padding: 5, includeBranchCode: true, includeFiscalYear: true },
   grn: { prefix: 'GRN', padding: 5, includeBranchCode: true, includeFiscalYear: true },
   payment: { prefix: 'PAY', padding: 5, includeBranchCode: true, includeFiscalYear: true },
   expense: { prefix: 'EXP', padding: 5, includeBranchCode: true, includeFiscalYear: true },
@@ -58,6 +64,9 @@ const DEFAULT_NUMBERING = {
   pickList: { prefix: 'PL', padding: 5, includeBranchCode: true, includeFiscalYear: true },
   supplierInvoice: { prefix: 'SINV', padding: 5, includeBranchCode: true, includeFiscalYear: true },
   dispatchTrip: { prefix: 'TRIP', padding: 5, includeBranchCode: true, includeFiscalYear: true },
+  dispatch: { prefix: 'DSP', padding: 5, includeBranchCode: true, includeFiscalYear: true },
+  purchaseRequisition: { prefix: 'PR', padding: 5, includeBranchCode: true, includeFiscalYear: true },
+  discountMapping: { prefix: 'DISC', padding: 5, includeBranchCode: true, includeFiscalYear: true },
   delivery: { prefix: 'DEL', padding: 5, includeBranchCode: true, includeFiscalYear: true },
   approval: { prefix: 'APR', padding: 5, includeBranchCode: true, includeFiscalYear: true },
   bankReconciliation: { prefix: 'BR', padding: 5, includeBranchCode: true, includeFiscalYear: true },
@@ -67,7 +76,8 @@ const branchOwnedCollections = [
   'approvalrequests', 'bankreconciliations', 'salesorders', 'quotations', 'invoices',
   'purchaseorders', 'grns', 'stocks', 'expenses', 'dealerpricings', 'payments',
   'salesreturns', 'purchasereturns', 'dealerledgers', 'supplierledgers',
-  'supplierinvoices', 'picklists', 'dispatchtrips', 'deliveries',
+  'supplierinvoices', 'picklists', 'dispatchtrips', 'dispatches', 'deliveries',
+  'purchaserequisitions', 'supplierquotations', 'discountmappings',
 ];
 
 const numberOwnerSpecs = [
@@ -77,6 +87,8 @@ const numberOwnerSpecs = [
   ['quotations', 'branch', 'quotationNumber'],
   ['invoices', 'branch', 'invoiceNumber'],
   ['purchaseorders', 'branch', 'poNumber'],
+  ['purchaserequisitions', 'branch', 'prNumber'],
+  ['supplierquotations', 'branch', 'quotationNumber'],
   ['grns', 'branch', 'grnNumber'],
   ['payments', 'branch', 'paymentNumber'],
   ['expenses', 'branch', 'expenseNumber'],
@@ -119,6 +131,8 @@ const indexedModels = [
   Quotation,
   Invoice,
   PurchaseOrder,
+  PurchaseRequisition,
+  SupplierQuotation,
   GRN,
   Payment,
   Expense,
@@ -126,6 +140,8 @@ const indexedModels = [
   SalesReturn,
   PurchaseReturn,
   PickList,
+  DiscountMapping,
+  Dispatch,
   DispatchTrip,
   Delivery,
 ];
@@ -244,6 +260,32 @@ async function preflightActiveInvoiceDuplicates() {
       + `Cancel or otherwise resolve these invoices and rerun (showing up to 25 groups):\n  ${details}`
     );
   }
+}
+
+async function preflightSalesOrderQuotationDuplicates() {
+  const duplicates = await SalesOrder.collection.aggregate([
+    { $match: { branch: { $type: 'objectId' }, sourceQuotation: { $type: 'objectId' } } },
+    {
+      $group: {
+        _id: { branch: '$branch', sourceQuotation: '$sourceQuotation' },
+        ids: { $push: '$_id' },
+        count: { $sum: 1 },
+      },
+    },
+    { $match: { count: { $gt: 1 } } },
+    { $limit: 25 },
+  ]).toArray();
+
+  if (duplicates.length) {
+    const details = duplicates.map((duplicate) => (
+      `branch=${duplicate._id.branch}, sourceQuotation=${duplicate._id.sourceQuotation}, salesOrderIds=${duplicate.ids.join(',')}`
+    )).join('\n  ');
+    throw new Error(
+      'Cannot create the Sales Order quotation-source uniqueness index. Resolve duplicate Sales Orders linked to the '
+      + `same branch and quotation, then rerun (showing up to 25 groups):\n  ${details}`
+    );
+  }
+  console.log('Sales Order quotation-source duplicate preflight passed');
 }
 
 async function preflightNumberDuplicates() {
@@ -703,6 +745,24 @@ async function reconcileOpeningAdjustments({ defaultBranch, dealers, suppliers }
   });
 }
 
+async function backfillPurchaseRequisitionItemIds() {
+  let updated = 0;
+  const cursor = PurchaseRequisition.collection.find({ 'items.0': { $exists: true } });
+  for await (const requisition of cursor) {
+    let changed = false;
+    const items = (requisition.items || []).map((item) => {
+      if (item._id) return item;
+      changed = true;
+      return { ...item, _id: new mongoose.Types.ObjectId() };
+    });
+    if (changed) {
+      await PurchaseRequisition.collection.updateOne({ _id: requisition._id }, { $set: { items } });
+      updated += 1;
+    }
+  }
+  console.log(`Backfilled item identities for ${updated} purchase requisition(s)`);
+}
+
 async function initializeAllSequences(settings) {
   const nonAllTotals = await BranchSequence.collection.aggregate([
     { $match: { fiscalYear: { $ne: 'ALL' } } },
@@ -768,6 +828,7 @@ async function dropLegacyGlobalIndexes() {
     [Quotation.collection, 'quotationNumber_1'],
     [Invoice.collection, 'invoiceNumber_1'],
     [PurchaseOrder.collection, 'poNumber_1'],
+    [PurchaseRequisition.collection, 'prNumber_1'],
     [GRN.collection, 'grnNumber_1'],
     [Payment.collection, 'paymentNumber_1'],
     [Expense.collection, 'expenseNumber_1'],
@@ -788,6 +849,150 @@ async function dropLegacyGlobalIndexes() {
   for (const [collection, indexName] of legacyIndexes) {
     await dropIndexIfPresent(collection, indexName);
   }
+}
+
+async function backfillSalesOrderLifecycle() {
+  const products = await Product.find({}).select('_id piecesPerBox sqftPerBox').lean();
+  const productMap = new Map(products.map(product => [String(product._id), product]));
+  let orderUpdates = 0;
+  const orderCursor = SalesOrder.collection.find({});
+  for await (const order of orderCursor) {
+    const fullyDispatched = ['dispatched', 'delivered'].includes(order.status);
+    const items = (order.items || []).map(item => {
+      const product = productMap.get(String(item.product));
+      const piecesPerBox = Number(product?.piecesPerBox || 0);
+      const sqftPerBox = Number(product?.sqftPerBox || 0);
+      const quantity = Number(item.quantity || item.boxes || 0);
+      const dispatchedQuantity = Number(item.dispatchedQuantity ?? (fullyDispatched ? quantity : 0));
+      const remainingQuantity = Math.max(0, Number(item.remainingQuantity ?? (quantity - dispatchedQuantity)));
+      const reservedQuantity = Number(item.reservedQuantity || 0);
+      return {
+        ...item,
+        quantity,
+        boxes: Number(item.boxes) > 0 ? Number(item.boxes) : quantity,
+        pieces: Number(item.pieces) > 0 ? Number(item.pieces) : piecesPerBox > 0 ? quantity * piecesPerBox : 0,
+        sqft: Number(item.sqft) > 0 ? Number(item.sqft) : sqftPerBox > 0 ? quantity * sqftPerBox : 0,
+        reservedQuantity,
+        allocatedQuantity: Number(item.allocatedQuantity || 0),
+        pickedQuantity: Number(item.pickedQuantity || 0),
+        shortQuantity: Number(item.shortQuantity || 0),
+        damagedQuantity: Number(item.damagedQuantity || 0),
+        dispatchedQuantity,
+        fulfilledQuantity: Number(item.fulfilledQuantity ?? dispatchedQuantity),
+        remainingQuantity,
+        backorderQuantity: Number(item.backorderQuantity ?? Math.max(0, remainingQuantity - reservedQuantity)),
+      };
+    });
+    await SalesOrder.collection.updateOne(
+      { _id: order._id },
+      {
+        $set: {
+          items,
+          confirmationRequested: Boolean(order.confirmationRequested),
+          reservationStatus: order.reservationStatus || (fullyDispatched ? 'consumed' : 'none'),
+          cancellationRequestStatus: order.cancellationRequestStatus || 'none',
+        },
+      }
+    );
+    orderUpdates += 1;
+  }
+
+  let pickUpdates = 0;
+  const pickCursor = PickList.collection.find({});
+  for await (const pickList of pickCursor) {
+    const order = await SalesOrder.collection.findOne({ _id: pickList.salesOrder });
+    const usedLineIds = new Set();
+    const items = (pickList.items || []).map((item, itemIndex) => {
+      let line = item.salesOrderItem
+        ? order?.items?.find(candidate => String(candidate._id) === String(item.salesOrderItem))
+        : null;
+      if (!line) {
+        const matches = (order?.items || []).filter(candidate =>
+          !usedLineIds.has(String(candidate._id))
+          && String(candidate.product) === String(item.product)
+          && String(candidate.warehouse || '') === String(item.warehouse || '')
+          && String(candidate.shade || '') === String(item.shade || '')
+          && String(candidate.batch || '') === String(item.batch || '')
+        );
+        if (matches.length === 1) [line] = matches;
+        else {
+          const positional = order?.items?.[itemIndex];
+          if (positional && String(positional.product) === String(item.product)) line = positional;
+        }
+      }
+      if (line) usedLineIds.add(String(line._id));
+      return {
+        ...item,
+        ...(line ? { salesOrderItem: line._id } : {}),
+        allocatedQty: Number(item.allocatedQty ?? item.requestedQty ?? 0),
+        dispatchedQty: Number(item.dispatchedQty ?? (pickList.stockConsumedAt ? item.pickedQty || 0 : 0)),
+      };
+    });
+    await PickList.collection.updateOne({ _id: pickList._id }, { $set: { items } });
+    pickUpdates += 1;
+  }
+  const legacyOrderCursor = SalesOrder.collection.find({ reservationStatus: 'none' });
+  for await (const order of legacyOrderCursor) {
+    const pickLists = await PickList.collection.find({ salesOrder: order._id }).toArray();
+    if (!pickLists.length) continue;
+    const counters = new Map((order.items || []).map(item => [String(item._id), {
+      reserved: 0, allocated: 0, picked: 0, short: 0, damaged: 0, dispatched: 0,
+    }]));
+    for (const pickList of pickLists) {
+      const activeReservation = !pickList.stockConsumedAt
+        && pickList.stockReserved === true
+        && !['released', 'consumed'].includes(pickList.reservationState)
+        && pickList.status !== 'cancelled';
+      const adjusted = ['adjusted', 'consuming'].includes(pickList.reservationState)
+        || ['picked', 'verified', 'sorted', 'packed', 'ready_for_dispatch'].includes(pickList.status);
+      for (const item of pickList.items || []) {
+        const counter = counters.get(String(item.salesOrderItem));
+        if (!counter) continue;
+        const picked = Number(item.pickedQty || 0);
+        counter.picked += picked;
+        counter.short += Number(item.shortQty || 0);
+        counter.damaged += Number(item.damagedQty || 0);
+        if (pickList.stockConsumedAt) counter.dispatched += Number(item.dispatchedQty ?? picked);
+        if (activeReservation) {
+          const activeQuantity = adjusted ? picked : Number(item.requestedQty || 0);
+          counter.reserved += activeQuantity;
+          counter.allocated += activeQuantity;
+        }
+      }
+    }
+    const items = (order.items || []).map(item => {
+      const counter = counters.get(String(item._id));
+      const quantity = Number(item.quantity || 0);
+      const dispatchedQuantity = Math.min(quantity, counter?.dispatched || 0);
+      const remainingQuantity = Math.max(0, quantity - dispatchedQuantity);
+      const reservedQuantity = Math.min(remainingQuantity, counter?.reserved || 0);
+      return {
+        ...item,
+        reservedQuantity,
+        allocatedQuantity: Math.min(reservedQuantity, counter?.allocated || 0),
+        pickedQuantity: counter?.picked || 0,
+        shortQuantity: counter?.short || 0,
+        damagedQuantity: counter?.damaged || 0,
+        dispatchedQuantity,
+        fulfilledQuantity: dispatchedQuantity,
+        remainingQuantity,
+        backorderQuantity: Math.max(0, remainingQuantity - reservedQuantity),
+      };
+    });
+    const hasReserved = items.some(item => Number(item.reservedQuantity || 0) > 0);
+    const allDispatched = items.length > 0 && items.every(item => Number(item.remainingQuantity || 0) <= 0.0001);
+    await SalesOrder.collection.updateOne(
+      { _id: order._id, reservationStatus: 'none' },
+      {
+        $set: {
+          items,
+          confirmationRequested: order.confirmationRequested || !['draft', 'cancelled', 'expired'].includes(order.status),
+          reservationStatus: allDispatched ? 'consumed' : hasReserved ? 'partial' : 'none',
+        },
+      }
+    );
+  }
+  console.log(`Backfilled lifecycle fields for ${orderUpdates} sales order(s) and ${pickUpdates} pick list(s)`);
 }
 
 async function run() {
@@ -890,7 +1095,10 @@ async function run() {
   );
   console.log(`Backfilled ${sourceTransferResult.modifiedCount} source and ${destinationTransferResult.modifiedCount} destination stock-transfer branch field(s)`);
 
+  await backfillSalesOrderLifecycle();
+  await backfillPurchaseRequisitionItemIds();
   await preflightActiveInvoiceDuplicates();
+  await preflightSalesOrderQuotationDuplicates();
   await preflightNumberDuplicates();
 
   await Invoice.collection.updateMany(

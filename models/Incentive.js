@@ -24,7 +24,8 @@ const slabSchema = new mongoose.Schema({
 
 const incentiveSchema = new mongoose.Schema(
   {
-    incentiveCode: { type: String, unique: true },
+    incentiveCode: { type: String, required: true },
+    branch: { type: mongoose.Schema.Types.ObjectId, ref: 'Branch', index: true },
     incentiveName: { type: String, required: true },
 
     // Who is this for
@@ -109,7 +110,7 @@ const incentiveSchema = new mongoose.Schema(
   { timestamps: true }
 );
 
-incentiveSchema.index({ incentiveCode: 1 });
+incentiveSchema.index({ branch: 1, incentiveCode: 1 }, { unique: true });
 incentiveSchema.index({ applicableTo: 1, status: 1 });
 incentiveSchema.index({ triggerEvent: 1, status: 1 });
 

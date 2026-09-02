@@ -29,16 +29,16 @@ const SECTION_PERMISSIONS = Object.freeze({
   collections: ['reports.finance', 'finance.management', 'payment', 'dealer.ledger'],
   inventory: ['reports.inventory', 'stock.view'],
   purchase: ['reports.purchase', 'po.management', 'grn.entry', 'debit.note', 'supplier.ledger'],
-  crm: ['lead.management', 'followup.management', 'complaint.management'],
+  crm: ['lead.view', 'lead.followup', 'lead.app', 'complaint.management'],
   hr: ['reports.hr', 'hrms.management', 'attendance.master', 'leave.management'],
-  warehouseDelivery: ['picking.management', 'sorting.management', 'dispatch.management', 'delivery.management', 'delivery.tracking'],
+  warehouseDelivery: ['picking.management', 'sorting.management', 'dispatch.management', 'delivery.view', 'delivery.tracking'],
   profitability: ['reports.profit'],
   activity: ['activity.logs'],
 });
 
 const APPROVAL_TYPE_PERMISSIONS = Object.freeze({
   sales_order: 'sales.order.approve',
-  purchase_order: 'po.management',
+  purchase_order: 'po.approve',
   credit_limit: 'finance.management',
   rate_override: 'dealer.discounts',
   debit_note: 'debit.note',
@@ -334,7 +334,7 @@ const buildWarehouseDelivery = async (scopeMatch, periods, user) => {
   const canReadPicking = hasAnyPermission(user, ['picking.management']);
   const canReadSorting = hasAnyPermission(user, ['sorting.management']);
   const canReadDispatch = hasAnyPermission(user, ['dispatch.management']);
-  const canReadDelivery = hasAnyPermission(user, ['delivery.management', 'delivery.tracking']);
+  const canReadDelivery = hasAnyPermission(user, ['delivery.view', 'delivery.tracking']);
   const canReadPickLists = canReadPicking || canReadSorting || canReadDispatch;
   const [pickRows, tripRows, deliveryRows, deliveredToday, pendingPod] = await Promise.all([
     canReadPickLists ? PickList.aggregate([{ $match: { ...scopeMatch, status: { $ne: 'cancelled' } } }, { $group: { _id: '$status', count: { $sum: 1 } } }]) : Promise.resolve([]),
@@ -362,7 +362,7 @@ const buildWarehouseDelivery = async (scopeMatch, periods, user) => {
 };
 
 const buildCrm = async (scopeMatch, periods, user) => {
-  const canReadLeads = hasAnyPermission(user, ['lead.management', 'followup.management']);
+  const canReadLeads = hasAnyPermission(user, ['lead.view', 'lead.followup', 'lead.app']);
   const canReadComplaints = userHasPermission(user, 'complaint.management');
   const activeLeadStatuses = ['won', 'lost'];
   const terminalComplaintStatuses = ['resolved', 'closed', 'rejected'];

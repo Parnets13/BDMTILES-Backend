@@ -1,5 +1,34 @@
 import mongoose from 'mongoose';
 
+const loadingItemSchema = new mongoose.Schema({
+  pickListItem: { type: mongoose.Schema.Types.ObjectId },
+  salesOrderItem: { type: mongoose.Schema.Types.ObjectId },
+  product: { type: mongoose.Schema.Types.ObjectId, ref: 'Product' },
+  productCode: { type: String, default: '' },
+  productName: { type: String, default: '' },
+  productImage: { type: String, default: '' },
+  quantity: { type: Number, default: 0, min: 0 },
+  unit: { type: String, default: 'Box' },
+  shade: { type: String, default: '' },
+  batch: { type: String, default: '' },
+  boxContext: { type: String, default: '' },
+}, { _id: false });
+
+const finalDispatchVerificationSchema = new mongoose.Schema({
+  vehicleConfirmed: { type: Boolean, default: false },
+  sealConfirmed: { type: Boolean, default: false },
+  sealNumber: { type: String, default: '' },
+  invoiceConfirmed: { type: Boolean, default: false },
+  eWayBillConfirmed: { type: Boolean, default: false },
+  lrDocumentConfirmed: { type: Boolean, default: false },
+  finalOrderCount: { type: Number, default: 0, min: 0 },
+  finalBoxCount: { type: Number, default: 0, min: 0 },
+  remarks: { type: String, default: '' },
+  verifiedBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User' },
+  verifiedAt: Date,
+  completed: { type: Boolean, default: false },
+}, { _id: false });
+
 const tripOrderSchema = new mongoose.Schema({
   pickList: { type: mongoose.Schema.Types.ObjectId, ref: 'PickList' },
   salesOrder: { type: mongoose.Schema.Types.ObjectId, ref: 'SalesOrder', required: true },
@@ -10,12 +39,14 @@ const tripOrderSchema = new mongoose.Schema({
   contactPhone: { type: String, default: '' },
   totalBoxes: { type: Number, default: 0 },
   totalWeight: { type: Number, default: 0 },
+  invoice: { type: mongoose.Schema.Types.ObjectId, ref: 'Invoice' },
   invoiceNumber: { type: String, default: '' },
   pickListNumber: { type: String, default: '' },
   // Loading verification
   loadingVerified: { type: Boolean, default: false },
   loadedBoxes: { type: Number, default: 0 },
   loadingRemarks: { type: String, default: '' },
+  loadingItems: { type: [loadingItemSchema], default: [] },
   // Delivery sequence
   sequence: { type: Number, default: 0 },
   // Delivery status
@@ -74,6 +105,9 @@ const dispatchTripSchema = new mongoose.Schema(
     loadedBoxes: { type: Number, default: 0 },
     loadingSupervisor: { type: mongoose.Schema.Types.ObjectId, ref: 'User' },
     loadingVerified: { type: Boolean, default: false },
+
+    // Separate gate completed after loading and before stock consumption
+    finalDispatchVerification: { type: finalDispatchVerificationSchema, default: () => ({}) },
 
     // Prevent concurrent/retried dispatch from applying stock twice
     dispatchProcessing: { type: Boolean, default: false },

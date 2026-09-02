@@ -94,7 +94,7 @@ export async function syncAutomaticApprovalRequest({
     reason: [...new Set(pendingReasons.map((reason) => reason.type))].join(', '),
     requestedBy,
     requestedByName,
-    priority: pendingReasons.some((reason) => reason.type === 'credit_limit') ? 'urgent' : 'normal',
+    priority: pendingReasons.some((reason) => ['credit_limit', 'overdue_credit', 'credit_days'].includes(reason.type)) ? 'urgent' : 'normal',
     exposureFingerprint: approvalExposureFingerprint(document),
   };
 

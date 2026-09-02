@@ -12,7 +12,7 @@ const approvalRequestSchema = new mongoose.Schema(
     },
     type: {
       type: String,
-      enum: ['sales_order', 'quotation', 'purchase_order', 'credit_limit', 'rate_override', 'debit_note', 'credit_note', 'discount', 'other'],
+      enum: ['sales_order', 'sales_order_cancellation', 'quotation', 'purchase_order', 'credit_limit', 'rate_override', 'debit_note', 'credit_note', 'discount', 'other'],
       required: true,
     },
     title: { type: String, required: true },

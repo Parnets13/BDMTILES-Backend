@@ -1,14 +1,18 @@
 import mongoose from 'mongoose';
 
 const purchaseReturnItemSchema = new mongoose.Schema({
+  supplierInvoiceItem: { type: mongoose.Schema.Types.ObjectId, immutable: true },
+  grnItem: { type: mongoose.Schema.Types.ObjectId, immutable: true },
+  purchaseOrderItem: { type: mongoose.Schema.Types.ObjectId, immutable: true },
   product: { type: mongoose.Schema.Types.ObjectId, ref: 'Product', required: true },
   productCode: String,
   productName: String,
   shade: { type: String, default: '' },
   batch: { type: String, default: '' },
-  returnQty: { type: Number, required: true, min: 1 },
+  returnQty: { type: Number, required: true, min: 0.0001 },
   unit: { type: String, default: 'Box' },
   rate: { type: Number, default: 0 },
+  discountAmount: { type: Number, default: 0 },
   reason: { type: String, enum: ['damaged_on_receipt', 'wrong_product', 'quality_issue', 'excess_supply', 'defective', 'other'], default: 'other' },
   reasonDetails: String,
   gstPercentage: { type: Number, default: 18 },
@@ -25,10 +29,12 @@ const purchaseReturnSchema = new mongoose.Schema(
     returnDate: { type: Date, default: Date.now },
 
     // Reference to PO / GRN
-    purchaseOrder: { type: mongoose.Schema.Types.ObjectId, ref: 'PurchaseOrder' },
+    purchaseOrder: { type: mongoose.Schema.Types.ObjectId, ref: 'PurchaseOrder', immutable: true },
     poNumber: String,
-    grn: { type: mongoose.Schema.Types.ObjectId, ref: 'GRN' },
+    grn: { type: mongoose.Schema.Types.ObjectId, ref: 'GRN', immutable: true },
     grnNumber: String,
+    supplierInvoice: { type: mongoose.Schema.Types.ObjectId, ref: 'SupplierInvoice', immutable: true },
+    supplierInvoiceNumber: String,
 
     // Supplier
     supplier: { type: mongoose.Schema.Types.ObjectId, ref: 'Supplier', required: true },
@@ -45,10 +51,13 @@ const purchaseReturnSchema = new mongoose.Schema(
     requestFingerprint: { type: String, default: '' },
 
     // Status
-    status: { type: String, enum: ['draft', 'approved', 'stock_deducted', 'debit_issued', 'cancelled'], default: 'draft' },
+    status: { type: String, enum: ['draft', 'approved', 'stock_deducted', 'debit_issued', 'cancelled', 'reversed'], default: 'draft' },
     approvedBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User' },
     approvalDate: Date,
     approvalRemarks: String,
+    reversedBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User' },
+    reversedAt: Date,
+    reversalReason: String,
 
     remarks: { type: String, default: '' },
 

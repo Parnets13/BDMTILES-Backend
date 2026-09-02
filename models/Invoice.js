@@ -47,6 +47,9 @@ const invoiceSchema = new mongoose.Schema(
     // Source reference
     salesOrder: { type: mongoose.Schema.Types.ObjectId, ref: 'SalesOrder' },
     orderNumber: String,
+    dispatchTrips: [{ type: mongoose.Schema.Types.ObjectId, ref: 'DispatchTrip' }],
+    dispatchNumbers: [{ type: String }],
+    stockDispatchedAt: Date,
     sourceKey: { type: String, unique: true, sparse: true },
     requestFingerprint: { type: String, default: '' },
     activeSalesOrderKey: { type: String, unique: true, sparse: true },

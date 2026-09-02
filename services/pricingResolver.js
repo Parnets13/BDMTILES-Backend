@@ -178,8 +178,9 @@ async function findOverride({ branchId, dealer, dealerType, productId, quantity,
   }
   return null;
 }
-async function findDiscount(product, dealerType, at, session) {
+async function findDiscount(branchId, product, dealerType, at, session) {
   const base = {
+    branch: branchId,
     status: 'active', validFrom: { $lte: at }, validTo: { $gte: at },
     $or: [{ applicableTo: 'all' }, { applicableDealerTypes: dealerType }],
   };
@@ -263,7 +264,7 @@ export async function resolvePricing(options = {}) {
       schemeDiscount: override.schemeDiscount, minQty: override.minQty,
     };
   } else if (dealer?.discountEligible !== false) {
-    const rule = await findDiscount(product, discountDealerType, at, session);
+    const rule = await findDiscount(branchId, product, discountDealerType, at, session);
     if (rule) {
       const calculated = calculateDiscountRule(rule, tier.rate, qty, { orderAmount });
       if (calculated.applied) {

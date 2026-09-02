@@ -20,6 +20,7 @@ const discountMappingSchema = new mongoose.Schema(
     // Rule identification
     ruleName: { type: String, required: true, trim: true },
     ruleCode: { type: String, unique: true, sparse: true, trim: true },
+    branch: { type: mongoose.Schema.Types.ObjectId, ref: 'Branch', index: true },
 
     // What this discount targets
     targetType: {
@@ -110,14 +111,14 @@ const discountMappingSchema = new mongoose.Schema(
   { timestamps: true }
 );
 
-// Indexes for fast lookup
-discountMappingSchema.index({ targetType: 1, status: 1 });
-discountMappingSchema.index({ product: 1, status: 1 });
-discountMappingSchema.index({ brand: 1, status: 1 });
-discountMappingSchema.index({ category: 1, status: 1 });
-discountMappingSchema.index({ subcategory: 1, status: 1 });
-discountMappingSchema.index({ validFrom: 1, validTo: 1 });
-discountMappingSchema.index({ priority: -1 });
+// Indexes for fast branch-scoped lookup
+discountMappingSchema.index({ branch: 1, targetType: 1, status: 1 });
+discountMappingSchema.index({ branch: 1, product: 1, status: 1 });
+discountMappingSchema.index({ branch: 1, brand: 1, status: 1 });
+discountMappingSchema.index({ branch: 1, category: 1, status: 1 });
+discountMappingSchema.index({ branch: 1, subcategory: 1, status: 1 });
+discountMappingSchema.index({ branch: 1, validFrom: 1, validTo: 1 });
+discountMappingSchema.index({ branch: 1, priority: -1 });
 
 /**
  * Static method: Find the best applicable discount for a product + dealerType
@@ -129,9 +130,11 @@ discountMappingSchema.index({ priority: -1 });
  * Within each level, highest priority wins.
  * Stops at the FIRST level that returns a valid match.
  */
-discountMappingSchema.statics.findBestDiscount = async function (productDoc, dealerType = 'dealer') {
+discountMappingSchema.statics.findBestDiscount = async function (productDoc, dealerType = 'dealer', branchId) {
+  if (!branchId) throw new Error('branch is required to resolve discounts.');
   const now = new Date();
   const baseFilter = {
+    branch: branchId,
     status: 'active',
     validFrom: { $lte: now },
     validTo: { $gte: now },
@@ -191,9 +194,11 @@ discountMappingSchema.statics.findBestDiscount = async function (productDoc, dea
  * Static method: Bulk resolve discounts for multiple products at once
  * More efficient than calling findBestDiscount one by one
  */
-discountMappingSchema.statics.bulkResolveDiscounts = async function (products, dealerType = 'dealer') {
+discountMappingSchema.statics.bulkResolveDiscounts = async function (products, dealerType = 'dealer', branchId) {
+  if (!branchId) throw new Error('branch is required to resolve discounts.');
   const now = new Date();
   const baseFilter = {
+    branch: branchId,
     status: 'active',
     validFrom: { $lte: now },
     validTo: { $gte: now },

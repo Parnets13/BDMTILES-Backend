@@ -5,21 +5,24 @@ import DispatchTrip from '../models/DispatchTrip.js';
 import SalesOrder from '../models/SalesOrder.js';
 import PickList from '../models/PickList.js';
 import DealerLedger from '../models/DealerLedger.js';
+import Invoice from '../models/Invoice.js';
 import { protect, requirePermission, requireAnyPermission, userHasPermission } from '../middleware/auth.js';
 import { requireBranch } from '../utils/branchScope.js';
 import { generateBranchNumber } from '../utils/branchSequence.js';
 import { postSubledgerEntry } from '../utils/subledgerPosting.js';
+import { QUANTITY_TOLERANCE } from '../utils/salesOrderInventory.js';
+import { applyDealerInvoiceAllocation } from '../services/dealerInvoicePaymentService.js';
 
 const router = Router();
 router.use(protect);
 router.use(requireBranch);
 
-router.get(['/', '/stats', '/:id'], requireAnyPermission('delivery.management', 'delivery.tracking'));
+router.get(['/', '/stats', '/:id'], requireAnyPermission('delivery.view', 'delivery.tracking'));
 router.post('/', requirePermission('delivery.assignment'));
-router.patch(
-  ['/:id/start', '/:id/reached', '/:id/verify-otp', '/:id/complete', '/:id/fail'],
-  requirePermission('delivery.management')
-);
+router.patch(['/:id/start', '/:id/reached'], requirePermission('delivery.execute'));
+router.patch('/:id/verify-otp', requirePermission('delivery.verify'));
+router.patch('/:id/complete', requirePermission('delivery.complete'));
+router.patch('/:id/fail', requirePermission('delivery.fail'));
 
 const terminalStatuses = ['delivered', 'partially_delivered', 'failed'];
 const deliveryScope = req => ({
@@ -59,6 +62,23 @@ const syncDispatchTrip = async (delivery, session = null) => {
     trip.status = 'in_transit';
   }
   await trip.save(session ? { session } : undefined);
+};
+
+const setSalesOrderDeliveryStatus = async (salesOrderId, branch, _hasDeliveryShortage, session) => {
+  const order = await SalesOrder.findOne({ _id: salesOrderId, branch }).session(session);
+  if (!order) return null;
+  const deliveries = await Delivery.find({ salesOrder: salesOrderId, branch }).sort({ createdAt: -1 }).session(session).lean();
+  const hasOpenDelivery = deliveries.some(delivery => ['assigned', 'in_transit', 'reached', 'rescheduled'].includes(delivery.status));
+  const latestStatus = deliveries[0]?.status;
+  const hasRemaining = order.items.some(item => Number(item.remainingQuantity || 0) > QUANTITY_TOLERANCE);
+  order.status = !hasRemaining && !hasOpenDelivery && latestStatus === 'delivered' ? 'delivered' : 'partial_dispatch';
+  await order.save({ session });
+  return order;
+};
+
+const isPodEvidenceReference = value => {
+  if (!value) return false;
+  return /^(https?:\/\/|data:image\/(?:png|jpeg|jpg|webp);base64,|\/?uploads\/)/i.test(value);
 };
 
 const stateConflict = (res, delivery, expected, action) => res.status(409).json({
@@ -169,7 +189,8 @@ router.get('/:id', async (req, res) => {
   try {
     const delivery = await findAccessibleDelivery(req, req.params.id)
       .select('-otp')
-      .populate('salesOrder', 'orderNumber grandTotal items')
+      .populate('salesOrder', 'orderNumber grandTotal items status deliveryAddress customerPhone')
+      .populate('dispatchTrip', 'tripNumber status vehicleNumber vehicleType driverName driverPhone routeName dispatchTime remarks orders finalDispatchVerification')
       .populate('deliveryExecutive', 'name phone')
       .populate('dealer', 'businessName dealerCode mobile address city')
       .lean();
@@ -216,10 +237,13 @@ router.patch('/:id/verify-otp', async (req, res) => {
     if (delivery.otpVerified) return res.json({ success: true, message: 'OTP already verified.', data: safeDelivery(delivery) });
     if (!['in_transit', 'reached'].includes(delivery.status)) return stateConflict(res, delivery, 'in_transit/reached', 'verify OTP');
     if (!req.body.otp || delivery.otp !== String(req.body.otp)) return res.status(400).json({ success: false, message: 'Invalid OTP.' });
-    delivery.otpVerified = true;
-    delivery.otpVerifiedAt = new Date();
-    await delivery.save();
-    res.json({ success: true, message: 'OTP verified.', data: safeDelivery(delivery) });
+    const updatedDelivery = await Delivery.findOneAndUpdate(
+      { _id: req.params.id, ...deliveryScope(req), status: { $in: ['in_transit', 'reached'] }, otpVerified: { $ne: true } },
+      { $set: { otpVerified: true, otpVerifiedAt: new Date() } },
+      { new: true, runValidators: true }
+    );
+    if (!updatedDelivery) return res.status(409).json({ success: false, message: 'Delivery changed while OTP was being verified. Refresh and retry.' });
+    res.json({ success: true, message: 'OTP verified.', data: safeDelivery(updatedDelivery) });
   } catch (e) { res.status(500).json({ success: false, message: e.message }); }
 });
 
@@ -237,11 +261,7 @@ router.patch('/:id/complete', async (req, res) => {
       if (['delivered', 'partially_delivered'].includes(current.status)) {
         if (current.salesOrder) {
           const hasDebt = current.hasFulfillmentShortage || current.status === 'partially_delivered';
-          await SalesOrder.findOneAndUpdate(
-            { _id: current.salesOrder, branch: current.branch },
-            { status: hasDebt ? 'partial_dispatch' : 'delivered' },
-            { session }
-          );
+          await setSalesOrderDeliveryStatus(current.salesOrder, current.branch, hasDebt, session);
         }
         await syncDispatchTrip(current, session);
         response = {
@@ -255,6 +275,30 @@ router.patch('/:id/complete', async (req, res) => {
           status: 409,
           body: { success: false, message: `Cannot complete delivery while delivery is "${current.status}". Expected "in_transit/reached".` },
         };
+        return;
+      }
+
+      const exceptionRequested = req.body.verificationException === true;
+      const exceptionReason = String(req.body.exceptionReason || '').trim();
+      if (exceptionRequested && !userHasPermission(req.user, 'delivery.exception')) {
+        response = { status: 403, body: { success: false, message: 'Delivery exception permission is required to bypass OTP or POD evidence.' } };
+        return;
+      }
+      if (exceptionRequested && !exceptionReason) {
+        response = { status: 422, body: { success: false, message: 'An explicit exception reason is required.' } };
+        return;
+      }
+      const receiverName = String(req.body.receiverName || '').trim();
+      const podImage = String(req.body.podImage || '').trim();
+      const podSignature = String(req.body.podSignature || '').trim();
+      const podDocumentUrl = String(req.body.podDocumentUrl || '').trim();
+      if (!exceptionRequested && !current.otpVerified) {
+        response = { status: 409, body: { success: false, message: 'Verify the delivery OTP before completion.' } };
+        return;
+      }
+      const hasValidPodEvidence = [podImage, podSignature, podDocumentUrl].some(isPodEvidenceReference);
+      if (!exceptionRequested && (!receiverName || !hasValidPodEvidence)) {
+        response = { status: 422, body: { success: false, message: 'Receiver name and at least one valid POD upload, image data, or HTTPS document URL are required.' } };
         return;
       }
 
@@ -284,8 +328,20 @@ router.patch('/:id/complete', async (req, res) => {
       claimedDelivery.deliveredBoxes = deliveredBoxes;
       claimedDelivery.shortBoxes = shortBoxes;
       claimedDelivery.damagedBoxes = damagedBoxes;
-      claimedDelivery.podImage = req.body.podImage || '';
-      claimedDelivery.podSignature = req.body.podSignature || '';
+      claimedDelivery.podImage = podImage;
+      claimedDelivery.podSignature = podSignature;
+      claimedDelivery.podDocumentUrl = podDocumentUrl;
+      claimedDelivery.receiverName = receiverName;
+      claimedDelivery.verificationException = exceptionRequested ? {
+        used: true,
+        reason: exceptionReason,
+        authorizedBy: req.user._id,
+        authorizedAt: new Date(),
+      } : { used: false };
+      claimedDelivery.discrepancies = [
+        ...(shortBoxes > 0 ? [{ type: 'short', boxes: shortBoxes, remarks: String(req.body.shortRemarks || ''), recordedBy: req.user._id, recordedAt: new Date() }] : []),
+        ...(damagedBoxes > 0 ? [{ type: 'damaged', boxes: damagedBoxes, remarks: String(req.body.damagedRemarks || ''), recordedBy: req.user._id, recordedAt: new Date() }] : []),
+      ];
       claimedDelivery.deliveryRemarks = req.body.deliveryRemarks || '';
       claimedDelivery.completionTime = new Date();
       const lat = Number(req.body.lat);
@@ -300,22 +356,29 @@ router.patch('/:id/complete', async (req, res) => {
           throw error;
         }
 
-        const Dealer = (await import('../models/Dealer.js')).default;
-        const salesOrder = await SalesOrder.findById(claimedDelivery.salesOrder).session(session).lean();
-        const dealer = await Dealer.findById(claimedDelivery.dealer).session(session).lean();
+        const invoice = await Invoice.findOne({
+          branch: claimedDelivery.branch,
+          salesOrder: claimedDelivery.salesOrder,
+          status: { $ne: 'cancelled' },
+        }).session(session).lean();
+        if (!invoice) {
+          const error = new Error('Generate the fully dispatched customer invoice before collecting payment at delivery.');
+          error.status = 409;
+          throw error;
+        }
         const [branchLedger] = await DealerLedger.aggregate([
           { $match: { branch: claimedDelivery.branch, dealer: claimedDelivery.dealer } },
           { $group: { _id: null, debit: { $sum: '$debit' }, credit: { $sum: '$credit' } } },
         ]).session(session);
-        const orderBalance = Number(salesOrder?.balanceAmount ?? salesOrder?.grandTotal ?? 0);
+        const invoiceBalance = Number(invoice.balanceAmount || 0);
         const dealerOutstanding = Number((branchLedger?.debit || 0) - (branchLedger?.credit || 0));
-        const receivableLimit = Math.min(orderBalance, dealerOutstanding);
-        if (!(orderBalance > 0) || !(dealerOutstanding > 0)) {
-          const error = new Error('This Sales Order or dealer has no collectible outstanding balance.');
+        const receivableLimit = Math.min(invoiceBalance, dealerOutstanding);
+        if (!(invoiceBalance > 0) || !(dealerOutstanding > 0)) {
+          const error = new Error('This customer invoice or dealer has no collectible outstanding balance.');
           error.status = 409;
           throw error;
         }
-        if (collectedAmount > receivableLimit) {
+        if (collectedAmount > receivableLimit + 0.01) {
           const error = new Error(`Collection cannot exceed the authoritative outstanding amount of ${receivableLimit}.`);
           error.status = 409;
           throw error;
@@ -328,6 +391,7 @@ router.patch('/:id/complete', async (req, res) => {
           throw error;
         }
         const paymentModeForLedger = paymentMode === 'bank_transfer' ? 'neft' : paymentMode;
+        const paymentStatus = paymentMode === 'cheque' ? 'pending' : 'confirmed';
         claimedDelivery.paymentCollected = true;
         claimedDelivery.collectedAmount = collectedAmount;
         claimedDelivery.paymentMode = paymentMode;
@@ -335,7 +399,7 @@ router.patch('/:id/complete', async (req, res) => {
         claimedDelivery.utrNumber = req.body.utrNumber || '';
 
         const Payment = (await import('../models/Payment.js')).default;
-        const paymentNumber = await generateBranchNumber(req.branchId, 'payment', new Date());
+        const paymentNumber = await generateBranchNumber(req.branchId, 'payment', new Date(), { session });
         const [payment] = await Payment.create([{
           paymentNumber,
           branch: claimedDelivery.branch,
@@ -343,15 +407,15 @@ router.patch('/:id/complete', async (req, res) => {
           paymentType: 'dealer_receipt',
           dealer: claimedDelivery.dealer,
           againstOrders: [{
-            order: claimedDelivery.salesOrder,
-            orderModel: 'SalesOrder',
-            orderNumber: claimedDelivery.orderNumber,
+            order: invoice._id,
+            orderModel: 'Invoice',
+            orderNumber: invoice.invoiceNumber,
             allocatedAmount: collectedAmount,
           }],
           amount: collectedAmount,
           paymentMode: paymentModeForLedger,
           paymentDate: new Date(),
-          status: 'confirmed',
+          status: paymentStatus,
           remarks: `Collected at delivery ${claimedDelivery.deliveryNumber}`,
           chequeNumber: claimedDelivery.chequeNumber,
           transactionRef: claimedDelivery.utrNumber || claimedDelivery.chequeNumber || claimedDelivery.deliveryNumber,
@@ -359,44 +423,30 @@ router.patch('/:id/complete', async (req, res) => {
           createdBy: req.user._id,
         }], { session });
 
-        await postSubledgerEntry({
-          session,
-          branch: claimedDelivery.branch,
-          partyType: 'dealer',
-          partyId: claimedDelivery.dealer,
-          amount: collectedAmount,
-          side: 'credit',
-          postingKey: `payment:${payment._id}:confirmed`,
-          entryType: 'payment',
-          entryDate: payment.paymentDate,
-          description: `Dealer receipt ${payment.paymentNumber} collected at delivery ${claimedDelivery.deliveryNumber}`,
-          referenceNumber: payment.paymentNumber,
-          referenceModel: 'Payment',
-          referenceId: payment._id,
-          createdBy: req.user._id,
-        });
-
-        const updatedSalesOrder = await SalesOrder.findOneAndUpdate(
-          { _id: claimedDelivery.salesOrder, branch: claimedDelivery.branch, balanceAmount: { $gte: collectedAmount } },
-          [
-            {
-              $set: {
-                balanceAmount: { $subtract: ['$balanceAmount', collectedAmount] },
-                advanceAmount: { $add: [{ $ifNull: ['$advanceAmount', 0] }, collectedAmount] },
-              },
-            },
-            {
-              $set: {
-                paymentStatus: { $cond: [{ $lte: ['$balanceAmount', 0] }, 'paid', 'partial'] },
-              },
-            },
-          ],
-          { new: true, session }
-        );
-        if (!updatedSalesOrder) {
-          const error = new Error('Sales Order balance changed while collection was being posted. Refresh and retry.');
-          error.status = 409;
-          throw error;
+        if (payment.status === 'confirmed') {
+          await postSubledgerEntry({
+            session,
+            branch: claimedDelivery.branch,
+            partyType: 'dealer',
+            partyId: claimedDelivery.dealer,
+            amount: collectedAmount,
+            side: 'credit',
+            postingKey: `payment:${payment._id}:confirmed`,
+            entryType: 'payment',
+            entryDate: payment.paymentDate,
+            description: `Dealer receipt ${payment.paymentNumber} collected at delivery ${claimedDelivery.deliveryNumber}`,
+            referenceNumber: payment.paymentNumber,
+            referenceModel: 'Payment',
+            referenceId: payment._id,
+            createdBy: req.user._id,
+          });
+          await applyDealerInvoiceAllocation({
+            invoiceId: invoice._id,
+            branch: claimedDelivery.branch,
+            dealer: claimedDelivery.dealer,
+            amount: collectedAmount,
+            session,
+          });
         }
       }
 
@@ -405,11 +455,7 @@ router.patch('/:id/complete', async (req, res) => {
       await claimedDelivery.save({ session });
       if (claimedDelivery.salesOrder) {
         const hasDebt = claimedDelivery.hasFulfillmentShortage || claimedDelivery.status === 'partially_delivered';
-        await SalesOrder.findByIdAndUpdate(
-          claimedDelivery.salesOrder,
-          { status: hasDebt ? 'partial_dispatch' : 'delivered' },
-          { session }
-        );
+        await setSalesOrderDeliveryStatus(claimedDelivery.salesOrder, claimedDelivery.branch, hasDebt, session);
       }
       await syncDispatchTrip(claimedDelivery, session);
       response = {

@@ -7,7 +7,7 @@ import Product from '../models/Product.js';
 import Dealer from '../models/Dealer.js';
 import DealerType from '../models/DealerType.js';
 import { resolvePricing } from '../services/pricingResolver.js';
-import { protect, requirePermission } from '../middleware/auth.js';
+import { protect, requirePermission, requireAnyPermission } from '../middleware/auth.js';
 import { requireBranch } from '../utils/branchScope.js';
 import { roundMoney } from '../utils/pricingCalculations.js';
 
@@ -228,7 +228,7 @@ async function applyPreview({ branchId, preview, body, userId, action, scheduleI
 }
 
 // GET /api/v1/dealer-pricing
-router.get('/', requirePermission('product.master'), async (req, res) => {
+router.get('/', requirePermission('dealer.discounts'), async (req, res) => {
   try {
     const { dealer, dealerType, scope, product, page = 1, limit = 50, isActive } = req.query;
     const p = Math.max(1, Number.parseInt(page, 10) || 1);
@@ -251,7 +251,7 @@ router.get('/', requirePermission('product.master'), async (req, res) => {
 });
 
 // GET /api/v1/dealer-pricing/effective-rate
-router.get('/effective-rate', requirePermission('sales.order.create'), async (req, res) => {
+router.get('/effective-rate', requireAnyPermission('sales.order.create', 'quotation.management'), async (req, res) => {
   try {
     if (!req.query.product) throw routeError(422, 'product is required.');
     const target = parseTarget(req.query);
@@ -267,7 +267,7 @@ router.get('/effective-rate', requirePermission('sales.order.create'), async (re
 });
 
 // GET /api/v1/dealer-pricing/catalog
-router.get('/catalog', requirePermission('product.master'), async (req, res) => {
+router.get('/catalog', requirePermission('dealer.discounts'), async (req, res) => {
   try {
     const target = await validateTarget(parseTarget(req.query));
     const p = Math.max(1, Number.parseInt(req.query.page, 10) || 1);
@@ -313,7 +313,7 @@ router.get('/catalog', requirePermission('product.master'), async (req, res) => 
   } catch (error) { return sendError(res, error); }
 });
 
-router.post('/preview-bulk', requirePermission('product.master'), async (req, res) => {
+router.post('/preview-bulk', requirePermission('dealer.discounts'), async (req, res) => {
   try {
     const preview = await previewBulk(req.branchId, req.body || {});
     return res.json({ success: true, data: { rows: preview.rows, summary: preview.summary } });
@@ -323,7 +323,7 @@ router.post('/preview-bulk', requirePermission('product.master'), async (req, re
   }
 });
 
-router.post('/apply-bulk', requirePermission('product.master'), async (req, res) => {
+router.post('/apply-bulk', requirePermission('dealer.discounts'), async (req, res) => {
   try {
     const body = req.body || {};
     let preview = await previewBulk(req.branchId, body);
@@ -364,7 +364,7 @@ router.post('/apply-bulk', requirePermission('product.master'), async (req, res)
   }
 });
 
-router.get('/history', requirePermission('product.master'), async (req, res) => {
+router.get('/history', requirePermission('dealer.discounts'), async (req, res) => {
   try {
     const p = Math.max(1, Number.parseInt(req.query.page, 10) || 1);
     const l = Math.min(200, Math.max(1, Number.parseInt(req.query.limit, 10) || 50));
@@ -383,7 +383,7 @@ router.get('/history', requirePermission('product.master'), async (req, res) => 
   } catch (error) { return sendError(res, error); }
 });
 
-router.get('/schedules', requirePermission('product.master'), async (req, res) => {
+router.get('/schedules', requirePermission('dealer.discounts'), async (req, res) => {
   try {
     const p = Math.max(1, Number.parseInt(req.query.page, 10) || 1);
     const l = Math.min(200, Math.max(1, Number.parseInt(req.query.limit, 10) || 50));
@@ -411,7 +411,7 @@ router.get('/schedules', requirePermission('product.master'), async (req, res) =
   } catch (error) { return sendError(res, error); }
 });
 
-router.delete('/schedules/:id', requirePermission('product.master'), async (req, res) => {
+router.delete('/schedules/:id', requirePermission('dealer.discounts'), async (req, res) => {
   try {
     const schedule = await DealerPricingSchedule.findOneAndUpdate(
       { _id: req.params.id, branch: req.branchId, status: 'pending' },
@@ -423,7 +423,7 @@ router.delete('/schedules/:id', requirePermission('product.master'), async (req,
   } catch (error) { return sendError(res, error); }
 });
 
-router.post('/apply-due-schedules', requirePermission('product.master'), async (req, res) => {
+router.post('/apply-due-schedules', requirePermission('dealer.discounts'), async (req, res) => {
   try {
     const due = await DealerPricingSchedule.find({ branch: req.branchId, status: 'pending', applyAt: { $lte: new Date() } }).sort({ applyAt: 1 });
     const results = [];
@@ -464,7 +464,7 @@ router.post('/apply-due-schedules', requirePermission('product.master'), async (
   } catch (error) { return sendError(res, error); }
 });
 
-router.post('/', requirePermission('product.master'), async (req, res) => {
+router.post('/', requirePermission('dealer.discounts'), async (req, res) => {
   const session = await mongoose.startSession();
   try {
     const auditReason = String(req.body.reason || '').trim();
@@ -505,7 +505,7 @@ router.post('/', requirePermission('product.master'), async (req, res) => {
   finally { await session.endSession(); }
 });
 
-router.put('/:id', requirePermission('product.master'), async (req, res) => {
+router.put('/:id', requirePermission('dealer.discounts'), async (req, res) => {
   const session = await mongoose.startSession();
   try {
     const auditReason = String(req.body.reason || '').trim();
@@ -546,7 +546,7 @@ router.put('/:id', requirePermission('product.master'), async (req, res) => {
   finally { await session.endSession(); }
 });
 
-router.delete('/:id', requirePermission('product.master'), async (req, res) => {
+router.delete('/:id', requirePermission('dealer.discounts'), async (req, res) => {
   const session = await mongoose.startSession();
   try {
     let pricing;
@@ -564,7 +564,7 @@ router.delete('/:id', requirePermission('product.master'), async (req, res) => {
   finally { await session.endSession(); }
 });
 
-router.get('/bulk-by-dealer/:dealerId', requirePermission('product.master'), async (req, res) => {
+router.get('/bulk-by-dealer/:dealerId', requirePermission('dealer.discounts'), async (req, res) => {
   try {
     const target = await validateTarget({ scope: 'dealer', dealer: req.params.dealerId });
     const overrides = await DealerPricing.find({ branch: req.branchId, dealer: target.dealer, isActive: true })

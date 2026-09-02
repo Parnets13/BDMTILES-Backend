@@ -21,7 +21,7 @@ const dealerLedgerSchema = new mongoose.Schema(
     entryDate: { type: Date, default: Date.now },
     description: { type: String, default: '' },
     referenceNumber: String, // SO number, RCP number, CN number etc.
-    referenceModel: { type: String, enum: ['SalesOrder', 'Payment', 'SalesReturn', 'PurchaseReturn', ''] },
+    referenceModel: { type: String, enum: ['SalesOrder', 'Payment', 'SalesReturn', 'PurchaseReturn', 'SchemeSettlement', ''] },
     referenceId: { type: mongoose.Schema.Types.ObjectId },
     postingKey: { type: String, trim: true },
     reversalOf: { type: mongoose.Schema.Types.ObjectId, ref: 'DealerLedger' },

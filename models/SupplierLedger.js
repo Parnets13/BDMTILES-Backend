@@ -20,7 +20,7 @@ const supplierLedgerSchema = new mongoose.Schema(
     entryDate: { type: Date, default: Date.now },
     description: { type: String, default: '' },
     referenceNumber: String,
-    referenceModel: { type: String, enum: ['PurchaseOrder', 'GRN', 'Payment', 'PurchaseReturn', 'SupplierInvoice', ''] },
+    referenceModel: { type: String, enum: ['PurchaseOrder', 'GRN', 'Payment', 'PurchaseReturn', 'SupplierInvoice', 'SchemeSettlement', ''] },
     referenceId: { type: mongoose.Schema.Types.ObjectId },
     postingKey: { type: String, trim: true },
     reversalOf: { type: mongoose.Schema.Types.ObjectId, ref: 'SupplierLedger' },

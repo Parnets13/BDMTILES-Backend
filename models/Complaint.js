@@ -24,9 +24,23 @@ const warehouseVerificationSchema = new mongoose.Schema({
 
   // Photos — warehouse uploads evidence photos
   photos: [{
+    evidence: { type: mongoose.Schema.Types.ObjectId, ref: 'ComplaintEvidence' },
     url: String,
     caption: String,
     uploadedAt: { type: Date, default: Date.now },
+  }],
+
+  // Exact invoice-linked receipt lines for complaint-origin returns. Optional for legacy records.
+  items: [{
+    complaintItem: { type: mongoose.Schema.Types.ObjectId },
+    invoiceItem: { type: mongoose.Schema.Types.ObjectId },
+    product: { type: mongoose.Schema.Types.ObjectId, ref: 'Product' },
+    warehouse: { type: mongoose.Schema.Types.ObjectId, ref: 'Warehouse' },
+    receivedQty: { type: Number, min: 0 },
+    damagedQty: { type: Number, min: 0, default: 0 },
+    returnQty: { type: Number, min: 0 },
+    condition: { type: String, enum: ['resaleable', 'damaged', 'scrap'] },
+    remarks: { type: String, default: '' },
   }],
 
   // Product condition
@@ -71,6 +85,7 @@ const complaintSchema = new mongoose.Schema(
 
     // Products complained about
     products: [{
+      invoiceItem: { type: mongoose.Schema.Types.ObjectId },
       product: { type: mongoose.Schema.Types.ObjectId, ref: 'Product' },
       productName: String,
       productCode: String,
@@ -92,7 +107,7 @@ const complaintSchema = new mongoose.Schema(
     // Status workflow: open → warehouse_pending → warehouse_verified → finance_review → resolved/closed/rejected
     status: {
       type: String,
-      enum: ['open', 'acknowledged', 'warehouse_pending', 'warehouse_verified', 'finance_review', 'in_progress', 'resolved', 'closed', 'rejected'],
+      enum: ['open', 'acknowledged', 'warehouse_pending', 'warehouse_verified', 'finance_review', 'in_progress', 'refund_pending', 'replacement_pending', 'resolved', 'closed', 'rejected', 'return_reversed'],
       default: 'open',
     },
 
@@ -102,6 +117,9 @@ const complaintSchema = new mongoose.Schema(
 
     // Warehouse Verification (the key new feature)
     warehouseVerification: warehouseVerificationSchema,
+    sentToWarehouseBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User' },
+    sentToWarehouseByName: String,
+    sentToWarehouseAt: Date,
 
     // Accountant Review
     accountantReview: accountantReviewSchema,
@@ -118,6 +136,22 @@ const complaintSchema = new mongoose.Schema(
     creditNoteIssued: { type: Boolean, default: false },
     creditNoteAmount: { type: Number, default: 0 },
     creditNoteNumber: String,
+
+    // Posted return documents are authoritative; scalar note fields above remain for legacy reads.
+    salesReturn: { type: mongoose.Schema.Types.ObjectId, ref: 'SalesReturn' },
+    purchaseReturn: { type: mongoose.Schema.Types.ObjectId, ref: 'PurchaseReturn' },
+    purchaseLineage: {
+      requested: { type: Boolean, default: false },
+      supplierInvoice: { type: mongoose.Schema.Types.ObjectId, ref: 'SupplierInvoice' },
+      grn: { type: mongoose.Schema.Types.ObjectId, ref: 'GRN' },
+      purchaseOrder: { type: mongoose.Schema.Types.ObjectId, ref: 'PurchaseOrder' },
+      items: [{
+        supplierInvoiceItem: mongoose.Schema.Types.ObjectId,
+        grnItem: mongoose.Schema.Types.ObjectId,
+        purchaseOrderItem: mongoose.Schema.Types.ObjectId,
+        quantity: Number,
+      }],
+    },
 
     // Dealer-uploaded photos (initial complaint evidence)
     complaintPhotos: [{ url: String, caption: String }],

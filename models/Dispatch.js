@@ -12,6 +12,7 @@ const dispatchItemSchema = new mongoose.Schema({
 const dispatchSchema = new mongoose.Schema(
   {
     dispatchNumber: { type: String, unique: true, required: true },
+    branch: { type: mongoose.Schema.Types.ObjectId, ref: 'Branch', index: true },
     dispatchDate: { type: Date, default: Date.now },
     vehicle: { type: String, default: '' },
     driverName: { type: String, default: '' },
@@ -34,7 +35,7 @@ const dispatchSchema = new mongoose.Schema(
   { timestamps: true }
 );
 
-dispatchSchema.index({ dispatchNumber: 1 });
-dispatchSchema.index({ status: 1, dispatchDate: -1 });
+dispatchSchema.index({ branch: 1, dispatchNumber: 1 });
+dispatchSchema.index({ branch: 1, status: 1, dispatchDate: -1 });
 
 export default mongoose.model('Dispatch', dispatchSchema);

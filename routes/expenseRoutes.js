@@ -57,6 +57,22 @@ router.get('/stats', requirePermission('expense.management'), async (req, res) =
   } catch (e) { res.status(500).json({ success: false, message: e.message }); }
 });
 
+// GET /api/v1/expenses/:id
+router.get('/:id', requirePermission('expense.management'), async (req, res) => {
+  try {
+    const expense = await Expense.findOne({ _id: req.params.id, branch: req.branchId })
+      .populate('employee', 'name employeeCode department mobile')
+      .populate('approvalManager', 'name email')
+      .populate('approvedBy', 'name email')
+      .populate('createdBy', 'name email')
+      .lean();
+    if (!expense) return res.status(404).json({ success: false, message: 'Expense not found.' });
+    return res.json({ success: true, data: expense });
+  } catch (e) {
+    return res.status(e.name === 'CastError' ? 422 : 500).json({ success: false, message: e.name === 'CastError' ? 'Invalid expense identifier.' : e.message });
+  }
+});
+
 // POST /api/v1/expenses
 router.post('/', requirePermission('expense.management'), async (req, res) => {
   try {

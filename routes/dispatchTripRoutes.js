@@ -8,6 +8,7 @@ import Stock from '../models/Stock.js';
 import { protect, requirePermission } from '../middleware/auth.js';
 import { requireBranch } from '../utils/branchScope.js';
 import { generateBranchNumber } from '../utils/branchSequence.js';
+import { QUANTITY_TOLERANCE, refreshSalesOrderLine, salesOrderIsFullyDispatched } from '../utils/salesOrderInventory.js';
 
 const router = Router();
 router.use(protect);
@@ -69,14 +70,12 @@ router.get('/ready-orders', async (req, res) => {
   try {
     const page = Math.max(1, parseInt(req.query.page) || 1);
     const limit = Math.min(50, Math.max(1, parseInt(req.query.limit) || 20));
-    const claimedSalesOrders = await DispatchTrip.distinct('orders.salesOrder', { branch: req.branchId, status: { $ne: 'cancelled' } });
     const filter = {
       branch: req.branchId,
       status: 'ready_for_dispatch',
       stockConsumedAt: null,
       dispatchTrip: null,
       cancellationProcessing: { $ne: true },
-      salesOrder: { $nin: claimedSalesOrders.filter(Boolean) },
     };
     if (req.query.search) {
       const regex = new RegExp(String(req.query.search), 'i');
@@ -124,8 +123,19 @@ router.post('/', async (req, res) => {
     if (pickLists.length !== expectedPickListCount || pickLists.some(item => !item.salesOrder)) {
       return res.status(409).json({ success: false, message: 'Every selected pick list must still be unclaimed, ready, and linked to a sales order.' });
     }
+    const salesOrderIds = pickLists.map(item => String(item.salesOrder._id));
+    if (new Set(salesOrderIds).size !== salesOrderIds.length) {
+      return res.status(422).json({ success: false, message: 'Use only one pick list per Sales Order in a dispatch trip.' });
+    }
 
-    const orders = pickLists.map((pickList, index) => ({
+    const orders = pickLists.map((pickList, index) => {
+      const unresolvedSortingItem = (pickList.items || []).find(item => item.sortingVerifiedAt && (Number(item.sortingShortQty || 0) > QUANTITY_TOLERANCE || Number(item.sortingDamagedQty || 0) > QUANTITY_TOLERANCE));
+      if (unresolvedSortingItem) {
+        const error = new Error(`${pickList.pickListNumber} has unresolved sorting discrepancies for ${unresolvedSortingItem.productName}.`);
+        error.status = 409;
+        throw error;
+      }
+      return ({
       pickList: pickList._id,
       salesOrder: pickList.salesOrder._id,
       orderNumber: pickList.orderNumber || pickList.salesOrder.orderNumber,
@@ -136,8 +146,22 @@ router.post('/', async (req, res) => {
       totalBoxes: pickList.totalBoxes,
       totalWeight: pickList.totalWeight || 0,
       pickListNumber: pickList.pickListNumber,
+      loadingItems: (pickList.items || []).filter(item => Number(item.sortingVerifiedAt ? item.sortedQty : item.pickedQty || 0) > 0).map(item => ({
+        pickListItem: item._id,
+        salesOrderItem: item.salesOrderItem,
+        product: item.product,
+        productCode: item.productCode || '',
+        productName: item.productName || '',
+        productImage: item.productImage || '',
+        quantity: Number(item.sortingVerifiedAt ? item.sortedQty : item.pickedQty || 0),
+        unit: item.unit || 'Box',
+        shade: item.shade || '',
+        batch: item.batch || '',
+        boxContext: pickList.totalBoxes ? `${pickList.totalBoxes} box(es) for pick list` : '',
+      })),
       sequence: index + 1,
-    }));
+    });
+    });
 
     tripId = new mongoose.Types.ObjectId();
     const tripNumber = await generateBranchNumber(req.branchId, 'dispatchTrip', new Date());
@@ -180,7 +204,7 @@ router.post('/', async (req, res) => {
   } catch (e) {
     if (tripId && claimedPickListIds.length) {
       await PickList.updateMany(
-        { _id: { $in: claimedPickListIds }, dispatchTrip: tripId, stockConsumedAt: null },
+        { _id: { $in: claimedPickListIds }, branch: req.branchId, dispatchTrip: tripId, stockConsumedAt: null },
         { $unset: { dispatchTrip: 1, tripClaimedAt: 1 }, $set: { dispatchTripNumber: '' } }
       );
     }
@@ -194,11 +218,38 @@ router.get('/:id', async (req, res) => {
     const trip = await DispatchTrip.findOne({ _id: req.params.id, branch: req.branchId })
       .populate('vehicle', 'vehicleNumber vehicleType capacity')
       .populate('deliveryExecutive', 'name phone')
-      .populate('loadingSupervisor', 'name')
-      .populate('orders.pickList', 'pickListNumber status totalBoxes')
-      .populate('orders.salesOrder', 'orderNumber dealerName grandTotal items')
+      .populate('loadingSupervisor', 'name phone')
+      .populate('finalDispatchVerification.verifiedBy', 'name phone')
+      .populate('orders.pickList', 'pickListNumber status totalBoxes totalWeight items supervisorRemarks remarks sortedBy sortingStartTime sortingEndTime packingEndTime')
+      .populate('orders.salesOrder', 'orderNumber dealerName customerName customerPhone deliveryAddress status grandTotal items')
       .lean();
     if (!trip) return res.status(404).json({ success: false, message: 'Trip not found.' });
+    trip.orders = (trip.orders || []).map(order => {
+      const loadingItems = order.loadingItems?.length ? order.loadingItems : (order.pickList?.items || []).filter(item => Number(item.pickedQty || 0) > 0).map(item => ({
+        pickListItem: item._id,
+        salesOrderItem: item.salesOrderItem,
+        product: item.product,
+        productCode: item.productCode,
+        productName: item.productName,
+        productImage: item.productImage || '',
+        quantity: item.pickedQty,
+        unit: item.unit,
+        shade: item.shade,
+        batch: item.batch,
+        boxContext: order.totalBoxes ? `${order.totalBoxes} box(es) for order` : '',
+      }));
+      return {
+        ...order,
+        loadingItems: loadingItems.map(item => {
+          const salesOrderLine = order.salesOrder?.items?.find(line => String(line._id) === String(item.salesOrderItem));
+          return {
+            ...item,
+            salesOrderQuantity: Number(salesOrderLine?.quantity || 0),
+            salesOrderDispatchedQuantity: Number(salesOrderLine?.dispatchedQuantity || 0),
+          };
+        }),
+      };
+    });
     res.json({ success: true, data: trip });
   } catch (e) { res.status(500).json({ success: false, message: e.message }); }
 });
@@ -257,6 +308,50 @@ router.patch('/:id/verify-loading', async (req, res) => {
   } catch (e) { res.status(500).json({ success: false, message: e.message }); }
 });
 
+router.patch('/:id/verify-dispatch', requirePermission('dispatch.verify'), async (req, res) => {
+  try {
+    const current = await DispatchTrip.findOne({ _id: req.params.id, branch: req.branchId });
+    if (!current) return res.status(404).json({ success: false, message: 'Trip not found.' });
+    if (current.finalDispatchVerification?.completed) {
+      return res.json({ success: true, message: 'Final dispatch verification already completed.', data: current });
+    }
+    if (current.status !== 'loaded' || !current.loadingVerified || current.orders.some(order => !order.loadingVerified || order.loadedBoxes !== order.totalBoxes)) {
+      return res.status(409).json({ success: false, message: 'Complete authoritative loading verification before final dispatch verification.' });
+    }
+    const finalOrderCount = Number(req.body.finalOrderCount);
+    const finalBoxCount = Number(req.body.finalBoxCount);
+    if (finalOrderCount !== current.totalOrders || finalBoxCount !== current.totalBoxes) {
+      return res.status(422).json({ success: false, message: `Final counts must match ${current.totalOrders} orders and ${current.totalBoxes} boxes.` });
+    }
+    const requiredChecks = ['vehicleConfirmed', 'sealConfirmed', 'invoiceConfirmed', 'eWayBillConfirmed', 'lrDocumentConfirmed'];
+    if (requiredChecks.some(field => req.body[field] !== true)) {
+      return res.status(422).json({ success: false, message: 'Confirm vehicle, seal, invoice, e-way bill, and LR/document checks.' });
+    }
+    const verifiedAt = new Date();
+    const verification = {
+      vehicleConfirmed: true,
+      sealConfirmed: true,
+      sealNumber: String(req.body.sealNumber || ''),
+      invoiceConfirmed: true,
+      eWayBillConfirmed: true,
+      lrDocumentConfirmed: true,
+      finalOrderCount,
+      finalBoxCount,
+      remarks: String(req.body.remarks || ''),
+      verifiedBy: req.user._id,
+      verifiedAt,
+      completed: true,
+    };
+    const trip = await DispatchTrip.findOneAndUpdate(
+      { _id: current._id, branch: req.branchId, status: 'loaded', loadingVerified: true, 'finalDispatchVerification.completed': { $ne: true }, stockDeductedAt: null },
+      { $set: { finalDispatchVerification: verification } },
+      { new: true, runValidators: true }
+    );
+    if (!trip) return res.status(409).json({ success: false, message: 'Trip changed during final verification. Refresh and retry.' });
+    return res.json({ success: true, message: 'Final dispatch checklist verified. Stock-consuming dispatch is now enabled.', data: trip });
+  } catch (e) { return res.status(['CastError', 'ValidationError'].includes(e.name) ? 422 : 500).json({ success: false, message: e.message }); }
+});
+
 router.patch('/:id/dispatch', async (req, res) => {
   const session = await mongoose.startSession();
   let response;
@@ -276,9 +371,15 @@ router.patch('/:id/dispatch', async (req, res) => {
         response = { status: 409, body: { success: false, message: 'Dispatch requires a loaded trip with every order and box explicitly verified.' } };
         return;
       }
+      if (!current.finalDispatchVerification?.completed
+          || current.finalDispatchVerification.finalOrderCount !== current.totalOrders
+          || current.finalDispatchVerification.finalBoxCount !== current.totalBoxes) {
+        response = { status: 409, body: { success: false, message: 'Complete the separate final dispatch checklist before stock-consuming dispatch.' } };
+        return;
+      }
 
       const lockedTrip = await DispatchTrip.findOneAndUpdate(
-        { _id: current._id, branch: req.branchId, status: 'loaded', loadingVerified: true, dispatchProcessing: { $ne: true }, stockDeductedAt: null },
+        { _id: current._id, branch: req.branchId, status: 'loaded', loadingVerified: true, 'finalDispatchVerification.completed': true, dispatchProcessing: { $ne: true }, stockDeductedAt: null },
         { $set: { dispatchProcessing: true } },
         { new: true, session }
       );
@@ -343,11 +444,13 @@ router.patch('/:id/dispatch', async (req, res) => {
           throw new Error(`${order.pickListNumber || order.orderNumber} is no longer ready for dispatch.`);
         }
         for (const item of pickList.items) {
-          const quantity = Number(item.pickedQty);
+          if (item.sortingVerifiedAt && (Number(item.sortingShortQty || 0) > QUANTITY_TOLERANCE || Number(item.sortingDamagedQty || 0) > QUANTITY_TOLERANCE)) {
+            throw new Error(`${pickList.pickListNumber} has unresolved sorting discrepancies for ${item.productName}.`);
+          }
+          const quantity = Number(item.sortingVerifiedAt ? item.sortedQty : item.pickedQty);
           if (!(quantity > 0)) continue;
           if (!item.product || !item.warehouse) throw new Error(`Missing warehouse allocation for ${item.productName}.`);
-          const mode = pickList.stockReserved ? 'reserved' : 'available';
-          const key = [item.product, item.warehouse, item.shade || '', item.batch || '', mode].map(String).join('|');
+          const key = [item.product, item.warehouse, item.shade || '', item.batch || ''].map(String).join('|');
           const existing = requirements.get(key);
           if (existing) existing.quantity += quantity;
           else requirements.set(key, {
@@ -358,13 +461,11 @@ router.patch('/:id/dispatch', async (req, res) => {
             batch: item.batch || '',
             productName: item.productName || item.productCode || 'item',
             quantity,
-            mode,
           });
         }
       }
 
       for (const requirement of requirements.values()) {
-        const quantityField = requirement.mode === 'reserved' ? 'reservedQty' : 'availableQty';
         const stock = await Stock.findOneAndUpdate(
           {
             branch: requirement.branch,
@@ -372,28 +473,59 @@ router.patch('/:id/dispatch', async (req, res) => {
             warehouse: requirement.warehouse,
             shade: requirement.shade,
             batch: requirement.batch,
-            [quantityField]: { $gte: requirement.quantity },
+            reservedQty: { $gte: requirement.quantity },
             totalQty: { $gte: requirement.quantity },
           },
-          { $inc: { [quantityField]: -requirement.quantity, totalQty: -requirement.quantity }, $set: { lastSaleDate: new Date() } },
+          { $inc: { reservedQty: -requirement.quantity, totalQty: -requirement.quantity }, $set: { lastSaleDate: new Date() } },
           { new: true, session }
         );
-        if (!stock) throw new Error(`Insufficient ${requirement.mode} stock for ${requirement.productName} (shade ${requirement.shade || 'default'}, batch ${requirement.batch || 'default'}).`);
+        if (!stock) throw new Error(`Insufficient reserved stock for ${requirement.productName} (shade ${requirement.shade || 'default'}, batch ${requirement.batch || 'default'}).`);
       }
 
       const dispatchedAt = new Date();
       for (const order of lockedTrip.orders) {
         const pickList = pickListById.get(String(order.pickList));
-        const salesOrder = pickList.salesOrder;
+        const salesOrder = await SalesOrder.findOne({ _id: pickList.salesOrder._id, branch: req.branchId }).session(session);
+        if (!salesOrder) throw new Error(`Sales Order ${order.orderNumber} is unavailable.`);
+        const lifecycleManaged = salesOrder.reservationStatus !== 'none'
+          || salesOrder.items.some(item => Number(item.reservedQuantity || 0) > QUANTITY_TOLERANCE);
+        for (const pickItem of pickList.items) {
+          const quantity = Number(pickItem.sortingVerifiedAt ? pickItem.sortedQty : pickItem.pickedQty || 0);
+          if (!(quantity > QUANTITY_TOLERANCE)) continue;
+          let orderLine = pickItem.salesOrderItem ? salesOrder.items.id(pickItem.salesOrderItem) : null;
+          if (!orderLine) {
+            const matches = salesOrder.items.filter(line =>
+              String(line.product) === String(pickItem.product)
+              && String(line.warehouse || '') === String(pickItem.warehouse || '')
+              && String(line.shade || '') === String(pickItem.shade || '')
+              && String(line.batch || '') === String(pickItem.batch || '')
+            );
+            if (matches.length !== 1) throw new Error(`Cannot resolve the source Sales Order item for ${pickItem.productName}.`);
+            [orderLine] = matches;
+            pickItem.salesOrderItem = orderLine._id;
+          }
+          if (lifecycleManaged && (
+            Number(orderLine.reservedQuantity || 0) + QUANTITY_TOLERANCE < quantity
+            || Number(orderLine.allocatedQuantity || 0) + QUANTITY_TOLERANCE < quantity
+          )) throw new Error(`Sales Order reservation changed for ${pickItem.productName}.`);
+          orderLine.reservedQuantity = Math.max(0, Number(orderLine.reservedQuantity || 0) - quantity);
+          orderLine.allocatedQuantity = Math.max(0, Number(orderLine.allocatedQuantity || 0) - quantity);
+          orderLine.dispatchedQuantity = Number(orderLine.dispatchedQuantity || 0) + quantity;
+          refreshSalesOrderLine(orderLine);
+          pickItem.dispatchedQty = quantity;
+        }
+        const fullyDispatched = salesOrderIsFullyDispatched(salesOrder);
+        salesOrder.status = fullyDispatched ? 'dispatched' : 'partial_dispatch';
+        salesOrder.reservationStatus = fullyDispatched
+          ? 'consumed'
+          : salesOrder.items.some(item => Number(item.reservedQuantity || 0) > QUANTITY_TOLERANCE) ? 'partial' : 'released';
+        if (fullyDispatched) salesOrder.reservationConsumedAt = dispatchedAt;
+        await salesOrder.save({ session });
+
         const unfulfilledQty = pickList.items.reduce((sum, item) => sum + Number(item.shortQty || 0) + Number(item.damagedQty || 0), 0);
-        await SalesOrder.updateOne(
-          { _id: salesOrder._id, branch: req.branchId },
-          { $set: { status: unfulfilledQty > 0 ? 'partial_dispatch' : 'dispatched' } },
-          { session }
-        );
         const consumed = await PickList.updateOne(
           { _id: pickList._id, branch: req.branchId, dispatchTrip: lockedTrip._id, stockConsumedAt: null, stockConsumptionProcessing: true },
-          { $set: { stockConsumedAt: dispatchedAt, stockReserved: false, stockConsumptionProcessing: false, reservationState: 'consumed' } },
+          { $set: { items: pickList.items, stockConsumedAt: dispatchedAt, stockReserved: false, stockConsumptionProcessing: false, reservationState: 'consumed' } },
           { session }
         );
         if (consumed.modifiedCount !== 1) throw new Error(`${pickList.pickListNumber} stock-consumption claim was lost.`);
@@ -471,7 +603,7 @@ router.patch('/:id/cancel', async (req, res) => {
       const pickListIds = trip.orders.map(order => order.pickList).filter(Boolean);
       if (pickListIds.length) {
         await PickList.updateMany(
-          { _id: { $in: pickListIds }, dispatchTrip: trip._id, stockConsumedAt: null },
+          { _id: { $in: pickListIds }, branch: req.branchId, dispatchTrip: trip._id, stockConsumedAt: null },
           { $unset: { dispatchTrip: 1, tripClaimedAt: 1 }, $set: { dispatchTripNumber: '', stockConsumptionProcessing: false } }
         );
       }
