@@ -3,7 +3,14 @@ import mongoose from 'mongoose';
 import Quotation from '../models/Quotation.js';
 import SalesOrder from '../models/SalesOrder.js';
 import Dealer from '../models/Dealer.js';
+import DealerType from '../models/DealerType.js';
 import DealerLedger from '../models/DealerLedger.js';
+import Product from '../models/Product.js';
+import Stock from '../models/Stock.js';
+import Brand from '../models/Brand.js';
+import Category from '../models/Category.js';
+import Subcategory from '../models/Subcategory.js';
+import { resolvePricing } from '../services/pricingResolver.js';
 import { deriveOrderPricing, addCreditApproval } from '../services/orderPricingService.js';
 import { getDealerCreditExposure } from '../services/dealerCreditService.js';
 import { syncAutomaticApprovalRequest } from '../services/approvalRequestService.js';
@@ -149,6 +156,146 @@ router.get('/stats', requirePermission('quotation.management'), async (req, res)
     ]);
     return res.json({ success: true, data: { total, draft, pendingApproval, sent, accepted, converted, expired, cancelled, totalValue: totalValue[0]?.total || 0 } });
   } catch (error) { return res.status(500).json({ success: false, message: error.message }); }
+});
+
+const escapeRegex = (value = '') => String(value).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+const validObjectId = (value, field) => {
+  if (value && !mongoose.isValidObjectId(value)) throw routeError(422, `${field} is invalid.`);
+};
+async function mapWithConcurrency(values, concurrency, worker) {
+  const results = new Array(values.length);
+  let nextIndex = 0;
+  const workers = Array.from({ length: Math.min(concurrency, values.length) }, async () => {
+    while (nextIndex < values.length) {
+      const index = nextIndex;
+      nextIndex += 1;
+      results[index] = await worker(values[index], index);
+    }
+  });
+  await Promise.all(workers);
+  return results;
+}
+
+router.get('/product-browser', requireAnyPermission('sales.order.create', 'quotation.management'), async (req, res) => {
+  try {
+    const {
+      search, q, brand, category, subcategory, page = 1, limit = 50,
+      dealer: dealerQuery, dealerId: dealerIdQuery,
+      dealerType: dealerTypeQuery, dealerTypeId: dealerTypeIdQuery,
+      scope: requestedScope, quantity = 1, pricingDate, includeFilterOptions,
+    } = req.query;
+    const dealerId = dealerQuery || dealerIdQuery;
+    const dealerTypeId = dealerTypeQuery || dealerTypeIdQuery;
+    const scope = requestedScope || (dealerId ? 'dealer' : dealerTypeId ? 'dealer_type' : 'walk_in');
+    const allowedScopes = new Set(['dealer', 'dealer_type', 'walk_in']);
+    if (!allowedScopes.has(scope)) throw routeError(422, 'scope must be dealer, dealer_type, or walk_in.');
+    [brand, category, subcategory, dealerId, dealerTypeId].forEach((value, index) => {
+      validObjectId(value, ['brand', 'category', 'subcategory', 'dealer', 'dealerType'][index]);
+    });
+    if (scope === 'dealer' && !dealerId) throw routeError(422, 'dealer is required for dealer scope.');
+    if (scope === 'dealer_type' && !dealerTypeId) throw routeError(422, 'dealerType is required for dealer_type scope.');
+    if (scope === 'dealer_type' && dealerId) throw routeError(422, 'dealer_type scope cannot include dealer.');
+    if (scope === 'walk_in' && (dealerId || dealerTypeId)) throw routeError(422, 'walk_in scope cannot include dealer or dealerType.');
+
+    const qty = Number(quantity);
+    if (!Number.isFinite(qty) || qty <= 0) throw routeError(422, 'quantity must be greater than zero.');
+    const at = pricingDate ? new Date(pricingDate) : new Date();
+    if (Number.isNaN(at.getTime())) throw routeError(422, 'pricingDate is invalid.');
+    const p = Math.max(1, Number.parseInt(page, 10) || 1);
+    const l = Math.min(50, Math.max(1, Number.parseInt(limit, 10) || 50));
+
+    let dealer = null;
+    if (scope === 'dealer') {
+      dealer = await findActiveDealer(dealerId);
+      if (!dealer) throw routeError(404, 'Dealer not found.');
+      if (dealerTypeId && String(dealer.dealerType?._id || '') !== String(dealerTypeId)) {
+        throw routeError(422, 'Dealer does not belong to the selected Dealer Type.');
+      }
+    } else if (scope === 'dealer_type') {
+      const dealerType = await DealerType.findOne({ _id: dealerTypeId, status: 'active' }).select('_id').lean();
+      if (!dealerType) throw routeError(404, 'Dealer Type not found or inactive.');
+    }
+
+    const filter = { status: 'active' };
+    const term = String(search || q || '').trim();
+    if (term) {
+      const regex = new RegExp(escapeRegex(term), 'i');
+      filter.$or = [{ itemName: regex }, { productCode: regex }, { aliasName: regex }, { barcode: regex }];
+    }
+    if (brand) filter.brand = brand;
+    if (category) filter.category = category;
+    if (subcategory) filter.subcategory = subcategory;
+
+    const [products, totalItems] = await Promise.all([
+      Product.find(filter).sort({ itemName: 1, _id: 1 }).skip((p - 1) * l).limit(l)
+        .select('productCode itemName aliasName description hsnCode gst brand category subcategory tileSize thickness finish surface colour design grade collection tileType applicationArea unit piecesPerBox sqftPerBox weightPerBox mrp retailRate dealerRate wholesaleRate distributorRate projectRate builderRate minimumSellingRate images isNewArrival isFeatured status')
+        .populate('brand', 'name').populate('category', 'name brand').populate('subcategory', 'name category brand').lean(),
+      Product.countDocuments(filter),
+    ]);
+    const productIds = products.map((product) => product._id);
+    const stockRows = productIds.length ? await Stock.aggregate([
+      { $match: { branch: req.branchId, product: { $in: productIds } } },
+      { $group: {
+        _id: '$product', totalQty: { $sum: '$totalQty' }, availableQty: { $sum: '$availableQty' },
+        reservedQty: { $sum: '$reservedQty' }, blockedQty: { $sum: '$blockedQty' },
+        damagedQty: { $sum: '$damagedQty' },
+      } },
+    ]) : [];
+    const stockByProduct = new Map(stockRows.map((row) => [String(row._id), row]));
+    const data = await mapWithConcurrency(products, 6, async (product) => {
+      const pricing = await resolvePricing({
+        branchId: req.branchId, dealerId: scope === 'dealer' ? dealerId : undefined,
+        dealerTypeId: scope === 'dealer_type' ? dealerTypeId : undefined,
+        scope, product, quantity: qty, pricingDate: at,
+        orderType: scope === 'walk_in' ? 'retail' : 'dealer',
+      });
+      const stock = stockByProduct.get(String(product._id)) || {
+        totalQty: 0, availableQty: 0, reservedQty: 0, blockedQty: 0, damagedQty: 0,
+      };
+      return {
+        ...product,
+        stockAvailable: Number(stock.availableQty || 0),
+        stock: {
+          totalQty: Number(stock.totalQty || 0), availableQty: Number(stock.availableQty || 0),
+          reservedQty: Number(stock.reservedQty || 0), blockedQty: Number(stock.blockedQty || 0),
+          damagedQty: Number(stock.damagedQty || 0), scope: 'branch_snapshot',
+        },
+        requestedTier: pricing.requestedTier, rateField: pricing.rateField,
+        baseRate: pricing.baseRate, pricingRate: pricing.pricingRate, effectiveRate: pricing.effectiveRate,
+        minimumSellingRate: pricing.minimumSellingRate, belowMinimum: pricing.belowMinimum,
+        fallbackApplied: pricing.fallbackApplied, source: pricing.source, sourceName: pricing.sourceName,
+        overrideScope: pricing.overrideScope,
+        discount: {
+          regularPerUnit: pricing.regularDiscountPerUnit,
+          schemePerUnit: pricing.schemeDiscountPerUnit,
+          rule: pricing.rule,
+        },
+      };
+    });
+
+    const wantsFilterOptions = p === 1 && ['true', '1'].includes(String(includeFilterOptions).toLowerCase());
+    let filterOptions;
+    if (wantsFilterOptions) {
+      const [brands, categories, subcategories] = await Promise.all([
+        Brand.find({ status: 'active' }).sort({ name: 1 }).select('name').lean(),
+        Category.find({ status: 'active' }).sort({ name: 1 }).select('name brand').lean(),
+        Subcategory.find({ status: 'active' }).sort({ name: 1 }).select('name brand category').lean(),
+      ]);
+      filterOptions = { brands, categories, subcategories };
+    }
+    const totalPages = Math.ceil(totalItems / l);
+    return res.json({
+      success: true, data,
+      pagination: {
+        currentPage: p, totalPages, totalItems, itemsPerPage: l,
+        hasMore: p * l < totalItems,
+      },
+      ...(filterOptions ? { filterOptions } : {}),
+    });
+  } catch (error) {
+    return res.status(error.status || (['CastError', 'ValidationError'].includes(error.name) ? 422 : 500))
+      .json({ success: false, message: error.message });
+  }
 });
 
 router.post('/price-preview', requireAnyPermission('sales.order.create', 'quotation.management'), async (req, res) => {
