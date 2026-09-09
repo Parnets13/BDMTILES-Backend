@@ -3,6 +3,8 @@ import mongoose from 'mongoose';
 import PickList from '../models/PickList.js';
 import SalesOrder from '../models/SalesOrder.js';
 import Stock from '../models/Stock.js';
+import User from '../models/User.js';
+import { ROLE_DEFAULT_PERMISSIONS } from '../config/permissions.js';
 import { protect, requirePermission, requireAnyPermission } from '../middleware/auth.js';
 import { requireBranch } from '../utils/branchScope.js';
 import { generateBranchNumber } from '../utils/branchSequence.js';
@@ -13,6 +15,7 @@ router.use(protect);
 router.use(requireBranch);
 
 router.get(['/', '/stats', '/:id'], requireAnyPermission('picking.management', 'sorting.management', 'dispatch.management'));
+router.get('/assignable-staff', requireAnyPermission('picking.management', 'sorting.management', 'dispatch.management'));
 router.post('/generate/:soId', requireAnyPermission('sales.order.approve', 'picking.management'));
 router.patch(
   ['/:id/assign', '/:id/start', '/:id/complete-picking', '/:id/verify'],
@@ -20,6 +23,8 @@ router.patch(
 );
 router.patch(['/:id/sort', '/:id/pack'], requirePermission('sorting.management'));
 router.patch('/:id/ready', requireAnyPermission('sorting.management', 'dispatch.management'));
+router.patch('/:id/verify-loading', requireAnyPermission('dispatch.management', 'dispatch.verify'));
+router.patch('/:id/mark-short', requireAnyPermission('picking.management', 'sorting.management'));
 
 const stateError = (res, record, expected, action) => res.status(409).json({
   success: false,
@@ -56,7 +61,7 @@ router.get('/', async (req, res) => {
 
 router.get('/stats', async (req, res) => {
   try {
-    const statuses = ['generated', 'assigned', 'in_progress', 'picked', 'verified', 'sorted', 'packed', 'ready_for_dispatch'];
+    const statuses = ['generated', 'assigned', 'in_progress', 'picked', 'verified', 'sorted', 'packed', 'ready_for_dispatch', 'loaded'];
     const [total, ...counts] = await Promise.all([
       PickList.countDocuments({ branch: req.branchId }),
       ...statuses.map(status => PickList.countDocuments({ branch: req.branchId, status })),
@@ -96,7 +101,7 @@ router.post('/generate/:soId', async (req, res) => {
     await session.withTransaction(async () => {
       const so = await SalesOrder.findOne({ _id: req.params.soId, branch: req.branchId })
         .session(session)
-        .populate('items.product', 'productCode itemName images hsnCode')
+        .populate('items.product', 'productCode itemName images hsnCode barcode')
         .populate('items.warehouse', 'name');
       if (!so) throw Object.assign(new Error('Sales Order not found.'), { status: 404 });
       if (!['confirmed', 'approved', 'processing', 'partial_dispatch'].includes(so.status)) {
@@ -137,6 +142,7 @@ router.post('/generate/:soId', async (req, res) => {
           productName: line.productName || product.itemName || '',
           productImage: line.productImage || product.images?.[0] || '',
           hsnCode: product.hsnCode || '',
+          barcode: product.barcode || '',
           shade: line.shade || '',
           batch: line.batch || '',
           allocatedQty: requestedQty,
@@ -183,6 +189,33 @@ router.post('/generate/:soId', async (req, res) => {
   }
 });
 
+// Warehouse staff who can be assigned a pick list — active users in this branch
+// whose permissions (or role defaults) include a picking/sorting/dispatch grant.
+// Kept on pickListRoutes so it is reachable by warehouse supervisors (the /users
+// API is gated behind users.manage, which floor supervisors do not hold).
+router.get('/assignable-staff', async (req, res) => {
+  try {
+    const WAREHOUSE_PERMS = ['picking.management', 'sorting.management', 'dispatch.management'];
+    const warehouseRoles = Object.entries(ROLE_DEFAULT_PERMISSIONS)
+      .filter(([, perms]) => Array.isArray(perms) && (perms.includes('*') || perms.some(p => WAREHOUSE_PERMS.includes(p))))
+      .map(([role]) => role);
+
+    const users = await User.find({
+      status: 'Active',
+      assignedBranches: req.branchId,
+      $or: [
+        { permissions: { $in: [...WAREHOUSE_PERMS, '*'] } },
+        { role: { $in: warehouseRoles } },
+      ],
+    })
+      .select('name role')
+      .sort({ name: 1 })
+      .lean();
+
+    res.json({ success: true, data: users.map(u => ({ _id: u._id, name: u.name, role: u.role })) });
+  } catch (e) { res.status(500).json({ success: false, message: e.message }); }
+});
+
 router.get('/:id', async (req, res) => {
   try {
     const pickList = await PickList.findOne({ _id: req.params.id, branch: req.branchId })
@@ -190,6 +223,7 @@ router.get('/:id', async (req, res) => {
       .populate('sortedBy', 'name')
       .populate('packedBy', 'name')
       .populate('verifiedBy', 'name')
+      .populate('loadingVerifiedBy', 'name')
       .populate('salesOrder', 'orderNumber dealerName dealerCode orderDate')
       .populate('items.product', 'productCode itemName images')
       .lean();
@@ -350,6 +384,47 @@ router.patch('/:id/verify', async (req, res) => {
   } catch (e) { res.status(500).json({ success: false, message: e.message }); }
 });
 
+// Mark a single item short (quantity + optional reason). Usable while the pick
+// list is being picked (in_progress) or sorted (verified). Evidence only — no
+// stock is moved here; reservation reconciliation happens at complete-picking.
+router.patch('/:id/mark-short', async (req, res) => {
+  try {
+    const pickList = await PickList.findOne({ _id: req.params.id, branch: req.branchId });
+    if (!pickList) return res.status(404).json({ success: false, message: 'Pick list not found.' });
+    if (!['in_progress', 'picked', 'verified'].includes(pickList.status)) {
+      return res.status(409).json({
+        success: false,
+        message: `Cannot mark items short while pick list is "${pickList.status}".`,
+      });
+    }
+
+    const { itemId, shortQty, reason } = req.body;
+    const item = pickList.items.id(itemId);
+    if (!item) return res.status(404).json({ success: false, message: 'Pick-list item not found.' });
+
+    const qty = Number(shortQty);
+    if (!Number.isFinite(qty) || qty < 0) {
+      return res.status(400).json({ success: false, message: 'Short quantity must be zero or a positive number.' });
+    }
+    const cap = Number(item.requestedQty || 0);
+    if (qty > cap + QUANTITY_TOLERANCE) {
+      return res.status(400).json({ success: false, message: `Short quantity cannot exceed the requested quantity (${cap}).` });
+    }
+
+    item.shortQty = qty;
+    item.shortReason = String(reason || '');
+    item.status = qty > QUANTITY_TOLERANCE ? 'short' : (Number(item.pickedQty || 0) > 0 ? 'picked' : 'pending');
+
+    pickList.totalShortQty = pickList.items.reduce((sum, row) => sum + Number(row.shortQty || 0), 0);
+    await pickList.save();
+    res.json({
+      success: true,
+      message: qty > QUANTITY_TOLERANCE ? `Shortage recorded for ${item.productName}.` : `Shortage cleared for ${item.productName}.`,
+      data: pickList,
+    });
+  } catch (e) { res.status(500).json({ success: false, message: e.message }); }
+});
+
 router.patch('/:id/sort', async (req, res) => {
   const session = await mongoose.startSession();
   try {
@@ -431,6 +506,41 @@ router.patch('/:id/pack', async (req, res) => {
     if (!Number.isFinite(totalBoxes) || totalBoxes <= 0 || !Number.isFinite(totalWeight) || totalWeight < 0) {
       return res.status(400).json({ success: false, message: 'Total boxes must be greater than zero and weight cannot be negative.' });
     }
+
+    // Item-wise packing (optional). When an items array is supplied, record the
+    // packed quantity per item — it must equal that item's dispatchable quantity
+    // (sortedQty when sorted, else pickedQty). When omitted, the whole list packs
+    // its dispatchable quantity per item (backward compatible with older clients).
+    const submitted = Array.isArray(req.body.items) ? req.body.items : null;
+    const dispatchableOf = (item) =>
+      Number(item.sortedQty || 0) > 0 ? Number(item.sortedQty) : Number(item.pickedQty || 0);
+
+    if (submitted) {
+      if (submitted.length !== pickList.items.length) {
+        return res.status(400).json({ success: false, message: 'Submit a packed quantity for every item.' });
+      }
+      const byId = new Map(submitted.map((row) => [String(row._id), row]));
+      if (byId.size !== pickList.items.length) {
+        return res.status(400).json({ success: false, message: 'Every item must appear exactly once.' });
+      }
+      for (const item of pickList.items) {
+        const row = byId.get(String(item._id));
+        if (!row) return res.status(400).json({ success: false, message: `Missing packed quantity for ${item.productName}.` });
+        const packedQty = Number(row.packedQty);
+        const expected = dispatchableOf(item);
+        if (!Number.isFinite(packedQty) || packedQty < 0) {
+          return res.status(400).json({ success: false, message: `Invalid packed quantity for ${item.productName}.` });
+        }
+        if (Math.abs(packedQty - expected) > QUANTITY_TOLERANCE) {
+          return res.status(400).json({ success: false, message: `${item.productName}: packed quantity must equal the sorted/picked quantity (${expected}).` });
+        }
+        item.packedQty = packedQty;
+      }
+    } else {
+      // No per-item data — pack each item's dispatchable quantity.
+      pickList.items.forEach((item) => { item.packedQty = dispatchableOf(item); });
+    }
+
     pickList.status = 'packed';
     pickList.packedBy = req.user._id;
     pickList.packingEndTime = new Date();
@@ -453,6 +563,78 @@ router.patch('/:id/ready', async (req, res) => {
     await pickList.save();
     res.json({ success: true, message: 'Ready for dispatch planning.', data: pickList });
   } catch (e) { res.status(500).json({ success: false, message: e.message }); }
+});
+
+// Loading verification — confirms every item is physically loaded onto the
+// delivery vehicle by scanning its barcode. Evidence only: no stock is moved
+// here (dispatch consumption happens on the DispatchTrip). ready_for_dispatch → loaded.
+router.patch('/:id/verify-loading', async (req, res) => {
+  const session = await mongoose.startSession();
+  try {
+    let loaded;
+    await session.withTransaction(async () => {
+      const current = await PickList.findOne({ _id: req.params.id, branch: req.branchId }).session(session);
+      if (!current) throw Object.assign(new Error('Pick list not found.'), { status: 404 });
+      if (current.status === 'loaded') { loaded = current; return; }
+      if (current.status !== 'ready_for_dispatch') {
+        throw Object.assign(new Error(`Cannot verify loading while pick list is "${current.status}". Expected "ready_for_dispatch".`), { status: 409 });
+      }
+      const submitted = req.body.items;
+      if (!Array.isArray(submitted) || submitted.length !== current.items.length) {
+        throw Object.assign(new Error('Submit explicit loading verification for every pick-list item.'), { status: 400 });
+      }
+      const submittedById = new Map(submitted.map(item => [String(item._id), item]));
+      if (submittedById.size !== current.items.length) throw Object.assign(new Error('Every pick-list item must appear exactly once.'), { status: 400 });
+
+      const claimed = await PickList.findOneAndUpdate(
+        { _id: current._id, branch: req.branchId, status: 'ready_for_dispatch', loadingVerificationProcessing: { $ne: true } },
+        { $set: { loadingVerificationProcessing: true } },
+        { new: true, session }
+      );
+      if (!claimed) throw Object.assign(new Error('Loading verification is already being processed. Refresh before retrying.'), { status: 409 });
+
+      const verifiedAt = new Date();
+      for (const item of claimed.items) {
+        const evidence = submittedById.get(String(item._id));
+        if (!evidence) throw Object.assign(new Error(`Missing loading verification for ${item.productName}.`), { status: 400 });
+        // The dispatchable quantity is what survived sorting (sortedQty when sorted,
+        // otherwise the picked quantity). Loading confirms this whole quantity is on the vehicle.
+        const dispatchableQty = Number(item.sortedQty || 0) > 0 ? Number(item.sortedQty) : Number(item.pickedQty || 0);
+        const dispatchedQty = Number(evidence.dispatchedQty ?? dispatchableQty);
+        if (!Number.isFinite(dispatchedQty) || dispatchedQty < 0) {
+          throw Object.assign(new Error(`Invalid loaded quantity for ${item.productName}.`), { status: 400 });
+        }
+        if (Math.abs(dispatchedQty - dispatchableQty) > QUANTITY_TOLERANCE) {
+          throw Object.assign(new Error(`${item.productName}: loaded quantity must equal the dispatchable quantity (${dispatchableQty}).`), { status: 400 });
+        }
+        if (evidence.barcodeConfirmed !== true) {
+          throw Object.assign(new Error(`Scan and confirm the barcode for ${item.productName} before loading.`), { status: 400 });
+        }
+        item.dispatchedQty = dispatchedQty;
+        item.loadingBarcodeConfirmed = true;
+        item.loadingRemarks = String(evidence.remarks || '');
+        item.loadingVerifiedBy = req.user._id;
+        item.loadingVerifiedAt = verifiedAt;
+      }
+
+      claimed.status = 'loaded';
+      claimed.loadingVerifiedBy = req.user._id;
+      claimed.loadingEndTime = verifiedAt;
+      claimed.remarks = req.body.remarks ?? claimed.remarks;
+      claimed.loadingVerificationProcessing = false;
+      await claimed.save({ session });
+      loaded = claimed;
+    });
+    return res.json({
+      success: true,
+      message: loaded.status === 'loaded' ? 'Loading verified — every item scanned and confirmed on the vehicle.' : 'Loading already verified.',
+      data: loaded,
+    });
+  } catch (e) {
+    return res.status(e.status || (['CastError', 'ValidationError'].includes(e.name) ? 422 : 500)).json({ success: false, message: e.message });
+  } finally {
+    await session.endSession();
+  }
 });
 
 export default router;

@@ -6,6 +6,7 @@ const pickItemSchema = new mongoose.Schema({
   productName: String,
   productImage: { type: String, default: '' },
   hsnCode: { type: String, default: '' },
+  barcode: { type: String, default: '' },
   shade: { type: String, default: '' },
   batch: { type: String, default: '' },
   salesOrderItem: { type: mongoose.Schema.Types.ObjectId },
@@ -13,7 +14,9 @@ const pickItemSchema = new mongoose.Schema({
   requestedQty: { type: Number, required: true, min: 0.000001 },
   pickedQty: { type: Number, default: 0 },
   dispatchedQty: { type: Number, default: 0 },
+  packedQty: { type: Number, default: 0 },
   shortQty: { type: Number, default: 0 },
+  shortReason: { type: String, default: '' },
   damagedQty: { type: Number, default: 0 },
   unit: { type: String, default: 'Box' },
   warehouse: { type: mongoose.Schema.Types.ObjectId, ref: 'Warehouse' },
@@ -33,6 +36,11 @@ const pickItemSchema = new mongoose.Schema({
   sortingRemarks: { type: String, default: '' },
   sortingVerifiedBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User' },
   sortingVerifiedAt: Date,
+  // Loading verification (vehicle loading; evidence only, does not move stock)
+  loadingBarcodeConfirmed: { type: Boolean, default: false },
+  loadingVerifiedBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User' },
+  loadingVerifiedAt: Date,
+  loadingRemarks: { type: String, default: '' },
   // Status per item
   status: { type: String, enum: ['pending', 'picked', 'short', 'damaged', 'substituted'], default: 'pending' },
   remarks: { type: String, default: '' },
@@ -61,7 +69,7 @@ const pickListSchema = new mongoose.Schema(
     // Status
     status: {
       type: String,
-      enum: ['generated', 'assigned', 'in_progress', 'picked', 'verified', 'sorted', 'packed', 'ready_for_dispatch', 'cancelled'],
+      enum: ['generated', 'assigned', 'in_progress', 'picked', 'verified', 'sorted', 'packed', 'ready_for_dispatch', 'loaded', 'cancelled'],
       default: 'generated',
     },
 
@@ -74,11 +82,13 @@ const pickListSchema = new mongoose.Schema(
     sortingStartTime: Date,
     sortingEndTime: Date,
     packingEndTime: Date,
+    loadingEndTime: Date,
 
     // Sorting & Packing
     sortedBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User' },
     packedBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User' },
     verifiedBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User' },
+    loadingVerifiedBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User' },
     totalBoxes: { type: Number, default: 0 },
     totalWeight: { type: Number, default: 0 },
 
@@ -106,6 +116,7 @@ const pickListSchema = new mongoose.Schema(
     stockConsumedAt: Date,
     pickingCompletionProcessing: { type: Boolean, default: false },
     sortingVerificationProcessing: { type: Boolean, default: false },
+    loadingVerificationProcessing: { type: Boolean, default: false },
     cancellationProcessing: { type: Boolean, default: false },
     stockConsumptionProcessing: { type: Boolean, default: false },
 

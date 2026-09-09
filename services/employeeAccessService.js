@@ -111,6 +111,42 @@ export const getAssignableEmployeeRoles = (actor) => Object.entries(ROLE_INFO)
     && info.rank < (ROLE_INFO[actor?.role]?.rank ?? -1))
   .map(([value, info]) => ({ value, label: info.name }));
 
+// ── Multi-role app access ──────────────────────────────────────────────────
+// An employee can hold several operational roles (e.g. Picking + Sorting + Loading).
+// We store one primary `role` (highest rank, for the schema/display) and the UNION
+// of every selected role's default permissions as a custom permission set.
+
+// Normalise appAccess into a de-duplicated array of role keys, accepting either
+// the new `roles` array or the legacy single `role` field.
+const resolveAppRoles = (appAccess = {}) => {
+  const raw = Array.isArray(appAccess.roles) && appAccess.roles.length
+    ? appAccess.roles
+    : (appAccess.role ? [appAccess.role] : []);
+  return [...new Set(raw.map((role) => String(role || '').trim()).filter(Boolean))];
+};
+
+// The primary role = the highest-ranked selected role (used for the User.role enum).
+const primaryRoleOf = (roles) => roles
+  .slice()
+  .sort((a, b) => (ROLE_INFO[b]?.rank ?? -1) - (ROLE_INFO[a]?.rank ?? -1))[0];
+
+// Union of ROLE_DEFAULT_PERMISSIONS across all selected roles (de-duplicated).
+const mergePermissionsForRoles = (roles) => [
+  ...new Set(roles.flatMap((role) => ROLE_DEFAULT_PERMISSIONS[role] || [])),
+];
+
+// Which of the assignable roles a linked user currently satisfies — used so the
+// registration form can re-check the right boxes on edit. A role is considered
+// "granted" when every permission in its preset is present on the user.
+export const grantedRolesForPermissions = (permissions = []) => {
+  const held = new Set(permissions);
+  if (held.has('*')) return [...OPERATIONAL_APP_ROLES];
+  return [...OPERATIONAL_APP_ROLES].filter((role) => {
+    const preset = ROLE_DEFAULT_PERMISSIONS[role] || [];
+    return preset.length > 0 && preset.every((permission) => held.has(permission));
+  });
+};
+
 const assertBranchAccess = async (actor, branchId, session) => {
   if (!mongoose.isValidObjectId(branchId)) {
     throw serviceError(422, 'Employee branch is invalid.', 'INVALID_EMPLOYEE_BRANCH');
@@ -222,8 +258,13 @@ const applyAccessState = (user, employeeStatus, appAccess, { creating = false } 
 };
 
 const createLinkedUser = async ({ employee, appAccess, actor, branchId, session }) => {
-  const role = appAccess.role;
-  assertAssignableRole(actor, role);
+  const roles = resolveAppRoles(appAccess);
+  if (!roles.length) {
+    throw serviceError(422, 'Select at least one app-access designation.', 'APP_ROLE_REQUIRED');
+  }
+  roles.forEach((appRole) => assertAssignableRole(actor, appRole));
+  const role = primaryRoleOf(roles);
+  const mergedPermissions = mergePermissionsForRoles(roles);
   const password = temporaryPassword(appAccess);
   validateTemporaryPassword(password, true);
 
@@ -245,8 +286,11 @@ const createLinkedUser = async ({ employee, appAccess, actor, branchId, session 
     password: String(password),
     role,
     status: ['Inactive', 'Terminated'].includes(employee.status) ? 'Inactive' : 'Active',
-    permissions: [...(ROLE_DEFAULT_PERMISSIONS[role] || [])],
-    permissionMode: 'role_default',
+    permissions: mergedPermissions,
+    // Multiple roles merge into a union, so this is a custom set rather than a
+    // single role's defaults. When exactly one role is chosen it equals that
+    // role's preset, preserving the old behaviour.
+    permissionMode: 'custom',
     assignedBranches: [branchId],
     defaultBranch: branchId,
     assignedWarehouses: [],
@@ -262,9 +306,17 @@ const createLinkedUser = async ({ employee, appAccess, actor, branchId, session 
 };
 
 const syncLinkedUser = async ({ employee, user, appAccess, actor, branchId, session }) => {
-  const role = appAccess.role || user.role;
+  // Roles may be supplied (roles[] or legacy role). If none supplied on this edit,
+  // keep the user's existing role/permissions untouched.
+  const rolesProvided = hasOwn(appAccess, 'roles') || hasOwn(appAccess, 'role');
+  const roles = resolveAppRoles(appAccess);
   const isForcedDeactivation = ['Inactive', 'Terminated'].includes(employee.status) || appAccess.enabled === false;
-  if (!isForcedDeactivation || hasOwn(appAccess, 'role')) assertAssignableRole(actor, role);
+  if (rolesProvided && roles.length) {
+    roles.forEach((appRole) => assertAssignableRole(actor, appRole));
+  } else if (!isForcedDeactivation && rolesProvided) {
+    throw serviceError(422, 'Select at least one app-access designation.', 'APP_ROLE_REQUIRED');
+  }
+  const role = (rolesProvided && roles.length) ? primaryRoleOf(roles) : user.role;
 
   const username = hasOwn(appAccess, 'username') ? normalizeLogin(appAccess.username) : user.username;
   const email = normalizeLogin(hasOwn(appAccess, 'email') ? appAccess.email : employee.email);
@@ -282,33 +334,42 @@ const syncLinkedUser = async ({ employee, user, appAccess, actor, branchId, sess
   user.email = email;
   user.phone = phone;
   user.role = role;
-  user.permissionMode = 'role_default';
-  user.permissions = [...(ROLE_DEFAULT_PERMISSIONS[role] || [])];
+  // Only rewrite permissions when roles were provided on this edit; otherwise leave
+  // whatever the user already has (custom or role_default) intact.
+  if (rolesProvided && roles.length) {
+    user.permissionMode = 'custom';
+    user.permissions = mergePermissionsForRoles(roles);
+  }
   await syncUserBranch(user, branchId, session);
   applyAccessState(user, employee.status, appAccess);
   await user.save({ session });
 };
 
+const buildAppAccess = (linkedUser) => (linkedUser ? {
+  linked: true,
+  enabled: linkedUser.status === 'Active',
+  status: linkedUser.status,
+  role: linkedUser.role,
+  // Every operational role the user's permissions currently satisfy — lets the
+  // registration form re-check the right multi-select boxes on edit.
+  roles: grantedRolesForPermissions(linkedUser.permissions || []),
+  username: linkedUser.username,
+  email: linkedUser.email,
+  phone: linkedUser.phone,
+  mustChangePassword: Boolean(linkedUser.mustChangePassword),
+} : { linked: false, enabled: false, status: 'Not provisioned', roles: [] });
+
 const serializeEmployee = async (employeeId, branchId) => {
   const employee = await Employee.findOne({ _id: employeeId, branchId })
     .populate('branchId', 'branchCode name status city state')
-    .populate('userId', 'name username email phone role status mustChangePassword')
+    .populate('userId', 'name username email phone role status mustChangePassword permissions')
     .lean();
   if (!employee) return null;
   const linkedUser = employee.userId && typeof employee.userId === 'object' ? employee.userId : null;
   return {
     ...employee,
     userId: linkedUser?._id || employee.userId || null,
-    appAccess: linkedUser ? {
-      linked: true,
-      enabled: linkedUser.status === 'Active',
-      status: linkedUser.status,
-      role: linkedUser.role,
-      username: linkedUser.username,
-      email: linkedUser.email,
-      phone: linkedUser.phone,
-      mustChangePassword: Boolean(linkedUser.mustChangePassword),
-    } : { linked: false, enabled: false, status: 'Not provisioned' },
+    appAccess: buildAppAccess(linkedUser),
   };
 };
 
@@ -318,7 +379,7 @@ export const listEmployeesWithAccess = async (filter, options) => {
     .skip(options.skip)
     .limit(options.limit)
     .populate('branchId', 'branchCode name status city state')
-    .populate('userId', 'name username email phone role status mustChangePassword')
+    .populate('userId', 'name username email phone role status mustChangePassword permissions')
     .lean();
   const rows = await query;
   return rows.map((employee) => {
@@ -326,16 +387,7 @@ export const listEmployeesWithAccess = async (filter, options) => {
     return {
       ...employee,
       userId: linkedUser?._id || employee.userId || null,
-      appAccess: linkedUser ? {
-        linked: true,
-        enabled: linkedUser.status === 'Active',
-        status: linkedUser.status,
-        role: linkedUser.role,
-        username: linkedUser.username,
-        email: linkedUser.email,
-        phone: linkedUser.phone,
-        mustChangePassword: Boolean(linkedUser.mustChangePassword),
-      } : { linked: false, enabled: false, status: 'Not provisioned' },
+      appAccess: buildAppAccess(linkedUser),
     };
   });
 };

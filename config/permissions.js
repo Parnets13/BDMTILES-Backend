@@ -81,11 +81,15 @@ export const AVAILABLE_PERMISSIONS = {
     { id: "stock.view", name: "View Stock" },
     { id: "stock.transfer", name: "Stock Transfer" },
     { id: "stock.adjustment", name: "Stock Adjustment" },
-    { id: "picking.management", name: "Picking Management" },
-    { id: "sorting.management", name: "Sorting Management" },
-    { id: "dispatch.management", name: "Dispatch Management" },
-    { id: "dispatch.verify", name: "Final Dispatch Verification" },
     { id: "warehouse.verification", name: "Warehouse Complaint Verification" },
+  ],
+  // Capabilities for the BDM Tiles Picking & Sorting mobile app. Each maps to a
+  // feature in the app: Picking, Sorting, and Loading (vehicle dispatch) verification.
+  "Picking & Sorting App": [
+    { id: "picking.management", name: "Picking — assign, pick, barcode/shade/batch verify" },
+    { id: "sorting.management", name: "Sorting — verify, pack, mark ready for dispatch" },
+    { id: "dispatch.management", name: "Loading — scan-verify items onto the vehicle" },
+    { id: "dispatch.verify", name: "Loading — final dispatch verification" },
   ],
   "Finance & Accounts": [
     { id: "finance.management", name: "Finance Management" },
@@ -282,16 +286,18 @@ export const ROLE_DEFAULT_PERMISSIONS = {
     'de.collections.view', 'de.history.view',
     'delivery.view', 'delivery.execute', 'delivery.verify', 'delivery.complete', 'delivery.fail', 'delivery.tracking',
   ],
+  // Floor picker — picks and can sort. Does NOT handle vehicle loading/dispatch.
   picking_staff: [
     'dashboard.view', 'notification.inbox',
     'picking.management', 'sorting.management',
     'stock.view',
   ],
+  // Sorting + loading staff — sorts, packs, and verifies vehicle loading/dispatch.
   sorting_staff: [
     'dashboard.view', 'notification.inbox',
-    'sorting.management', 'picking.management',
-    'stock.view',
+    'sorting.management',
     'dispatch.management', 'dispatch.verify',
+    'stock.view',
   ],
   dealer: [
     'notification.inbox', 'dealer.order.requests', 'support.chat',
@@ -313,8 +319,8 @@ export const ROLE_INFO = {
   hr_manager: { name: 'HR Manager', description: 'Employees, attendance, leave, salary, expenses', color: '#faad14', rank: 50 },
   sales_executive: { name: 'Sales Executive', description: 'Field sales, leads, quotations, orders', color: '#ff7a45', rank: 30 },
   delivery_executive: { name: 'Delivery Executive', description: 'Delivery assignments and tracking', color: '#36cfc9', rank: 30 },
-  picking_staff: { name: 'Picking/Sorting Staff', description: 'Warehouse picking, sorting, stock view', color: '#9254de', rank: 20 },
-  sorting_staff: { name: 'Sorting Staff', description: 'Sorting, dispatch preparation', color: '#597ef7', rank: 20 },
+  picking_staff: { name: 'Picking Staff', description: 'Warehouse picking and sorting, stock view', color: '#9254de', rank: 20 },
+  sorting_staff: { name: 'Sorting / Loading Staff', description: 'Sorting, packing, and vehicle loading / dispatch verification', color: '#597ef7', rank: 20 },
   dealer: { name: 'Dealer (App)', description: 'Dealer portal — orders and support', color: '#73d13d', rank: 10 },
 };
 

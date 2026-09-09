@@ -5,14 +5,19 @@
   "main": "server.js",
   "type": "module",
   "scripts": {
-    "start": "node server.js",
+    "start": "nodemon server.js",
     "dev": "nodemon server.js",
     "seed": "node scripts/seed.js",
     "create-admin": "node scripts/createSuperAdmin.js",
     "migrate:branches": "node scripts/migrateMultiBranch.js",
     "test:modules": "node scripts/testAllModules.js"
   },
-  "keywords": ["bdmtiles", "erp", "crm", "tiles"],
+  "keywords": [
+    "bdmtiles",
+    "erp",
+    "crm",
+    "tiles"
+  ],
   "author": "BDMTILES",
   "license": "PROPRIETARY",
   "dependencies": {
@@ -36,6 +41,6 @@
     "slugify": "^1.6.6"
   },
   "devDependencies": {
-    "nodemon": "^3.1.10"
+    "nodemon": "^3.1.14"
   }
 }
