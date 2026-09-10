@@ -8,10 +8,12 @@ const uploadRoot = path.join(__dirname, '..', 'uploads');
 const privateUploadRoot = path.join(__dirname, '..', 'private-uploads');
 const productUploadDirectory = path.join(uploadRoot, 'products');
 const complaintUploadDirectory = path.join(uploadRoot, 'complaints');
+const webUploadDirectory = path.join(uploadRoot, 'web');
 export const legacySupplierCreditNoteDirectory = path.join(uploadRoot, 'supplier-credit-notes');
 export const supplierCreditNoteDirectory = path.join(privateUploadRoot, 'supplier-credit-notes');
 fs.mkdirSync(productUploadDirectory, { recursive: true });
 fs.mkdirSync(complaintUploadDirectory, { recursive: true });
+fs.mkdirSync(webUploadDirectory, { recursive: true });
 fs.mkdirSync(supplierCreditNoteDirectory, { recursive: true });
 
 const storageFor = (directory) => multer.diskStorage({
@@ -39,6 +41,13 @@ export const uploadProductImages = multer({
 
 export const uploadComplaintEvidence = multer({
   storage: storageFor(complaintUploadDirectory),
+  fileFilter,
+  limits: { fileSize: 5 * 1024 * 1024 },
+}).array('images', 10);
+
+// Web Management (storefront CMS) images — hero, banners, categories, testimonials.
+export const uploadWebImages = multer({
+  storage: storageFor(webUploadDirectory),
   fileFilter,
   limits: { fileSize: 5 * 1024 * 1024 },
 }).array('images', 10);
