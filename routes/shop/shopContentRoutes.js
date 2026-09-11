@@ -6,13 +6,35 @@ import Testimonial from '../../models/webContent/Testimonial.js';
 import MarqueeItem from '../../models/webContent/MarqueeItem.js';
 import SiteSettings from '../../models/webContent/SiteSettings.js';
 import DeliveryPincode from '../../models/webContent/DeliveryPincode.js';
+import PincodeRequest from '../../models/webContent/PincodeRequest.js';
 import TileRoom from '../../models/webContent/TileRoom.js';
 import TileTypeItem from '../../models/webContent/TileTypeItem.js';
 import TileSizeItem from '../../models/webContent/TileSizeItem.js';
+import VideoTestimonial from '../../models/webContent/VideoTestimonial.js';
 
 const router = Router();
 
-// GET /api/v1/shop/content/pincode/:pincode — is this pincode serviceable?
+// POST /api/v1/shop/content/pincode-request — customer requests delivery to unserviceable pincode
+router.post('/pincode-request', async (req, res) => {
+  try {
+    const pincode = String(req.body?.pincode || '').trim();
+    if (!/^\d{6}$/.test(pincode)) {
+      return res.status(422).json({ success: false, message: 'Enter a valid 6-digit pincode.' });
+    }
+    // Don't create duplicates — upsert by pincode.
+    await PincodeRequest.findOneAndUpdate(
+      { pincode },
+      {
+        $set: { pincode, name: String(req.body?.name || '').trim(), phone: String(req.body?.phone || '').trim() },
+        $setOnInsert: { status: 'pending' },
+      },
+      { upsert: true, new: true }
+    );
+    res.json({ success: true, message: 'Your request has been noted. We will notify you when delivery is available.' });
+  } catch (error) {
+    res.status(500).json({ success: false, message: error.message });
+  }
+});
 // Public, no auth. Used by the storefront "Deliver To" checker.
 router.get('/pincode/:pincode', async (req, res) => {
   try {
@@ -44,7 +66,7 @@ const bySort = { sortOrder: 1, createdAt: -1 };
 // Public, no auth, no branch. Consumed by the bdm-tiles-web home page.
 router.get('/', async (_req, res) => {
   try {
-    const [hero, banners, categories, testimonials, marquee, settings, tileRooms, tileTypes, tileSizes] = await Promise.all([
+    const [hero, banners, categories, testimonials, marquee, settings, tileRooms, tileTypes, tileSizes, videoTestimonials] = await Promise.all([
       HeroSection.find(ACTIVE).sort(bySort).lean(),
       HomeBanner.find(ACTIVE).sort(bySort).lean(),
       HomeCategory.find(ACTIVE).sort(bySort).lean(),
@@ -54,6 +76,7 @@ router.get('/', async (_req, res) => {
       TileRoom.find(ACTIVE).sort(bySort).lean(),
       TileTypeItem.find(ACTIVE).sort(bySort).lean(),
       TileSizeItem.find(ACTIVE).sort(bySort).lean(),
+      VideoTestimonial.find(ACTIVE).sort(bySort).lean(),
     ]);
 
     res.json({
@@ -106,7 +129,9 @@ router.get('/', async (_req, res) => {
           id: t._id,
           name: t.name,
           image: t.image || '',
+          videoUrl: t.videoUrl || '',
           badge: t.badge || '',
+          badgeColor: t.badgeColor || '',
           quote: t.quote,
           caption: t.caption || '',
           rating: t.rating ?? 5,
@@ -132,6 +157,16 @@ router.get('/', async (_req, res) => {
           sub: s.sub || 'mm',
           image: s.image || '',
           query: s.query || '',
+        })),
+        videoTestimonials: videoTestimonials.map((v) => ({
+          id: v._id,
+          name: v.name,
+          badge: v.badge || '',
+          badgeColor: v.badgeColor || '',
+          quote: v.quote,
+          caption: v.caption || '',
+          thumbnail: v.thumbnail || '',
+          videoUrl: v.videoUrl,
         })),
       },
     });

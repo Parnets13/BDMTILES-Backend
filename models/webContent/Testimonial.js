@@ -8,7 +8,9 @@ const testimonialSchema = new mongoose.Schema(
   {
     name: { type: String, required: true, trim: true },
     image: { type: String, trim: true, default: '' },
+    videoUrl: { type: String, trim: true, default: '' }, // optional video shown behind the play button
     badge: { type: String, trim: true, default: '' },
+    badgeColor: { type: String, trim: true, default: '' }, // hex background for the badge
     quote: { type: String, required: true, trim: true },
     caption: { type: String, trim: true, default: '' },
     rating: { type: Number, min: 0, max: 5, default: 5 },

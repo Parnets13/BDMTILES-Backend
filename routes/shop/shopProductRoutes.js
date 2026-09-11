@@ -9,14 +9,14 @@ const router = Router();
 // Only these fields are ever exposed to the public storefront.
 // NOTE: cost/dealer/wholesale/distributor/project/builder rates are deliberately omitted.
 const PUBLIC_PRODUCT_FIELDS = [
-  'itemName', 'aliasName', 'description', 'productCode',
+  'itemName', 'aliasName', 'description', 'applications', 'maintenance', 'disclaimer', 'productCode',
   'tileSize', 'thickness', 'finish', 'surface', 'colour', 'design', 'grade', 'collection',
   'tileType', 'applicationArea', 'antiSkidRating', 'waterAbsorption', 'breakingStrength',
   'countryOfOrigin', 'manufacturer',
   'unit', 'piecesPerBox', 'sqftPerBox', 'weightPerBox',
   'mrp', 'retailRate',
   'images', 'videos', 'images360', 'cataloguePdf',
-  'isNewArrival', 'isFeatured', 'brand', 'category', 'subcategory', 'gst',
+  'isNewArrival', 'isFeatured', 'isDealOfWeek', 'brand', 'category', 'subcategory', 'gst',
 ].join(' ');
 
 const ONLY_ONLINE = { status: 'active', onlineVisible: true };
@@ -45,6 +45,7 @@ const toPublic = (p) => {
     subcategory: p.subcategory?.name || '',
     isNewArrival: !!p.isNewArrival,
     isFeatured: !!p.isFeatured,
+    isDealOfWeek: !!p.isDealOfWeek,
     specs: {
       tileSize: p.tileSize || '',
       thickness: p.thickness || '',
@@ -112,6 +113,32 @@ router.get('/', async (req, res) => {
     });
   } catch (error) {
     return res.status(500).json({ success: false, message: error.message });
+  }
+});
+
+// GET /api/v1/shop/products/deals — deals of the week (online + isDealOfWeek:true), max 10
+router.get('/deals', async (_req, res) => {
+  try {
+    const deals = await Product.find({ ...ONLY_ONLINE, isDealOfWeek: true })
+      .select(PUBLIC_PRODUCT_FIELDS)
+      .populate('brand', 'name').populate('category', 'name').populate('subcategory', 'name')
+      .sort({ updatedAt: -1 }).limit(10).lean();
+    res.json({ success: true, data: deals.map(toPublic) });
+  } catch (error) {
+    res.status(500).json({ success: false, message: error.message });
+  }
+});
+
+// GET /api/v1/shop/products/new-arrivals — new arrivals (online + isNewArrival:true), max 10
+router.get('/new-arrivals', async (_req, res) => {
+  try {
+    const items = await Product.find({ ...ONLY_ONLINE, isNewArrival: true })
+      .select(PUBLIC_PRODUCT_FIELDS)
+      .populate('brand', 'name').populate('category', 'name').populate('subcategory', 'name')
+      .sort({ updatedAt: -1 }).limit(10).lean();
+    res.json({ success: true, data: items.map(toPublic) });
+  } catch (error) {
+    res.status(500).json({ success: false, message: error.message });
   }
 });
 

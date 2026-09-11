@@ -9,8 +9,10 @@ import DeliveryPincode from '../models/webContent/DeliveryPincode.js';
 import TileRoom from '../models/webContent/TileRoom.js';
 import TileTypeItem from '../models/webContent/TileTypeItem.js';
 import TileSizeItem from '../models/webContent/TileSizeItem.js';
+import VideoTestimonial from '../models/webContent/VideoTestimonial.js';
+import PincodeRequest from '../models/webContent/PincodeRequest.js';
 import { protect, requirePermission } from '../middleware/auth.js';
-import { uploadWebImages } from '../middleware/upload.js';
+import { uploadWebImages, uploadWebVideo } from '../middleware/upload.js';
 
 const router = Router();
 router.use(protect);
@@ -103,6 +105,26 @@ router.post('/upload-images', (req, res) => {
   });
 });
 
+// Video upload for video testimonials. Field name: 'video'. Returns a single URL.
+router.post('/upload-video', (req, res) => {
+  uploadWebVideo(req, res, (err) => {
+    if (err) {
+      console.error('[upload-video] multer error:', err.message, '| mimetype:', req.headers['content-type']);
+      return res.status(400).json({ success: false, message: err.message });
+    }
+    if (!req.file) {
+      console.error('[upload-video] no file received — check field name is "video" and Content-Type is multipart/form-data');
+      return res.status(400).json({ success: false, message: 'No video uploaded. Make sure the file field is named "video".' });
+    }
+    console.log('[upload-video] saved:', req.file.filename, req.file.mimetype, req.file.size, 'bytes');
+    res.json({
+      success: true,
+      message: 'Video uploaded.',
+      data: `/uploads/web-videos/${req.file.filename}`,
+    });
+  });
+});
+
 // ── Site settings (singleton: header logo, brand text, phone number) ──
 router.get('/site-settings', async (_req, res) => {
   try {
@@ -148,5 +170,31 @@ registerCrud('/testimonials', Testimonial);
 registerCrud('/tile-rooms', TileRoom);
 registerCrud('/tile-types', TileTypeItem);
 registerCrud('/tile-sizes', TileSizeItem);
+registerCrud('/video-testimonials', VideoTestimonial);
+
+// Pincode requests (read-only list for CRM staff — customers submit via the website)
+router.get('/pincode-requests', async (req, res) => {
+  try {
+    const { status } = req.query;
+    const filter = status ? { status } : {};
+    const items = await PincodeRequest.find(filter).sort({ createdAt: -1 }).lean();
+    res.json({ success: true, data: items, pagination: { currentPage: 1, totalPages: 1, totalItems: items.length, itemsPerPage: items.length } });
+  } catch (error) {
+    res.status(500).json({ success: false, message: error.message });
+  }
+});
+
+router.patch('/pincode-requests/:id', async (req, res) => {
+  try {
+    const allowed = ['pending', 'acknowledged', 'added'];
+    const status = req.body?.status;
+    if (!allowed.includes(status)) return res.status(422).json({ success: false, message: 'Invalid status.' });
+    const item = await PincodeRequest.findByIdAndUpdate(req.params.id, { status }, { new: true });
+    if (!item) return res.status(404).json({ success: false, message: 'Not found.' });
+    res.json({ success: true, message: 'Updated.', data: item });
+  } catch (error) {
+    res.status(500).json({ success: false, message: error.message });
+  }
+});
 
 export default router;
