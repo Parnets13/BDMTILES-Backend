@@ -81,6 +81,10 @@ const productSchema = new mongoose.Schema(
     salesType: { type: String, enum: ['Regular Sale', 'CD Sales'], default: 'Regular Sale' },
     productType: { type: String, enum: ['Regular Product', 'AO Product'], default: 'Regular Product' },
 
+    // Storefront ratings (aggregate from reviews; updated when reviews are posted)
+    rating: { type: Number, min: 0, max: 5, default: null },
+    reviewCount: { type: Number, min: 0, default: 0 },
+
     // Tally Integration
     tallyStockItemName: { type: String, trim: true, default: '' },
     tallyGUID: { type: String, trim: true, default: '' },

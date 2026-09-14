@@ -8,6 +8,7 @@ import errorHandler from './middleware/errorHandler.js';
 import authRoutes from './routes/authRoutes.js';
 import shopRoutes from './routes/shop/index.js';
 import webManagementRoutes from './routes/webManagementRoutes.js';
+import walletRoutes from './routes/walletRoutes.js';
 import userRoutes from './routes/userRoutes.js';
 import categoryRoutes from './routes/categoryRoutes.js';
 import productRoutes from './routes/productRoutes.js';
@@ -93,6 +94,7 @@ app.use('/api/v1', autoLogMiddleware);
 // Routes
 app.use('/api/v1/shop', shopRoutes); // public customer storefront API
 app.use('/api/v1/web-management', webManagementRoutes); // storefront CMS (staff)
+app.use('/api/v1/wallets', walletRoutes); // customer BDM Cash wallet management
 app.use('/api/v1/auth', authRoutes);
 app.use('/api/v1/users', userRoutes);
 app.use('/api/v1/category-setup', categoryRoutes);

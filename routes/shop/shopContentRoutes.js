@@ -14,9 +14,19 @@ import VideoTestimonial from '../../models/webContent/VideoTestimonial.js';
 
 const router = Router();
 
-// POST /api/v1/shop/content/pincode-request — customer requests delivery to unserviceable pincode
-router.post('/pincode-request', async (req, res) => {
+// GET /api/v1/shop/content/pincodes — all active serviceable pincodes (for location picker chips)
+router.get('/pincodes', async (_req, res) => {
   try {
+    const pincodes = await DeliveryPincode.find({ status: 'active' })
+      .select('pincode area city').sort({ sortOrder: 1, pincode: 1 }).lean();
+    res.json({ success: true, data: pincodes.map((p) => ({ pincode: p.pincode, area: p.area || '', city: p.city || '' })) });
+  } catch (error) {
+    res.status(500).json({ success: false, message: error.message });
+  }
+});
+
+// POST /api/v1/shop/content/pincode-request — customer requests delivery to unserviceable pincode
+router.post('/pincode-request', async (req, res) => {  try {
     const pincode = String(req.body?.pincode || '').trim();
     if (!/^\d{6}$/.test(pincode)) {
       return res.status(422).json({ success: false, message: 'Enter a valid 6-digit pincode.' });

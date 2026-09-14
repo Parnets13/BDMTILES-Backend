@@ -16,7 +16,9 @@ const PUBLIC_PRODUCT_FIELDS = [
   'unit', 'piecesPerBox', 'sqftPerBox', 'weightPerBox',
   'mrp', 'retailRate',
   'images', 'videos', 'images360', 'cataloguePdf',
-  'isNewArrival', 'isFeatured', 'isDealOfWeek', 'brand', 'category', 'subcategory', 'gst',
+  'isNewArrival', 'isFeatured', 'isDealOfWeek',
+  'rating', 'reviewCount',
+  'brand', 'category', 'subcategory', 'gst',
 ].join(' ');
 
 const ONLY_ONLINE = { status: 'active', onlineVisible: true };
@@ -28,7 +30,11 @@ const toPublic = (p) => {
     id: p._id,
     code: p.productCode || '',
     name: p.itemName,
+    aliasName: p.aliasName || '',
     description: p.description || '',
+    applications: p.applications || '',
+    maintenance: p.maintenance || '',
+    disclaimer: p.disclaimer || '',
     price,
     mrp: Number(p.mrp) || price,
     gst: Number(p.gst) || 0,
@@ -46,6 +52,8 @@ const toPublic = (p) => {
     isNewArrival: !!p.isNewArrival,
     isFeatured: !!p.isFeatured,
     isDealOfWeek: !!p.isDealOfWeek,
+    rating: p.rating ?? null,
+    reviewCount: Number(p.reviewCount) || 0,
     specs: {
       tileSize: p.tileSize || '',
       thickness: p.thickness || '',

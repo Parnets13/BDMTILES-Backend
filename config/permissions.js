@@ -19,6 +19,7 @@ export const AVAILABLE_PERMISSIONS = {
   ],
   "Web Management": [
     { id: "webmanagement.manage", name: "Web Management (Storefront CMS)" },
+    { id: "wallet.manage", name: "BDM Cash Wallet Management" },
   ],
   "Master Management": [
     { id: "product.master", name: "Product Master" },
@@ -191,7 +192,7 @@ export const ROLE_DEFAULT_PERMISSIONS = {
   owner: ['*'],        // All access — bypasses permission check in middleware
   admin: [
     'dashboard.view', 'system.management', 'users.manage', 'document.management', 'task.management',
-    'notification.inbox', 'webmanagement.manage',
+    'notification.inbox', 'webmanagement.manage', 'wallet.manage',
     'product.master', 'products.create', 'products.update', 'products.delete',
     'category.setup', 'dealer.master', 'customer.master', 'dealer.type', 'dealer.category',
     'supplier.master', 'employee.master', 'branch.master', 'warehouse.master', 'vehicle.master',
