@@ -1,6 +1,7 @@
 import mongoose from 'mongoose';
 
 const invoiceItemSchema = new mongoose.Schema({
+  salesOrderItem: { type: mongoose.Schema.Types.ObjectId, immutable: true },
   product: { type: mongoose.Schema.Types.ObjectId, ref: 'Product' },
   productCode: String,
   productName: String,
@@ -10,6 +11,10 @@ const invoiceItemSchema = new mongoose.Schema({
   batch: { type: String, default: '' },
   quantity: { type: Number, default: 0 },
   unit: { type: String, default: 'Box' },
+  baseQuantity: { type: Number, default: 0, min: 0 },
+  baseUnit: { type: String, default: 'Box' },
+  conversionFactor: { type: Number, default: 1, min: 0.000000001 },
+  uomVersion: { type: Number, default: 1, min: 1 },
   boxes: { type: Number, default: 0 },
   pieces: { type: Number, default: 0 },
   sqft: { type: Number, default: 0 },

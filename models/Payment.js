@@ -49,6 +49,13 @@ const paymentSchema = new mongoose.Schema(
 
     remarks: { type: String, default: '' },
 
+    // Field collection (Sales Executive app). These are captured when a receipt is
+    // recorded in the field; they never affect posting, which stays gated on status.
+    isFieldCollection: { type: Boolean, default: false },
+    collectedBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User' },
+    collectionLocation: { lat: Number, lng: Number },
+    receiptImage: { type: String, default: '' },
+
     // Tally
     tallySyncStatus: { type: String, enum: ['not_synced', 'pending', 'synced', 'failed'], default: 'not_synced' },
     tallyVoucherNumber: String,

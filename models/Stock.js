@@ -22,6 +22,11 @@ const stockSchema = new mongoose.Schema(
     transitQty: { type: Number, default: 0 },
     shortQty: { type: Number, default: 0 },
 
+    // Stable inventory-UOM snapshot. These fields are deliberately excluded from
+    // the unique key and do not reinterpret or multiply legacy balances.
+    baseUnit: { type: String, trim: true, default: 'Unit' },
+    uomVersion: { type: Number, min: 1, default: 1 },
+
     // Location within warehouse
     zone: { type: String, default: '' },
     rack: { type: String, default: '' },

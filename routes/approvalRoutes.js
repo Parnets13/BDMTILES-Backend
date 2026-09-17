@@ -8,6 +8,8 @@ import Quotation from '../models/Quotation.js';
 import PurchaseOrder from '../models/PurchaseOrder.js';
 import PurchaseReturn from '../models/PurchaseReturn.js';
 import SalesReturn from '../models/SalesReturn.js';
+import StockAdjustment from '../models/StockAdjustment.js';
+import PhysicalStockAudit from '../models/PhysicalStockAudit.js';
 import { protect, requireAnyPermission, userHasPermission } from '../middleware/auth.js';
 import { requireBranch } from '../utils/branchScope.js';
 import { generateBranchNumber } from '../utils/branchSequence.js';
@@ -16,12 +18,17 @@ import { actionPurchaseOrderApproval } from '../services/purchaseOrderService.js
 import { reserveSalesOrderInventory } from '../utils/salesOrderInventory.js';
 import { releaseSalesOrderReservation } from '../utils/releaseSalesOrderReservation.js';
 import { postSubledgerEntry } from '../utils/subledgerPosting.js';
+import { actionPhysicalAuditApproval, actionStockAdjustmentApproval } from '../services/stockWorkflowService.js';
+import { actionSalesOrderRemainingCancellation } from '../services/salesOrderRemainingCancellationService.js';
 
 const APPROVAL_TYPE_PERMISSIONS = Object.freeze({
   sales_order: 'sales.order.approve',
   sales_order_cancellation: 'sales.order.approve',
+  sales_order_remaining_cancellation: 'sales.order.approve',
   quotation: 'sales.order.approve',
   purchase_order: 'po.approve',
+  stock_adjustment: 'stock.adjustment.approve',
+  physical_stock_audit: 'stock.audit.approve',
   credit_limit: 'finance.management',
   rate_override: 'dealer.discounts',
   debit_note: 'debit.note',
@@ -33,8 +40,11 @@ const APPROVAL_TYPE_PERMISSIONS = Object.freeze({
 const APPROVAL_REFERENCE_TYPES = Object.freeze({
   sales_order: { referenceModel: 'SalesOrder', Model: SalesOrder, displayField: 'orderNumber', required: true },
   sales_order_cancellation: { referenceModel: 'SalesOrder', Model: SalesOrder, displayField: 'orderNumber', required: true },
+  sales_order_remaining_cancellation: { referenceModel: 'SalesOrder', Model: SalesOrder, displayField: 'orderNumber', required: true },
   quotation: { referenceModel: 'Quotation', Model: Quotation, displayField: 'quotationNumber', required: true },
   purchase_order: { referenceModel: 'PurchaseOrder', Model: PurchaseOrder, displayField: 'poNumber', required: true },
+  stock_adjustment: { referenceModel: 'StockAdjustment', Model: StockAdjustment, displayField: 'adjustmentNumber', required: true },
+  physical_stock_audit: { referenceModel: 'PhysicalStockAudit', Model: PhysicalStockAudit, displayField: 'auditNumber', required: true },
   credit_limit: { referenceModel: 'SalesOrder', Model: SalesOrder, displayField: 'orderNumber' },
   rate_override: { referenceModel: 'SalesOrder', Model: SalesOrder, displayField: 'orderNumber' },
   debit_note: { referenceModel: 'PurchaseReturn', Model: PurchaseReturn, displayField: 'debitNoteNumber' },
@@ -60,7 +70,7 @@ const sendRouteError = (res, error) => {
   let status = error.status;
   if (!status && (error.name === 'CastError' || error.name === 'ValidationError')) status = 422;
   if (!status && error.code === 11000) status = 409;
-  return res.status(status || 500).json({ success: false, message: error.message });
+  return res.status(status || 500).json({ success: false, message: error.message, ...(error.details ? { details: error.details } : {}) });
 };
 
 const allowedApprovalTypes = (user) => Object.entries(APPROVAL_TYPE_PERMISSIONS)
@@ -181,11 +191,11 @@ router.post('/', async (req, res) => {
       throw routeError(422, 'Unsupported approval type.');
     }
 
-    if (data.type === 'sales_order_cancellation') {
-      throw routeError(422, 'Use the Sales Order cancellation-request endpoint.');
+    if (['sales_order_cancellation', 'sales_order_remaining_cancellation'].includes(data.type)) {
+      throw routeError(422, 'Use the owning Sales Order cancellation-request endpoint.');
     }
-    if (data.type === 'purchase_order') {
-      throw routeError(422, 'Use the Purchase Order submit endpoint to create its approval request.');
+    if (['purchase_order', 'stock_adjustment', 'physical_stock_audit'].includes(data.type)) {
+      throw routeError(422, 'Use the owning document submit endpoint to create this approval request.');
     }
     const referenceNumber = await validateApprovalReference(
       req.branchId,
@@ -215,6 +225,30 @@ const actionApproval = async (req, res, nextStatus) => {
     return sendRouteError(res, error);
   }
 
+  // Durable stock workflows must always execute their domain action; generic approval
+  // is never allowed to update only the ApprovalRequest status.
+  try {
+    const current = await ApprovalRequest.findOne({ _id: req.params.id, branch: req.branchId }).lean();
+    if (current && ['stock_adjustment', 'physical_stock_audit'].includes(current.type)) {
+      if (!canActionApproval(req.user, current)) throw routeError(403, 'Access denied for this approval type.');
+      if (current.status !== 'pending') throw routeError(409, 'Already actioned.');
+      const domainResult = current.type === 'stock_adjustment'
+        ? await actionStockAdjustmentApproval({ branchId: req.branchId, actorId: req.user._id, adjustmentId: current.referenceId, nextStatus, remarks, approvalRequestId: current._id })
+        : await actionPhysicalAuditApproval({ branchId: req.branchId, actorId: req.user._id, auditId: current.referenceId, nextStatus, remarks, approvalRequestId: current._id });
+      const updatedApproval = await ApprovalRequest.findById(current._id).lean();
+      return res.json({
+        success: true,
+        message: nextStatus === 'approved' ? 'Approved and domain posting completed.' : 'Rejected without stock posting.',
+        data: updatedApproval,
+        domainDocument: domainResult.document,
+        affectedStockIds: domainResult.stocks || [],
+        movementIds: domainResult.movements || [],
+      });
+    }
+  } catch (error) {
+    return sendRouteError(res, error);
+  }
+
   const session = await mongoose.startSession();
   let approval;
   try {
@@ -225,6 +259,20 @@ const actionApproval = async (req, res, nextStatus) => {
         throw routeError(403, 'Access denied for this approval type.');
       }
       if (current.status !== 'pending') throw routeError(409, 'Already actioned.');
+
+      if (current.type === 'sales_order_remaining_cancellation') {
+        const result = await actionSalesOrderRemainingCancellation({
+          branchId: req.branchId,
+          orderId: current.referenceId,
+          approvalRequestId: current._id,
+          actorId: req.user._id,
+          nextStatus,
+          remarks,
+          session,
+        });
+        approval = result.approval;
+        return;
+      }
 
       const purchaseOrderAction = current.type === 'purchase_order'
         && current.referenceModel === 'PurchaseOrder'
@@ -314,7 +362,7 @@ const actionApproval = async (req, res, nextStatus) => {
 
       if (cancellationAction) {
         if (nextStatus === 'approved') {
-          await releaseSalesOrderReservation(current.referenceId, { session });
+          await releaseSalesOrderReservation(current.referenceId, { session, actor: req.user._id });
           await PickList.updateMany(
             { branch: req.branchId, salesOrder: current.referenceId, stockConsumedAt: null },
             {
@@ -407,8 +455,11 @@ const actionApproval = async (req, res, nextStatus) => {
           { new: true, runValidators: true, session }
         );
         if (!updatedOrder) throw routeError(409, 'Referenced sales order approval state changed.');
+        if (aggregateStatus === 'rejected' && updatedOrder.reservationStatus === 'reserved') {
+          await releaseSalesOrderReservation(updatedOrder._id, { session, actor: req.user._id });
+        }
         if (aggregateStatus === 'approved' && updatedOrder.confirmationRequested && updatedOrder.status === 'draft') {
-          await reserveSalesOrderInventory(updatedOrder, { session });
+          await reserveSalesOrderInventory(updatedOrder, { session, actor: req.user._id });
           updatedOrder.status = 'confirmed';
           await updatedOrder.save({ session });
           if (updatedOrder.dealer && updatedOrder.grandTotal > 0) {
@@ -437,6 +488,7 @@ const actionApproval = async (req, res, nextStatus) => {
         if (nextStatus === 'approved') {
           setFields.approvedBy = req.user._id;
           setFields.approvalDate = actionedAt;
+          setFields.stockQueuedAt = referencedQuotation.stockQueuedAt || actionedAt;
         }
         const quotationUpdate = nextStatus === 'approved'
           ? { $set: setFields }

@@ -3,6 +3,7 @@ import Invoice from '../models/Invoice.js';
 import SalesOrder from '../models/SalesOrder.js';
 import DispatchTrip from '../models/DispatchTrip.js';
 import Payment from '../models/Payment.js';
+import SalesReturn from '../models/SalesReturn.js';
 import BranchSettings from '../models/BranchSettings.js';
 import { protect, requirePermission } from '../middleware/auth.js';
 import { requireBranch } from '../utils/branchScope.js';
@@ -98,7 +99,7 @@ router.post('/generate-from-so/:soId', requirePermission('invoice'), async (req,
   const requestFingerprint = fingerprintRequest({ salesOrder: req.params.soId, ...req.body });
   try {
     const so = await SalesOrder.findOne({ _id: req.params.soId, branch: req.branchId })
-      .populate('dealer', 'businessName dealerCode gstin pan address city state mobile')
+      .populate('dealer', 'businessName dealerCode gstin pan address city state mobile creditDays paymentTerms')
       .populate('items.product', 'productCode itemName hsnCode images piecesPerBox sqftPerBox')
       .lean();
 
@@ -115,16 +116,16 @@ router.post('/generate-from-so/:soId', requirePermission('invoice'), async (req,
     }
 
     if (['draft', 'cancelled'].includes(so.status)) {
-      return res.status(409).json({ success: false, code: 'FULL_DISPATCH_REQUIRED', message: `Cannot generate an invoice for a ${so.status} order.` });
+      return res.status(409).json({ success: false, code: 'FINAL_DISPATCH_REQUIRED', message: `Cannot generate an invoice for a ${so.status} order.` });
     }
     const incompleteLine = (so.items || []).find(item => (
-      Number(item.quantity || 0) - Number(item.dispatchedQuantity || 0) > QUANTITY_TOLERANCE
+      Number(item.quantity || 0) - Number(item.dispatchedQuantity || 0) + Number(item.dispatchReversedQuantity || 0) - Number(item.cancelledRemainingQuantity || 0) > QUANTITY_TOLERANCE
     ));
     if (incompleteLine) {
       return res.status(409).json({
         success: false,
-        code: 'FULL_DISPATCH_REQUIRED',
-        message: `${incompleteLine.productName || incompleteLine.productCode || 'Every order line'} must be fully dispatched before invoicing.`,
+        code: 'FINAL_DISPATCH_REQUIRED',
+        message: `${incompleteLine.productName || incompleteLine.productCode || 'Every order line'} must be dispatched or have its remainder formally cancelled before final invoicing.`,
       });
     }
 
@@ -165,9 +166,11 @@ router.post('/generate-from-so/:soId', requirePermission('invoice'), async (req,
     const invoiceNumber = await generateBranchNumber(req.branchId, 'invoice', new Date());
 
     // Build invoice items with full details
-    const items = so.items.map(item => {
+    const items = so.items.filter(item => Number(item.dispatchedQuantity || 0) - Number(item.dispatchReversedQuantity || 0) > QUANTITY_TOLERANCE).map(item => {
       const prod = item.product || {};
-      const qty = item.quantity || 0;
+      const qty = Math.max(0, Number(item.dispatchedQuantity || 0) - Number(item.dispatchReversedQuantity || 0));
+      const orderedQty = Number(item.quantity || 0);
+      const commercialRatio = orderedQty > 0 ? qty / orderedQty : 0;
       const rate = item.rate || 0;
       const baseAmount = qty * rate;
 
@@ -178,7 +181,7 @@ router.post('/generate-from-so/:soId', requirePermission('invoice'), async (req,
         discountAmt = (item.discount || 0) * qty;
       }
 
-      const taxable = baseAmount - discountAmt - (item.schemeDiscount || 0);
+      const taxable = baseAmount - discountAmt - (Number(item.schemeDiscount || 0) * commercialRatio);
       const gstPct = item.gstPercentage || 18;
       const gstAmt = (taxable * gstPct) / 100;
 
@@ -187,6 +190,7 @@ router.post('/generate-from-so/:soId', requirePermission('invoice'), async (req,
       const halfGst = gstAmt / 2;
 
       return {
+        salesOrderItem: item._id,
         product: prod._id || item.product,
         productCode: item.productCode || prod.productCode || '',
         productName: item.productName || prod.itemName || '',
@@ -196,14 +200,18 @@ router.post('/generate-from-so/:soId', requirePermission('invoice'), async (req,
         batch: item.batch || '',
         quantity: qty,
         unit: item.unit || 'Box',
-        boxes: item.boxes || qty,
-        pieces: item.pieces || (qty * (prod.piecesPerBox || 0)),
-        sqft: item.sqft || (qty * (prod.sqftPerBox || 0)),
+        baseQuantity: qty * Number(item.conversionFactor || 1),
+        baseUnit: item.baseUnit || item.unit || 'Box',
+        conversionFactor: Number(item.conversionFactor || 1),
+        uomVersion: Number(item.uomVersion || 1),
+        boxes: Number(item.boxes || orderedQty) * commercialRatio,
+        pieces: Number(item.pieces || (orderedQty * (prod.piecesPerBox || 0))) * commercialRatio,
+        sqft: Number(item.sqft || (orderedQty * (prod.sqftPerBox || 0))) * commercialRatio,
         rate,
         discount: item.discount || 0,
         discountType: item.discountType || 'flat',
         discountAmount: Math.round(discountAmt * 100) / 100,
-        schemeDiscount: item.schemeDiscount || 0,
+        schemeDiscount: Math.round(Number(item.schemeDiscount || 0) * commercialRatio * 100) / 100,
         taxableAmount: Math.round(taxable * 100) / 100,
         gstPercentage: gstPct,
         cgst: Math.round(halfGst * 100) / 100,
@@ -214,6 +222,7 @@ router.post('/generate-from-so/:soId', requirePermission('invoice'), async (req,
       };
     });
 
+    if (!items.length) return res.status(409).json({ success: false, code: 'NO_DISPATCHED_QUANTITY', message: 'A final invoice requires at least one dispatched line.' });
     // Determine interstate treatment from GST jurisdiction codes, never from missing/free-text state names.
     const branchSettings = await BranchSettings.findOne({ branch: req.branchId }).lean();
     const isInterState = buyerStateCode !== sellerStateCode;
@@ -235,13 +244,25 @@ router.post('/generate-from-so/:soId', requirePermission('invoice'), async (req,
     const totalDiscount = items.reduce((s, i) => s + i.discountAmount, 0);
     const totalSchemeDiscount = items.reduce((s, i) => s + i.schemeDiscount, 0);
 
-    const chargesTotal = (so.freightCharges || 0) + (so.loadingCharges || 0) + (so.installationCharges || 0) + (so.otherCharges || 0);
+    const cancelledHeaderCharges = so.status === 'partially_closed' ? (so.closureFinancialSummary?.headerCharges || {}) : {};
+    const invoiceCharges = Object.fromEntries(['freightCharges', 'loadingCharges', 'installationCharges', 'otherCharges'].map(field => [field, Math.max(0, Number(so[field] || 0) - Number(cancelledHeaderCharges[field] || 0))]));
+    const chargesTotal = Object.values(invoiceCharges).reduce((sum, value) => sum + value, 0);
     const rawGrand = taxableTotal + totalTax + chargesTotal;
-    const grandTotal = Math.round(rawGrand);
+    const closureGrandTotal = Number(so.closureFinancialSummary?.expectedFinalInvoiceGrandTotal);
+    const grandTotal = so.status === 'partially_closed' && Number.isFinite(closureGrandTotal)
+      ? closureGrandTotal
+      : Math.round(rawGrand);
     const roundOff = grandTotal - rawGrand;
     const paidAmount = Math.min(grandTotal, Math.max(0, Number(so.advanceAmount) || 0));
     const balanceAmount = Math.max(0, grandTotal - paidAmount);
     const paymentStatus = balanceAmount <= 0.01 ? 'paid' : paidAmount > 0.01 ? 'partial' : 'pending';
+
+    // Credit terms flow from the dealer master onto the invoice: due date =
+    // invoice date + creditDays, so ledger/aging and payment reminders are accurate.
+    const invoiceDate = new Date();
+    const creditDays = Math.max(0, Number(so.dealer?.creditDays ?? 0));
+    const dueDate = new Date(invoiceDate.getTime() + creditDays * 24 * 60 * 60 * 1000);
+    const paymentTermsText = String(so.dealer?.paymentTerms || (creditDays ? `${creditDays} days credit` : ''));
 
     const invoice = await Invoice.create({
       invoiceNumber,
@@ -249,7 +270,7 @@ router.post('/generate-from-so/:soId', requirePermission('invoice'), async (req,
       requestFingerprint,
       activeSalesOrderKey: `${String(req.branchId)}:${String(so._id)}`,
       branch: req.branchId,
-      invoiceDate: new Date(),
+      invoiceDate,
       invoiceType: 'tax_invoice',
       gstType: 'output', // Sales invoice = Output GST
       isInterState,
@@ -291,10 +312,10 @@ router.post('/generate-from-so/:soId', requirePermission('invoice'), async (req,
       totalSgst: Math.round(totalSgst * 100) / 100,
       totalIgst: Math.round(totalIgst * 100) / 100,
       totalTax: Math.round(totalTax * 100) / 100,
-      freightCharges: so.freightCharges || 0,
-      loadingCharges: so.loadingCharges || 0,
-      installationCharges: so.installationCharges || 0,
-      otherCharges: so.otherCharges || 0,
+      freightCharges: invoiceCharges.freightCharges,
+      loadingCharges: invoiceCharges.loadingCharges,
+      installationCharges: invoiceCharges.installationCharges,
+      otherCharges: invoiceCharges.otherCharges,
       roundOff: Math.round(roundOff * 100) / 100,
       grandTotal,
       amountInWords: numberToWords(grandTotal),
@@ -303,6 +324,8 @@ router.post('/generate-from-so/:soId', requirePermission('invoice'), async (req,
       paidAmount,
       balanceAmount,
       paymentStatus,
+      paymentTerms: paymentTermsText,
+      dueDate,
 
       // Status
       status: 'generated',
@@ -358,6 +381,10 @@ router.patch('/:id/status', requirePermission('invoice'), async (req, res) => {
       });
       if (allocatedPayment) {
         return res.status(409).json({ success: false, message: 'Invoice cancellation is blocked while a pending or confirmed payment references it.' });
+      }
+      const postedReturn = await SalesReturn.exists({ invoice: invoiceToCancel._id, status: { $nin: ['cancelled', 'reversed'] } });
+      if (postedReturn) {
+        return res.status(409).json({ success: false, message: 'Invoice cancellation is blocked while a non-reversed Sales Return references it.' });
       }
     }
 

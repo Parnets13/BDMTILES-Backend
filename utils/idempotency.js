@@ -23,7 +23,7 @@ export const getIdempotencyContext = (req) => {
     throw error;
   }
   return {
-    sourceKey: `${String(req.branchId)}:${key}`,
+    sourceKey: `${String(req.branchId)}:${String(req.user?._id || 'anonymous')}:${key}`,
     requestFingerprint: requestFingerprint(req.body),
   };
 };

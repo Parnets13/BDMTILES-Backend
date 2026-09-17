@@ -4,11 +4,12 @@ import DispatchTrip from '../models/DispatchTrip.js';
 import Delivery from '../models/Delivery.js';
 import SalesOrder from '../models/SalesOrder.js';
 import PickList from '../models/PickList.js';
-import Stock from '../models/Stock.js';
+import { applyStockMovement, stockOperationKey } from '../services/stockMovementService.js';
 import { protect, requirePermission } from '../middleware/auth.js';
 import { requireBranch } from '../utils/branchScope.js';
 import { generateBranchNumber } from '../utils/branchSequence.js';
 import { QUANTITY_TOLERANCE, refreshSalesOrderLine, salesOrderIsFullyDispatched } from '../utils/salesOrderInventory.js';
+import { stableUomSnapshot } from '../services/stockUomService.js';
 
 const router = Router();
 router.use(protect);
@@ -16,6 +17,21 @@ router.use(requireBranch);
 router.use(requirePermission('dispatch.management'));
 
 const terminalDeliveryStatuses = ['delivered', 'partially_delivered', 'failed'];
+
+const deliveryItemsForPickList = (pickList, trip) => (pickList.items || [])
+  .filter(item => Number(item.dispatchedQty || 0) > QUANTITY_TOLERANCE)
+  .map(item => {
+    const snapshot = stableUomSnapshot(item);
+    const quantity = Number(item.dispatchedQty || 0);
+    return {
+      pickList: pickList._id, pickListItem: item._id, salesOrderItem: item.salesOrderItem,
+      originalDispatchOperationKey: stockOperationKey('dispatch-trip', trip._id, pickList._id, item._id, 'consume'),
+      product: item.product, warehouse: item.warehouse, shade: item.shade || '', batch: item.batch || '',
+      dispatchedQuantity: quantity, acceptedQuantity: 0, shortQuantity: 0, damagedRejectedQuantity: 0,
+      enteredUnit: snapshot.enteredUnit, baseQuantity: quantity * snapshot.conversionFactor,
+      baseUnit: snapshot.baseUnit, conversionFactor: snapshot.conversionFactor, uomVersion: snapshot.uomVersion,
+    };
+  });
 
 const stateConflict = (res, trip, expected, action) => res.status(409).json({
   success: false,
@@ -129,7 +145,9 @@ router.post('/', async (req, res) => {
     }
 
     const orders = pickLists.map((pickList, index) => {
-      const unresolvedSortingItem = (pickList.items || []).find(item => item.sortingVerifiedAt && (Number(item.sortingShortQty || 0) > QUANTITY_TOLERANCE || Number(item.sortingDamagedQty || 0) > QUANTITY_TOLERANCE));
+      const unresolvedSortingItem = (pickList.items || []).find(item => item.sortingVerifiedAt
+        && (Number(item.sortingShortQty || 0) > QUANTITY_TOLERANCE || Number(item.sortingDamagedQty || 0) > QUANTITY_TOLERANCE)
+        && (!pickList.sortingPostedAt || item.sortingDiscrepancyResolved !== true));
       if (unresolvedSortingItem) {
         const error = new Error(`${pickList.pickListNumber} has unresolved sorting discrepancies for ${unresolvedSortingItem.productName}.`);
         error.status = 409;
@@ -444,7 +462,9 @@ router.patch('/:id/dispatch', async (req, res) => {
           throw new Error(`${order.pickListNumber || order.orderNumber} is no longer ready for dispatch.`);
         }
         for (const item of pickList.items) {
-          if (item.sortingVerifiedAt && (Number(item.sortingShortQty || 0) > QUANTITY_TOLERANCE || Number(item.sortingDamagedQty || 0) > QUANTITY_TOLERANCE)) {
+          if (item.sortingVerifiedAt
+              && (Number(item.sortingShortQty || 0) > QUANTITY_TOLERANCE || Number(item.sortingDamagedQty || 0) > QUANTITY_TOLERANCE)
+              && (!pickList.sortingPostedAt || item.sortingDiscrepancyResolved !== true)) {
             throw new Error(`${pickList.pickListNumber} has unresolved sorting discrepancies for ${item.productName}.`);
           }
           const quantity = Number(item.sortingVerifiedAt ? item.sortedQty : item.pickedQty);
@@ -465,24 +485,32 @@ router.patch('/:id/dispatch', async (req, res) => {
         }
       }
 
-      for (const requirement of requirements.values()) {
-        const stock = await Stock.findOneAndUpdate(
-          {
-            branch: requirement.branch,
-            product: requirement.product,
-            warehouse: requirement.warehouse,
-            shade: requirement.shade,
-            batch: requirement.batch,
-            reservedQty: { $gte: requirement.quantity },
-            totalQty: { $gte: requirement.quantity },
-          },
-          { $inc: { reservedQty: -requirement.quantity, totalQty: -requirement.quantity }, $set: { lastSaleDate: new Date() } },
-          { new: true, session }
-        );
-        if (!stock) throw new Error(`Insufficient reserved stock for ${requirement.productName} (shade ${requirement.shade || 'default'}, batch ${requirement.batch || 'default'}).`);
+      const stockConsumedAt = new Date();
+      for (const order of lockedTrip.orders) {
+        const pickList = pickListById.get(String(order.pickList));
+        for (const item of pickList.items) {
+          const quantity = Number(item.sortingVerifiedAt ? item.sortedQty : item.pickedQty);
+          if (!(quantity > 0)) continue;
+          const snapshot = stableUomSnapshot(item);
+          const baseQuantity = quantity * snapshot.conversionFactor;
+          await applyStockMovement({
+            operationKey: stockOperationKey('dispatch-trip', lockedTrip._id, pickList._id, item._id, 'consume'),
+            correlationKey: stockOperationKey('dispatch-trip', lockedTrip._id),
+            movementType: 'sales_dispatch', phase: 'dispatched',
+            branch: req.branchId, product: item.product, warehouse: item.warehouse, shade: item.shade || '', batch: item.batch || '',
+            deltas: { reservedQty: -baseQuantity, totalQty: -baseQuantity },
+            stockSet: { lastSaleDate: stockConsumedAt },
+            enteredQuantity: quantity, ...snapshot, baseQuantity,
+            sourceType: 'DispatchTrip', sourceModel: 'DispatchTrip', sourceId: lockedTrip._id, sourceLineId: item._id,
+            sourceNumber: lockedTrip.tripNumber, actor: req.user._id, occurredAt: stockConsumedAt,
+            reason: 'Sales dispatch stock consumption',
+            metadata: { pickList: pickList._id, pickListNumber: pickList.pickListNumber, salesOrder: pickList.salesOrder?._id || pickList.salesOrder, salesOrderItem: item.salesOrderItem },
+            guardMessage: `Insufficient reserved stock for ${item.productName || item.productCode || 'item'} (shade ${item.shade || 'default'}, batch ${item.batch || 'default'}).`,
+          }, { session });
+        }
       }
 
-      const dispatchedAt = new Date();
+      const dispatchedAt = stockConsumedAt;
       for (const order of lockedTrip.orders) {
         const pickList = pickListById.get(String(order.pickList));
         const salesOrder = await SalesOrder.findOne({ _id: pickList.salesOrder._id, branch: req.branchId }).session(session);
@@ -550,6 +578,8 @@ router.patch('/:id/dispatch', async (req, res) => {
             totalBoxes: order.totalBoxes,
             unfulfilledQty,
             hasFulfillmentShortage: unfulfilledQty > 0,
+            items: deliveryItemsForPickList(pickList, lockedTrip),
+            itemReconciliationState: 'pending',
             otp: String(Math.floor(100000 + Math.random() * 900000)),
             status: 'in_transit',
             startTime: dispatchedAt,

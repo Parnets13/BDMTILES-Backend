@@ -298,6 +298,11 @@ router.post('/', requirePermission('invoice'), async (req, res) => {
       if (grandTotal <= 0) throw invoiceError(422, 'Supplier invoice grand total must be greater than zero.');
       const invoiceDate = req.body.invoiceDate || new Date();
       const invoiceRefNumber = await generateBranchNumber(req.branchId, 'supplierInvoice', invoiceDate, { session });
+      // Auto-fill payment due date from the supplier master creditDays when the
+      // client does not supply one explicitly: dueDate = invoiceDate + creditDays.
+      const supplierCreditDays = Math.max(0, Number(supplier.creditDays ?? 0));
+      const resolvedDueDate = req.body.dueDate
+        || new Date(new Date(invoiceDate).getTime() + supplierCreditDays * 24 * 60 * 60 * 1000);
       [result] = await SupplierInvoice.create([{
         invoiceRefNumber,
         branch: req.branchId,
@@ -316,8 +321,8 @@ router.post('/', requirePermission('invoice'), async (req, res) => {
         grandTotal,
         paidAmount: 0,
         balanceAmount: grandTotal,
-        paymentTerms: String(req.body.paymentTerms ?? supplier.paymentTerms ?? ''),
-        dueDate: req.body.dueDate || undefined,
+        paymentTerms: String(req.body.paymentTerms ?? supplier.paymentTerms ?? (supplierCreditDays ? `${supplierCreditDays} days credit` : '')),
+        dueDate: resolvedDueDate,
         status: 'pending_verification',
         matchReport: expectedReport(expected),
         remarks: String(req.body.remarks || ''),

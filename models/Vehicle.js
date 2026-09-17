@@ -25,7 +25,6 @@ const vehicleSchema = new mongoose.Schema(
   { timestamps: true }
 );
 
-vehicleSchema.index({ vehicleNumber: 1 });
 vehicleSchema.index({ isActive: 1 });
 
 const Vehicle = mongoose.model('Vehicle', vehicleSchema);

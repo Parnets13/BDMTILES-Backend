@@ -1,3 +1,4 @@
+import fs from 'fs';
 import { Router } from 'express';
 import mongoose from 'mongoose';
 import Complaint from '../models/Complaint.js';
@@ -193,6 +194,9 @@ router.post('/evidence', requireAnyPermission('complaint.management', 'warehouse
       const data = documents.map((evidence) => ({ id: evidence._id, url: evidence.url }));
       return res.json({ success: true, message: `${data.length} evidence image(s) uploaded.`, data });
     } catch (persistenceError) {
+      await Promise.all((req.files || []).map((file) => (
+        fs.promises.unlink(file.path).catch(() => undefined)
+      )));
       return res.status(500).json({ success: false, message: `Evidence metadata could not be persisted: ${persistenceError.message}` });
     }
   });
@@ -243,6 +247,10 @@ router.get('/:id', requireAnyPermission('complaint.management', 'warehouse.verif
 
 router.post('/', requirePermission('complaint.management'), async (req, res) => {
   try {
+    const rawComplaintPhotos = Array.isArray(req.body.complaintPhotos)
+      ? req.body.complaintPhotos
+      : [];
+    if (rawComplaintPhotos.length > 10) throw routeError(422, 'A complaint can include at most 10 evidence images.');
     const data = {
       branch: req.branchId,
       dealer: req.body.dealer,
@@ -253,9 +261,7 @@ router.post('/', requirePermission('complaint.management'), async (req, res) => 
       description: trimmed(req.body.description),
       priority: req.body.priority,
       assignedTo: req.body.assignedTo,
-      complaintPhotos: Array.isArray(req.body.complaintPhotos)
-        ? req.body.complaintPhotos.map((photo) => ({ url: trimmed(photo?.url), caption: trimmed(photo?.caption) })).filter((photo) => photo.url)
-        : [],
+      complaintPhotos: [],
       status: 'open',
       requiresReturn: false,
       returnReceived: false,
@@ -265,6 +271,41 @@ router.post('/', requirePermission('complaint.management'), async (req, res) => 
       createdByName: req.user.name,
     };
     if (!data.description) throw routeError(422, 'Complaint description is required.');
+
+    const evidenceSelectors = rawComplaintPhotos.map((photo, index) => {
+      const evidenceId = trimmed(photo?.evidence);
+      const url = trimmed(photo?.url);
+      if (evidenceId) {
+        if (!mongoose.isValidObjectId(evidenceId)) throw routeError(422, `complaintPhotos[${index}].evidence is invalid.`);
+        return { _id: evidenceId };
+      }
+      if (url) return { url };
+      throw routeError(422, `complaintPhotos[${index}] requires an uploaded evidence identifier.`);
+    });
+    const evidenceRecords = evidenceSelectors.length
+      ? await ComplaintEvidence.find({
+        branch: req.branchId,
+        uploadedBy: req.user._id,
+        status: 'uploaded',
+        $or: evidenceSelectors,
+      }).lean()
+      : [];
+    if (evidenceRecords.length !== evidenceSelectors.length) {
+      throw routeError(422, 'Complaint evidence must belong to the active branch and current user, and must not already be attached.');
+    }
+    const evidenceById = new Map(evidenceRecords.map((evidence) => [String(evidence._id), evidence]));
+    const evidenceByUrl = new Map(evidenceRecords.map((evidence) => [evidence.url, evidence]));
+    const resolvedEvidence = rawComplaintPhotos.map((photo) => (
+      evidenceById.get(trimmed(photo?.evidence)) || evidenceByUrl.get(trimmed(photo?.url))
+    ));
+    if (new Set(resolvedEvidence.map((evidence) => String(evidence?._id))).size !== resolvedEvidence.length) {
+      throw routeError(422, 'Complaint evidence contains a duplicate image.');
+    }
+    data.complaintPhotos = resolvedEvidence.map((evidence, index) => ({
+      evidence: evidence._id,
+      url: evidence.url,
+      caption: trimmed(rawComplaintPhotos[index]?.caption),
+    }));
 
     let order = null;
     let invoice = null;
@@ -361,7 +402,30 @@ router.post('/', requirePermission('complaint.management'), async (req, res) => 
 
     const { generateUniqueCode } = await import('../utils/codeGenerator.js');
     data.complaintNumber = await generateUniqueCode(Complaint, 'complaintNumber', 'CMP-', 5);
-    const complaint = await Complaint.create(data);
+    const session = await mongoose.startSession();
+    let complaint;
+    try {
+      await session.withTransaction(async () => {
+        [complaint] = await Complaint.create([data], { session });
+        if (!resolvedEvidence.length) return;
+        const attachedAt = new Date();
+        const evidenceUpdate = await ComplaintEvidence.updateMany(
+          {
+            _id: { $in: resolvedEvidence.map((evidence) => evidence._id) },
+            branch: req.branchId,
+            uploadedBy: req.user._id,
+            status: 'uploaded',
+          },
+          { $set: { status: 'attached', complaint: complaint._id, attachedAt } },
+          { session },
+        );
+        if (evidenceUpdate.modifiedCount !== resolvedEvidence.length) {
+          throw routeError(409, 'One or more evidence images were already attached; upload fresh evidence and retry.');
+        }
+      });
+    } finally {
+      await session.endSession();
+    }
     await emitNotification({
       branch: req.branchId,
       module: 'complaint',

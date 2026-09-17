@@ -98,7 +98,7 @@ const complaintSchema = new mongoose.Schema(
     // Category & Description
     category: {
       type: String,
-      enum: ['damaged_goods', 'wrong_product', 'quality_issue', 'shade_mismatch', 'size_issue', 'short_delivery', 'billing_error', 'delivery_delay', 'packing_issue', 'other'],
+      enum: ['damaged_goods', 'wrong_product', 'quality_issue', 'shade_mismatch', 'size_issue', 'short_delivery', 'billing_error', 'payment_issue', 'delivery_delay', 'packing_issue', 'other'],
       default: 'other',
     },
     description: { type: String, required: true },
@@ -154,7 +154,11 @@ const complaintSchema = new mongoose.Schema(
     },
 
     // Dealer-uploaded photos (initial complaint evidence)
-    complaintPhotos: [{ url: String, caption: String }],
+    complaintPhotos: [{
+      evidence: { type: mongoose.Schema.Types.ObjectId, ref: 'ComplaintEvidence' },
+      url: String,
+      caption: String,
+    }],
 
     createdBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User' },
     createdByName: String,

@@ -38,7 +38,10 @@ const SECTION_PERMISSIONS = Object.freeze({
 
 const APPROVAL_TYPE_PERMISSIONS = Object.freeze({
   sales_order: 'sales.order.approve',
+  sales_order_remaining_cancellation: 'sales.order.approve',
   purchase_order: 'po.approve',
+  stock_adjustment: 'stock.adjustment.approve',
+  physical_stock_audit: 'stock.audit.approve',
   credit_limit: 'finance.management',
   rate_override: 'dealer.discounts',
   debit_note: 'debit.note',

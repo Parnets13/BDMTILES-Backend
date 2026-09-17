@@ -73,7 +73,8 @@ export const autoLogMiddleware = (req, res, next) => {
         recordId: body?.data?._id || body?.data?.id || null,
         recordTitle: body?.data?.orderNumber || body?.data?.poNumber || body?.data?.name ||
                      body?.data?.itemName || body?.data?.businessName || body?.data?.paymentNumber ||
-                     body?.data?.voucherNumber || body?.data?.complaintNumber || body?.data?.leadNumber || '',
+                     body?.data?.voucherNumber || body?.data?.complaintNumber || body?.data?.leadNumber ||
+                     body?.data?.requestNumber || '',
         recordModel: '',
         description: body?.message || `${action} on ${module}`,
         req,
@@ -108,7 +109,7 @@ function getModuleFromPath(url) {
     'purchase-returns': 'purchase_return', 'sales-returns': 'sales_return',
     'payments': 'payment', 'hrms': 'hrms', 'masters': 'master',
     'category-setup': 'category', 'users': 'user', 'auth': 'auth',
-    'dealer-pricing': 'pricing', 'quotations': 'quotation',
+    'dealer-pricing': 'pricing', 'quotations': 'quotation', 'dealer-order-requests': 'dealer_order_request',
     'ledger': 'ledger', 'cheques': 'cheque', 'vouchers': 'voucher',
     'dispatch': 'dispatch', 'leads': 'lead', 'complaints': 'complaint',
     'approvals': 'approval', 'schemes': 'scheme', 'reports': 'report',

@@ -37,6 +37,7 @@ const dealerTypeSnapshotSchema = new mongoose.Schema({
 }, { _id: false });
 
 const salesOrderItemSchema = new mongoose.Schema({
+  sourceQuotationItem: { type: mongoose.Schema.Types.ObjectId },
   product: { type: mongoose.Schema.Types.ObjectId, ref: 'Product', required: true },
   productCode: String,
   productName: String,
@@ -45,16 +46,26 @@ const salesOrderItemSchema = new mongoose.Schema({
   batch: { type: String, default: '' },
   quantity: { type: Number, required: true, min: 0.000001 },
   unit: { type: String, default: 'Box' },
+  baseQuantity: { type: Number, default: 0, min: 0 },
+  baseUnit: { type: String, default: 'Box' },
+  conversionFactor: { type: Number, default: 1, min: 0.000000001 },
+  uomVersion: { type: Number, default: 1, min: 1 },
   boxes: { type: Number, default: 0 },
   pieces: { type: Number, default: 0 },
   sqft: { type: Number, default: 0 },
   reservedQuantity: { type: Number, default: 0, min: 0 },
+  reservationVersion: { type: Number, default: 0, min: 0 },
+  reservationReleaseVersion: { type: Number, default: 0, min: 0 },
   allocatedQuantity: { type: Number, default: 0, min: 0 },
   pickedQuantity: { type: Number, default: 0, min: 0 },
   shortQuantity: { type: Number, default: 0, min: 0 },
   damagedQuantity: { type: Number, default: 0, min: 0 },
   dispatchedQuantity: { type: Number, default: 0, min: 0 },
   fulfilledQuantity: { type: Number, default: 0, min: 0 },
+  cancelledRemainingQuantity: { type: Number, default: 0, min: 0 },
+  returnedQuantity: { type: Number, default: 0, min: 0 },
+  dispatchReversedQuantity: { type: Number, default: 0, min: 0 },
+  netFulfilledQuantity: { type: Number, default: 0, min: 0 },
   remainingQuantity: { type: Number, default: 0, min: 0 },
   backorderQuantity: { type: Number, default: 0, min: 0 },
   rate: { type: Number, required: true, min: 0 },
@@ -103,7 +114,7 @@ const salesOrderSchema = new mongoose.Schema(
     deliveryPriority: { type: String, enum: ['normal', 'urgent', 'vip'], default: 'normal' },
     status: {
       type: String,
-      enum: ['draft', 'confirmed', 'approved', 'processing', 'partial_dispatch', 'dispatched', 'delivered', 'cancelled', 'expired'],
+      enum: ['draft', 'confirmed', 'approved', 'processing', 'partial_dispatch', 'partially_closed', 'dispatched', 'delivered', 'cancelled', 'expired'],
       default: 'draft',
     },
     paymentStatus: { type: String, enum: ['pending', 'partial', 'paid', 'overdue'], default: 'pending' },
@@ -122,10 +133,32 @@ const salesOrderSchema = new mongoose.Schema(
     reservedAt: Date,
     reservationReleasedAt: Date,
     reservationConsumedAt: Date,
+    reservationExpiresAt: Date,
+    reservationExpiryVersion: { type: Number, min: 0, default: 0 },
+    reservationExpiryState: { type: String, enum: ['none', 'active', 'extended', 'expired', 'released'], default: 'none' },
+    reservationExpiredAt: Date,
+    reservationExpiryReason: { type: String, default: '' },
+    reservationExtensions: [{
+      version: { type: Number, required: true },
+      previousExpiresAt: Date,
+      extendedTo: { type: Date, required: true },
+      reason: { type: String, required: true },
+      extendedBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User' },
+      extendedAt: { type: Date, default: Date.now },
+    }],
     cancellationRequestStatus: { type: String, enum: ['none', 'pending', 'approved', 'rejected'], default: 'none' },
     cancellationApprovalRequest: { type: mongoose.Schema.Types.ObjectId, ref: 'ApprovalRequest' },
     cancellationRequestedAt: Date,
     cancellationRequestedBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User' },
+    remainingCancellationStatus: { type: String, enum: ['none', 'pending', 'approved', 'rejected'], default: 'none' },
+    remainingCancellationApprovalRequest: { type: mongoose.Schema.Types.ObjectId, ref: 'ApprovalRequest' },
+    remainingCancellationRequestedAt: Date,
+    remainingCancellationRequestedBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User' },
+    remainingCancellationReviewedAt: Date,
+    remainingCancellationReviewedBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User' },
+    remainingCancellationReason: { type: String, default: '' },
+    remainingCancellationVersion: { type: Number, min: 0, default: 0 },
+    closureFinancialSummary: { type: mongoose.Schema.Types.Mixed },
     sourceQuotation: { type: mongoose.Schema.Types.ObjectId, ref: 'Quotation' },
     sourceKey: String,
     requestFingerprint: String,
@@ -153,6 +186,9 @@ const salesOrderSchema = new mongoose.Schema(
 );
 
 salesOrderSchema.index({ branch: 1, status: 1, orderDate: -1 });
+salesOrderSchema.index({ approvalStatus: 1, reservationStatus: 1, reservationExpiryState: 1, reservationExpiresAt: 1, branch: 1 });
+salesOrderSchema.index({ branch: 1, expectedDeliveryDate: 1, status: 1 });
+salesOrderSchema.index({ branch: 1, grandTotal: 1 });
 salesOrderSchema.index({ branch: 1, dealer: 1, status: 1 });
 salesOrderSchema.index({ branch: 1, orderNumber: 1 }, { unique: true });
 salesOrderSchema.index(
@@ -160,8 +196,8 @@ salesOrderSchema.index(
   { unique: true, partialFilterExpression: { sourceKey: { $type: 'string' } } }
 );
 salesOrderSchema.index(
-  { branch: 1, sourceQuotation: 1 },
-  { unique: true, partialFilterExpression: { sourceQuotation: { $type: 'objectId' } } }
+  { branch: 1, sourceQuotation: 1, createdAt: 1 },
+  { name: 'branch_1_sourceQuotation_1_createdAt_1', partialFilterExpression: { sourceQuotation: { $type: 'objectId' } } }
 );
 salesOrderSchema.index({ dealer: 1, status: 1 });
 salesOrderSchema.index({ status: 1, orderDate: -1 });

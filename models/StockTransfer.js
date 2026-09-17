@@ -7,12 +7,22 @@ const transferItemSchema = new mongoose.Schema({
   productImage: { type: String, default: '' },
   shade: { type: String, default: '' },
   batch: { type: String, default: '' },
-  requestedQty: { type: Number, required: true, min: 1 },
+  requestedQty: { type: Number, required: true, min: 0.000001 },
+  availableAtRequest: { type: Number, default: 0, min: 0 },
+  approvedQty: { type: Number, default: 0, min: 0 },
+  blockedQty: { type: Number, default: 0, min: 0 },
+  cancelledQty: { type: Number, default: 0, min: 0 },
+  releasedQty: { type: Number, default: 0, min: 0 },
   dispatchedQty: { type: Number, default: 0 },
   receivedQty: { type: Number, default: 0 },
   damagedQty: { type: Number, default: 0 },
   shortQty: { type: Number, default: 0 },
   unit: { type: String, default: 'Box' },
+  enteredUnit: { type: String, default: 'Box' },
+  baseQuantity: { type: Number, default: 0, min: 0 },
+  baseUnit: { type: String, default: 'Box' },
+  conversionFactor: { type: Number, default: 1, min: 0.000000001 },
+  uomVersion: { type: Number, default: 1, min: 1 },
   remarks: { type: String, default: '' },
 });
 
@@ -55,6 +65,12 @@ const stockTransferSchema = new mongoose.Schema(
     approvalDate: Date,
     approvalRemarks: { type: String, default: '' },
     rejectionReason: { type: String, default: '' },
+
+    // Reservation lifecycle created atomically at approval.
+    reservationState: { type: String, enum: ['none', 'blocking', 'blocked', 'released', 'consumed'], default: 'none' },
+    reservationVersion: { type: Number, min: 0, default: 0 },
+    reservationPostedAt: Date,
+    reservationReleasedAt: Date,
 
     // Dispatch
     dispatchedBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User' },

@@ -48,7 +48,6 @@ const sampleSchema = new mongoose.Schema(
   { timestamps: true }
 );
 
-sampleSchema.index({ sampleNumber: 1 });
 sampleSchema.index({ status: 1 });
 sampleSchema.index({ issuedTo: 'text' });
 

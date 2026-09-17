@@ -19,6 +19,7 @@ const branchSettingsSchema = new mongoose.Schema(
     invoiceTerms: { type: String, default: '' },
     inventory: {
       reorderFallbackLevel: { type: Number, min: 1, default: 10 },
+      minStockFallbackLevel: { type: Number, min: 0, default: 5 },
       minimumReorderQuantity: { type: Number, min: 1, default: 10 },
     },
     numbering: {
@@ -46,6 +47,7 @@ const branchSettingsSchema = new mongoose.Schema(
     },
     createdBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User' },
     updatedBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User' },
+    reorderGuardVersion: { type: Number, default: 0, select: false },
   },
   { timestamps: true }
 );

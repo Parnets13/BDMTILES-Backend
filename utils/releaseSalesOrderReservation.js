@@ -1,14 +1,15 @@
 import SalesOrder from '../models/SalesOrder.js';
 import PickList from '../models/PickList.js';
 import DispatchTrip from '../models/DispatchTrip.js';
-import Stock from '../models/Stock.js';
+import { applyStockMovement, stockOperationKey } from '../services/stockMovementService.js';
 import { QUANTITY_TOLERANCE, releaseSalesOrderInventory } from './salesOrderInventory.js';
+import { stableUomSnapshot } from '../services/stockUomService.js';
 
 const conflict = message => Object.assign(new Error(message), { status: 409 });
 const attachSession = (query, session) => (session ? query.session(session) : query);
 const sessionOptions = session => (session ? { session } : {});
 
-export async function releaseSalesOrderReservation(salesOrderId, { session = null } = {}) {
+export async function releaseSalesOrderReservation(salesOrderId, { session = null, actor = null } = {}) {
   const order = await attachSession(SalesOrder.findById(salesOrderId), session);
   if (!order) return null;
 
@@ -21,7 +22,7 @@ export async function releaseSalesOrderReservation(salesOrderId, { session = nul
 
   const hasLineReservation = order.items.some(item => Number(item.reservedQuantity || 0) > QUANTITY_TOLERANCE);
   if (hasLineReservation || !['none', undefined, null].includes(order.reservationStatus)) {
-    await releaseSalesOrderInventory(order, { session });
+    await releaseSalesOrderInventory(order, { session, actor });
   } else {
     // Compatibility path for pre-lifecycle pick lists that owned their reservation.
     const legacyPickLists = await attachSession(PickList.find({
@@ -31,41 +32,27 @@ export async function releaseSalesOrderReservation(salesOrderId, { session = nul
       stockReserved: true,
       reservationState: { $nin: ['released', 'consumed'] },
     }), session);
-    const requirements = new Map();
     for (const pickList of legacyPickLists) {
       const adjusted = ['adjusted', 'consuming'].includes(pickList.reservationState)
         || ['picked', 'verified', 'sorted', 'packed', 'ready_for_dispatch'].includes(pickList.status);
       for (const item of pickList.items) {
         const quantity = Number(adjusted ? item.pickedQty : item.requestedQty);
         if (!(quantity > QUANTITY_TOLERANCE)) continue;
-        const key = [item.product, item.warehouse, item.shade || '', item.batch || ''].map(String).join('|');
-        const existing = requirements.get(key);
-        if (existing) existing.quantity += quantity;
-        else requirements.set(key, {
-          branch: order.branch,
-          product: item.product,
-          warehouse: item.warehouse,
-          shade: item.shade || '',
-          batch: item.batch || '',
-          productName: item.productName || item.productCode || 'item',
-          quantity,
-        });
+        const snapshot = stableUomSnapshot(item);
+        const baseQuantity = quantity * snapshot.conversionFactor;
+        await applyStockMovement({
+          operationKey: stockOperationKey('legacy-pick-list', pickList._id, item._id, 'reservation-release'),
+          correlationKey: stockOperationKey('sales-order', order._id, 'reservation-release'),
+          movementType: 'sales_reservation_release', phase: 'released',
+          branch: order.branch, product: item.product, warehouse: item.warehouse, shade: item.shade || '', batch: item.batch || '',
+          deltas: { reservedQty: -baseQuantity, availableQty: baseQuantity },
+          enteredQuantity: quantity, ...snapshot, baseQuantity,
+          sourceType: 'PickList', sourceModel: 'PickList', sourceId: pickList._id, sourceLineId: item._id,
+          sourceNumber: pickList.pickListNumber, actor: actor || order.createdBy, occurredAt: new Date(),
+          reason: 'Legacy PickList reservation release',
+          guardMessage: `Reserved stock is inconsistent for ${item.productName || item.productCode || 'item'}; cancellation was not applied.`,
+        }, { session });
       }
-    }
-    for (const requirement of requirements.values()) {
-      const stock = await Stock.findOneAndUpdate(
-        {
-          branch: requirement.branch,
-          product: requirement.product,
-          warehouse: requirement.warehouse,
-          shade: requirement.shade,
-          batch: requirement.batch,
-          reservedQty: { $gte: requirement.quantity },
-        },
-        { $inc: { reservedQty: -requirement.quantity, availableQty: requirement.quantity } },
-        { new: true, ...sessionOptions(session) }
-      );
-      if (!stock) throw conflict(`Reserved stock is inconsistent for ${requirement.productName}; cancellation was not applied.`);
     }
     order.reservationStatus = 'released';
     order.reservationReleasedAt = order.reservationReleasedAt || new Date();

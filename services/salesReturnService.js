@@ -1,11 +1,14 @@
 import SalesReturn from '../models/SalesReturn.js';
 import SalesOrder from '../models/SalesOrder.js';
 import Invoice from '../models/Invoice.js';
-import Stock from '../models/Stock.js';
+import { applyStockMovement, stockOperationKey } from './stockMovementService.js';
 import Dealer from '../models/Dealer.js';
 import { assertWarehousesInBranch } from '../utils/branchScope.js';
 import { generateBranchNumber } from '../utils/branchSequence.js';
 import { postSubledgerEntry } from '../utils/subledgerPosting.js';
+import { stableUomSnapshot } from './stockUomService.js';
+import { refreshSalesOrderLine, QUANTITY_TOLERANCE } from '../utils/salesOrderInventory.js';
+import { lockSalesReturnLineage, resolveSalesReturnDeliveryLineage } from './salesReturnLineageService.js';
 
 export const ACTIVE_INVOICE_STATUSES = ['generated', 'sent'];
 export const POSTED_RETURN_STATUSES = ['credit_issued', 'refund_pending', 'replacement_pending'];
@@ -33,74 +36,89 @@ function invoiceLineValues(source, quantity) {
 }
 
 export async function validateSalesReturnItems(data, invoice, options = {}) {
-  if (!Array.isArray(data.items) || data.items.length === 0) {
-    throw routeError(422, 'At least one return item is required.');
-  }
-  const invoiceLines = new Map((invoice.items || []).map((item) => [String(item._id), item]));
-  const requested = new Map();
+  if (!Array.isArray(data.items) || data.items.length === 0) throw routeError(422, 'At least one return item is required.');
+  const invoiceLines = new Map((invoice.items || []).map(item => [String(item._id), item]));
+  const requestedByInvoice = new Map();
+  const requestedByDelivery = new Map();
+  const requestedByDiscrepancy = new Map();
+  const allowances = new Map();
   const normalizedItems = [];
 
   for (let index = 0; index < data.items.length; index += 1) {
     const item = data.items[index];
     const returnQty = Number(item.returnQty);
     const source = invoiceLines.get(String(item.invoiceItem || ''));
-    if (!source || !Number.isFinite(returnQty) || returnQty <= 0) {
-      throw routeError(422, `items[${index}] requires a valid invoiceItem and a finite returnQty greater than zero.`);
-    }
-    if (!item.condition || !['resaleable', 'damaged', 'scrap'].includes(item.condition)) {
-      throw routeError(422, `items[${index}] requires a valid product condition.`);
-    }
-    if (item.condition !== 'scrap' && !item.warehouse) {
-      throw routeError(422, `items[${index}] requires a receiving warehouse for stock adjustment.`);
-    }
+    if (!source || !Number.isFinite(returnQty) || returnQty <= 0) throw routeError(422, `items[${index}] requires a valid invoiceItem and a finite returnQty greater than zero.`);
+    if (!item.condition || !['resaleable', 'damaged', 'scrap'].includes(item.condition)) throw routeError(422, `items[${index}] requires a valid product condition.`);
+    if (item.condition !== 'scrap' && !item.warehouse) throw routeError(422, `items[${index}] requires a receiving warehouse for stock adjustment.`);
     const sourceId = String(source._id);
-    requested.set(sourceId, (requested.get(sourceId) || 0) + returnQty);
+    const conversionFactor = Number(source.conversionFactor || 1);
+    const baseQuantity = returnQty * conversionFactor;
+    requestedByInvoice.set(sourceId, (requestedByInvoice.get(sourceId) || 0) + returnQty);
+    const resolved = await resolveSalesReturnDeliveryLineage({ branch: data.branch, invoice, invoiceItem: source, requested: item, session: options.session });
+    const lineage = resolved.lineage;
+    if (resolved.allowance) {
+      const target = resolved.allowance.context === 'delivery_discrepancy' ? requestedByDiscrepancy : requestedByDelivery;
+      target.set(resolved.allowance.key, (target.get(resolved.allowance.key) || 0) + baseQuantity);
+      allowances.set(`${resolved.allowance.context}:${resolved.allowance.key}`, resolved.allowance);
+    }
     normalizedItems.push({
-      invoiceItem: source._id,
-      product: source.product,
-      productCode: source.productCode || '',
-      productName: source.productName || '',
-      shade: source.shade || '',
-      batch: source.batch || '',
-      returnQty,
-      unit: source.unit || 'Box',
-      reason: item.reason,
-      reasonDetails: String(item.reasonDetails || '').trim(),
-      condition: item.condition,
-      warehouse: item.condition === 'scrap' ? undefined : item.warehouse,
-      ...invoiceLineValues(source, returnQty),
+      invoiceItem: source._id, salesOrderItem: source.salesOrderItem, ...lineage,
+      product: source.product, productCode: source.productCode || '', productName: source.productName || '',
+      shade: source.shade || '', batch: source.batch || '', returnQty, unit: source.unit || 'Box', baseQuantity,
+      baseUnit: source.baseUnit || source.unit || 'Box', conversionFactor, uomVersion: Number(source.uomVersion || 1),
+      reason: item.reason, reasonDetails: String(item.reasonDetails || '').trim(), condition: item.condition,
+      warehouse: item.condition === 'scrap' ? undefined : item.warehouse, ...invoiceLineValues(source, returnQty),
     });
   }
 
-  let query = SalesReturn.find({
-    branch: data.branch,
-    status: { $nin: ['cancelled', 'reversed'] },
-    $or: [
-      { invoice: invoice._id },
-      { salesOrder: invoice.salesOrder, invoice: { $exists: false } },
-      { salesOrder: invoice.salesOrder, invoice: null },
-    ],
-    ...(options.excludeId ? { _id: { $ne: options.excludeId } } : {}),
+  const activeFilter = { branch: data.branch, status: { $nin: ['cancelled', 'reversed'] }, ...(options.excludeId ? { _id: { $ne: options.excludeId } } : {}) };
+  let invoiceQuery = SalesReturn.find({
+    ...activeFilter,
+    $or: [{ invoice: invoice._id }, { salesOrder: invoice.salesOrder, invoice: { $exists: false } }, { salesOrder: invoice.salesOrder, invoice: null }],
   }).select('items').lean();
-  if (options.session) query = query.session(options.session);
-  const previous = new Map();
+  if (options.session) invoiceQuery = invoiceQuery.session(options.session);
+  const previousByInvoice = new Map();
   const previousLegacy = new Map();
-  for (const existing of await query) {
+  for (const existing of await invoiceQuery) {
     for (const item of existing.items || []) {
-      if (item.invoiceItem) {
-        const key = String(item.invoiceItem);
-        previous.set(key, (previous.get(key) || 0) + Number(item.returnQty || 0));
-      } else {
-        const key = legacyLineKey(item);
-        previousLegacy.set(key, (previousLegacy.get(key) || 0) + Number(item.returnQty || 0));
-      }
+      if (item.invoiceItem) previousByInvoice.set(String(item.invoiceItem), (previousByInvoice.get(String(item.invoiceItem)) || 0) + Number(item.returnQty || 0));
+      else previousLegacy.set(legacyLineKey(item), (previousLegacy.get(legacyLineKey(item)) || 0) + Number(item.returnQty || 0));
     }
   }
-  for (const [sourceId, quantity] of requested) {
+  for (const [sourceId, quantity] of requestedByInvoice) {
     const source = invoiceLines.get(sourceId);
-    const priorQuantity = (previous.get(sourceId) || 0) + (previousLegacy.get(legacyLineKey(source)) || 0);
-    if (priorQuantity + quantity > Number(source.quantity || 0) + 1e-9) {
-      throw routeError(422, 'Return quantity exceeds the remaining quantity on the selected invoice.');
+    const prior = (previousByInvoice.get(sourceId) || 0) + (previousLegacy.get(legacyLineKey(source)) || 0);
+    if (prior + quantity > Number(source.quantity || 0) + 1e-9) throw routeError(422, 'Return quantity exceeds the remaining quantity on the selected invoice.');
+  }
+
+  const deliveryIds = [...requestedByDelivery.keys()];
+  const discrepancyIds = [...requestedByDiscrepancy.keys()];
+  if (deliveryIds.length || discrepancyIds.length) {
+    let lineageQuery = SalesReturn.find({
+      ...activeFilter,
+      $or: [
+        ...(deliveryIds.length ? [{ 'items.deliveryItem': { $in: deliveryIds } }] : []),
+        ...(discrepancyIds.length ? [{ 'items.discrepancy': { $in: discrepancyIds } }] : []),
+      ],
+    }).select('items').lean();
+    if (options.session) lineageQuery = lineageQuery.session(options.session);
+    const priorDelivery = new Map();
+    const priorDiscrepancy = new Map();
+    for (const existing of await lineageQuery) {
+      for (const item of existing.items || []) {
+        const consumed = Number(item.baseQuantity ?? (Number(item.returnQty || 0) * Number(item.conversionFactor || 1)));
+        if (item.returnContext === 'customer_accepted' && item.deliveryItem) priorDelivery.set(String(item.deliveryItem), (priorDelivery.get(String(item.deliveryItem)) || 0) + consumed);
+        if (item.returnContext === 'delivery_discrepancy' && item.discrepancy) priorDiscrepancy.set(String(item.discrepancy), (priorDiscrepancy.get(String(item.discrepancy)) || 0) + consumed);
+      }
+    }
+    for (const [key, quantity] of requestedByDelivery) {
+      const allowance = allowances.get(`customer_accepted:${key}`);
+      if ((priorDelivery.get(key) || 0) + quantity > Number(allowance?.baseQuantity || 0) + 1e-9) throw routeError(422, 'Return quantity exceeds the remaining customer-accepted quantity on the selected delivery item.');
+    }
+    for (const [key, quantity] of requestedByDiscrepancy) {
+      const allowance = allowances.get(`delivery_discrepancy:${key}`);
+      if ((priorDiscrepancy.get(key) || 0) + quantity > Number(allowance?.baseQuantity || 0) + 1e-9) throw routeError(422, 'Return quantity exceeds the remaining quantity on the selected delivery discrepancy.');
     }
   }
   return normalizedItems;
@@ -136,7 +154,7 @@ export async function approveSalesReturn({ current, branchId, approver, remarks 
   }
 
   const [order, invoice] = await Promise.all([
-    SalesOrder.findOne({ _id: current.salesOrder, branch: branchId, dealer: current.dealer }).session(session).lean(),
+    SalesOrder.findOne({ _id: current.salesOrder, branch: branchId, dealer: current.dealer }).session(session),
     Invoice.findOne({
       _id: current.invoice,
       branch: branchId,
@@ -148,27 +166,43 @@ export async function approveSalesReturn({ current, branchId, approver, remarks 
   if (!order || !invoice || String(invoice.salesOrder) !== String(order._id)) {
     throw routeError(409, 'The source sales order or active invoice is unavailable or no longer matches the dealer.');
   }
+  await lockSalesReturnLineage(current.items, branchId, session);
   current.items = await validateSalesReturnItems(current.toObject(), invoice, { excludeId: current._id, session });
   await assertWarehousesInBranch(current.items.map((item) => item.warehouse).filter(Boolean), branchId, { session });
   applySalesReturnTotals(current);
 
-  const stockUpdates = new Map();
   for (const item of current.items) {
-    if (!['resaleable', 'damaged'].includes(item.condition)) continue;
-    const key = stockKey(item);
-    const previous = stockUpdates.get(key);
-    stockUpdates.set(key, { item, quantity: (previous?.quantity || 0) + Number(item.returnQty || 0) });
+    const quantity = Number(item.returnQty || 0);
+    if (['resaleable', 'damaged'].includes(item.condition)) {
+      const snapshot = stableUomSnapshot(item);
+      const baseQuantity = quantity * snapshot.conversionFactor;
+      const increment = item.condition === 'resaleable'
+        ? { totalQty: baseQuantity, availableQty: baseQuantity }
+        : { totalQty: baseQuantity, damagedQty: baseQuantity };
+      await applyStockMovement({
+        operationKey: stockOperationKey('sales-return', current._id, item._id, 'post', item.condition),
+        correlationKey: stockOperationKey('sales-return', current._id),
+        movementType: 'sales_return', phase: 'posted',
+        branch: current.branch, product: item.product, warehouse: item.warehouse, shade: item.shade || '', batch: item.batch || '',
+        deltas: increment, upsert: true,
+        enteredQuantity: quantity, ...snapshot, baseQuantity,
+        sourceType: 'SalesReturn', sourceModel: 'SalesReturn', sourceId: current._id, sourceLineId: item._id,
+        sourceNumber: current.returnNumber, actor: approver, occurredAt: new Date(),
+        reason: item.reason || 'Sales return', remarks: item.reasonDetails || remarks,
+        metadata: { condition: item.condition, invoice: current.invoice, invoiceItem: item.invoiceItem, salesOrder: current.salesOrder, complaint: current.complaint },
+      }, { session });
+    }
+    if (item.salesOrderItem) {
+      const orderLine = order.items.id(item.salesOrderItem);
+      if (!orderLine) throw routeError(409, `Sales Order lineage is missing for ${item.productName || 'returned item'}.`);
+      if (Number(orderLine.returnedQuantity || 0) + quantity > Number(orderLine.dispatchedQuantity || 0) + QUANTITY_TOLERANCE) {
+        throw routeError(409, `Return quantity exceeds gross dispatched quantity for ${item.productName || 'returned item'}.`);
+      }
+      orderLine.returnedQuantity = Number(orderLine.returnedQuantity || 0) + quantity;
+      refreshSalesOrderLine(orderLine);
+    }
   }
-  for (const { item, quantity } of stockUpdates.values()) {
-    const increment = item.condition === 'resaleable'
-      ? { totalQty: quantity, availableQty: quantity }
-      : { totalQty: quantity, damagedQty: quantity };
-    await Stock.findOneAndUpdate(
-      { branch: current.branch, product: item.product, warehouse: item.warehouse, shade: item.shade || '', batch: item.batch || '' },
-      { $inc: increment, $set: { branch: current.branch } },
-      { upsert: true, new: true, session, runValidators: true }
-    );
-  }
+  await order.save({ session });
   if (current.adjustmentType === 'credit_note' && current.grandTotal > 0) {
     await postSubledgerEntry({
       session,
@@ -279,8 +313,8 @@ export async function createAndPostComplaintSalesReturn({ complaint, decision, a
     if (!dealer || !order || !invoice || String(invoice.salesOrder) !== String(order._id)) {
       throw routeError(422, 'Complaint approval requires an active invoice with matching dealer and sales-order lineage.');
     }
-    if (!['dispatched', 'delivered'].includes(order.status)) {
-      throw routeError(422, 'Only invoiced, dispatched or delivered sales can be returned.');
+    if (!['dispatched', 'delivered', 'partially_closed', 'partial_dispatch'].includes(order.status)) {
+      throw routeError(422, 'Only invoiced dispatched, delivered, or partially closed sales can be returned.');
     }
     const returnDate = new Date();
     const data = {

@@ -34,8 +34,22 @@ const productSchema = new mongoose.Schema(
     manufacturer: { type: String, trim: true, default: '' }, // Actual manufacturer if different from brand
     barcode: { type: String, trim: true, sparse: true },
 
-    // Units
-    unit: { type: String, required: true, default: 'Box' },
+    // Units. Existing `unit` remains the commercial/display UOM. Inventory fields
+    // are additive and default to factor-1 semantics for legacy products.
+    unit: { type: String, required: true, default: 'Box', trim: true },
+    inventoryBaseUom: { type: String, trim: true, default: function () { return this.unit || 'Box'; } },
+    inventoryUomVersion: { type: Number, min: 1, default: 1 },
+    uomConversions: {
+      type: [{
+        uom: { type: String, required: true, trim: true },
+        toBaseFactor: { type: Number, required: true, min: 0.000000001 },
+        precision: { type: Number, min: 0, max: 6, default: 6 },
+        allowFraction: { type: Boolean, default: true },
+        version: { type: Number, min: 1, default: 1 },
+        effectiveFrom: { type: Date, default: () => new Date(0) },
+      }],
+      default: function () { return [{ uom: this.unit || 'Box', toBaseFactor: 1, precision: 6, allowFraction: true, version: 1, effectiveFrom: new Date(0) }]; },
+    },
     piecesPerBox: { type: Number, min: 0, default: 0 },
     sqftPerBox: { type: Number, min: 0, default: 0 },
     weightPerBox: { type: Number, min: 0, default: 0 },
@@ -84,14 +98,13 @@ const productSchema = new mongoose.Schema(
 
     createdBy: { type: mongoose.Schema.Types.ObjectId },
   },
-  { timestamps: true }
+  { timestamps: true, suppressReservedKeysWarning: true }
 );
 
 // Indexes for fast search/filter at 1 lakh products
 productSchema.index({ itemName: 'text', productCode: 'text', aliasName: 'text' });
 productSchema.index({ brand: 1, category: 1, subcategory: 1 });
 productSchema.index({ status: 1 });
-productSchema.index({ productCode: 1 });
 
 // Auto-calculate maxPurchaseRate before save
 productSchema.pre('save', function (next) {

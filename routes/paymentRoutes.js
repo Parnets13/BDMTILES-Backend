@@ -172,7 +172,12 @@ async function validatePaymentData(source, session = null, { allowLegacySalesOrd
   }
 
   const hasLegacySalesOrder = againstOrders.some(allocation => allocation.orderModel === 'SalesOrder');
-  if (paymentType === 'dealer_receipt' && !hasLegacySalesOrder && Math.abs(amount - allocatedTotal) > 0.01) {
+  // Field collections captured by the Sales Executive app are recorded unallocated
+  // and confirmed by finance as an on-account credit, so the full-allocation rule
+  // does not apply to them. All other dealer receipts must be fully allocated.
+  const isUnallocatedFieldCollection = source.isFieldCollection === true && allocatedTotal === 0;
+  if (paymentType === 'dealer_receipt' && !hasLegacySalesOrder && !isUnallocatedFieldCollection
+    && Math.abs(amount - allocatedTotal) > 0.01) {
     throw paymentError(422, 'Dealer receipt amount must be fully allocated to customer invoices.');
   }
 

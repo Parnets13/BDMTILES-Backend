@@ -1,6 +1,8 @@
 import { Router } from 'express';
+import crypto from 'crypto';
 import rateLimit from 'express-rate-limit';
 import User from '../models/User.js';
+import OtpChallenge from '../models/OtpChallenge.js';
 import { generateToken, verifyRefreshToken } from '../utils/jwt.js';
 import { authenticateOnly, buildAuthUser } from '../middleware/auth.js';
 import {
@@ -39,6 +41,36 @@ const passwordResetLimiter = rateLimit({
   legacyHeaders: false,
   handler: (_req, res) => res.status(429).json({ success: false, message: 'Too many requests. Try again later.' }),
 });
+
+const otpRequestLimiter = rateLimit({
+  windowMs: numberFromEnv('OTP_REQUEST_RATE_LIMIT_WINDOW_MINUTES', 15) * 60 * 1000,
+  limit: numberFromEnv('OTP_REQUEST_RATE_LIMIT_MAX', 12),
+  standardHeaders: 'draft-8',
+  legacyHeaders: false,
+  handler: (_req, res) => res.status(429).json({ success: false, message: 'Too many OTP requests. Try again later.' }),
+});
+
+const otpVerifyLimiter = rateLimit({
+  windowMs: numberFromEnv('OTP_VERIFY_RATE_LIMIT_WINDOW_MINUTES', 15) * 60 * 1000,
+  limit: numberFromEnv('OTP_VERIFY_RATE_LIMIT_MAX', 20),
+  standardHeaders: 'draft-8',
+  legacyHeaders: false,
+  handler: (_req, res) => res.status(429).json({ success: false, message: 'Too many attempts. Try again later.' }),
+});
+
+// Roles permitted to sign in through the phone + OTP field-app flow.
+const OTP_LOGIN_ROLES = new Set(['sales_executive']);
+// Generic response so an attacker cannot enumerate which phone numbers exist.
+const OTP_REQUEST_RESPONSE = 'If that number is registered for the field app, an OTP has been sent.';
+const normalizePhone = (value) => String(value || '').replace(/[^\d]/g, '').slice(-15);
+const sixDigitOtp = () => String(crypto.randomInt(0, 1_000_000)).padStart(6, '0');
+const hashOtp = (code, userId) => crypto
+  .createHash('sha256')
+  .update(`${code}:${userId}:${process.env.JWT_SECRET || 'otp'}`)
+  .digest('hex');
+// Until DLT/SMS is provisioned, the generated OTP is echoed to the client so the
+// executive can complete login. Flip OTP_EXPOSE_CODE to 'false' once SMS is live.
+const exposeOtpCode = () => String(process.env.OTP_EXPOSE_CODE ?? 'true').toLowerCase() !== 'false';
 
 const invalidCredentials = (res) => res.status(401).json({ success: false, message: INVALID_CREDENTIALS });
 
@@ -104,6 +136,100 @@ router.post('/login', loginLimiter, async (req, res) => {
     return res.json({ success: true, message: 'Login successful', token, user: userObj });
   } catch (error) {
     console.error('Login error:', error.message);
+    return res.status(500).json({ success: false, message: 'Login failed.' });
+  }
+});
+
+router.post('/otp/request', otpRequestLimiter, async (req, res) => {
+  const response = { success: true, message: OTP_REQUEST_RESPONSE };
+  try {
+    const phone = normalizePhone(req.body?.phone);
+    if (phone.length < 10) {
+      return res.status(400).json({ success: false, message: 'A valid phone number is required.' });
+    }
+    // Match the field-app roles on the trailing digits so stored formats
+    // (with or without country code/spaces) still resolve.
+    const candidates = await User.find({
+      status: 'Active',
+      role: { $in: [...OTP_LOGIN_ROLES] },
+    }).select('_id phone role name');
+    const user = candidates.find((candidate) => normalizePhone(candidate.phone) === phone);
+    if (!user) return res.json(response);
+
+    const code = sixDigitOtp();
+    const ttlMinutes = numberFromEnv('OTP_EXPIRE_MINUTES', 5);
+    await OtpChallenge.deleteMany({ user: user._id, consumedAt: null });
+    await OtpChallenge.create({
+      phone,
+      user: user._id,
+      codeHash: hashOtp(code, user._id),
+      purpose: 'se_login',
+      maxAttempts: numberFromEnv('OTP_MAX_ATTEMPTS', 5),
+      expiresAt: new Date(Date.now() + ttlMinutes * 60 * 1000),
+      ip: String(req.ip || req.socket?.remoteAddress || '').slice(0, 100),
+      userAgent: String(req.get('user-agent') || '').slice(0, 500),
+    });
+
+    // TODO: dispatch `code` via DLT-approved SMS once the provider is configured.
+    if (exposeOtpCode()) {
+      response.devOtp = code;
+      response.expiresInSeconds = ttlMinutes * 60;
+    }
+    return res.json(response);
+  } catch (error) {
+    console.error('OTP request error:', error.message);
+    return res.json(response);
+  }
+});
+
+router.post('/otp/verify', otpVerifyLimiter, async (req, res) => {
+  try {
+    const phone = normalizePhone(req.body?.phone);
+    const code = String(req.body?.otp || req.body?.code || '').trim();
+    if (phone.length < 10 || !/^\d{4,8}$/.test(code)) {
+      return res.status(400).json({ success: false, message: 'Phone number and OTP are required.' });
+    }
+
+    const challenge = await OtpChallenge.findOne({
+      phone,
+      consumedAt: null,
+      expiresAt: { $gt: new Date() },
+    }).sort({ createdAt: -1 });
+    if (!challenge) {
+      return res.status(401).json({ success: false, message: 'OTP is invalid or has expired. Request a new one.' });
+    }
+    if (challenge.attempts >= challenge.maxAttempts) {
+      await OtpChallenge.deleteOne({ _id: challenge._id });
+      return res.status(429).json({ success: false, message: 'Too many incorrect attempts. Request a new OTP.' });
+    }
+
+    if (hashOtp(code, challenge.user) !== challenge.codeHash) {
+      challenge.attempts += 1;
+      await challenge.save({ validateBeforeSave: false });
+      return res.status(401).json({ success: false, message: 'Incorrect OTP.' });
+    }
+
+    const user = await User.findOne({ _id: challenge.user, status: 'Active' }).select('+refreshSessions role tokenVersion');
+    if (!user || !OTP_LOGIN_ROLES.has(user.role)) {
+      await OtpChallenge.deleteOne({ _id: challenge._id });
+      return res.status(401).json({ success: false, message: 'This account cannot use app login.' });
+    }
+
+    challenge.consumedAt = new Date();
+    await challenge.save({ validateBeforeSave: false });
+    await OtpChallenge.deleteMany({ user: user._id, consumedAt: null });
+
+    user.lastLogin = new Date();
+    const credential = createRefreshCredential(user, req);
+    user.refreshSessions = boundedSessions(user.refreshSessions, credential.session);
+    await user.save({ validateBeforeSave: false });
+
+    const token = generateToken(user._id, user.role, user.tokenVersion || 0);
+    const userObj = await buildAuthUser(user._id);
+    setRefreshCookie(res, credential.token);
+    return res.json({ success: true, message: 'Login successful', token, user: userObj });
+  } catch (error) {
+    console.error('OTP verify error:', error.message);
     return res.status(500).json({ success: false, message: 'Login failed.' });
   }
 });

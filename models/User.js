@@ -1,6 +1,7 @@
 import mongoose from 'mongoose';
 import bcrypt from 'bcrypt';
 import { ROLE_INFO } from '../config/permissions.js';
+import { canonicalPhone } from '../utils/phone.js';
 
 const ASSIGNMENT_SCOPE_VALUES = ['all', 'selected', 'none'];
 const assignmentScopesSchema = new mongoose.Schema(
@@ -56,6 +57,7 @@ const userSchema = new mongoose.Schema(
     email: { type: String, required: true, unique: true, trim: true, lowercase: true },
     password: { type: String, required: true, minlength: 6, select: false },
     phone: { type: String, required: true, trim: true },
+    phoneNormalized: { type: String, required: true, select: false },
     role: {
       type: String,
       required: true,
@@ -100,6 +102,22 @@ userSchema.index({ role: 1, status: 1 });
 userSchema.index({ assignedBranches: 1, status: 1 });
 userSchema.index({ assignedWarehouses: 1, status: 1 });
 userSchema.index({ defaultBranch: 1 });
+userSchema.index(
+  { phoneNormalized: 1 },
+  {
+    unique: true,
+    name: 'unique_normalized_user_phone',
+    partialFilterExpression: { phoneNormalized: { $type: 'string' } },
+  }
+);
+
+userSchema.pre('validate', function (next) {
+  if (!this.isModified('phone') && this.phoneNormalized) return next();
+  const normalized = canonicalPhone(this.phone);
+  if (!normalized) return next(new Error('Enter a valid phone number using digits and standard phone formatting.'));
+  this.phoneNormalized = normalized;
+  return next();
+});
 
 userSchema.pre('save', async function (next) {
   if (!this.isModified('password')) return next();

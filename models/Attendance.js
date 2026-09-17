@@ -31,6 +31,9 @@ const attendanceSchema = new mongoose.Schema(
     leaveType: String,
     leaveReason: String,
 
+    // Reason captured when the employee punches in past the grace period
+    lateReason: { type: String, default: '' },
+
     // Remarks
     remarks: { type: String, default: '' },
     markedBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User' },

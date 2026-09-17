@@ -8,6 +8,9 @@ const suggestionProvenanceSchema = new mongoose.Schema({
   configuredReorderLevel: { type: Number, default: 0 },
   effectiveReorderLevel: { type: Number, default: 0 },
   minimumStockLevel: { type: Number, default: 0 },
+  reorderLevelSource: { type: String, enum: ['product', 'branch_fallback'], default: 'branch_fallback' },
+  minimumStockLevelSource: { type: String, enum: ['product', 'branch_fallback'], default: 'branch_fallback' },
+  configurationWarnings: { type: [String], default: [] },
   suggestedQty: { type: Number, default: 0 },
   lastSupplier: { type: mongoose.Schema.Types.ObjectId, ref: 'Supplier' },
   lastSupplierName: { type: String, default: '' },
@@ -20,6 +23,8 @@ const prItemSchema = new mongoose.Schema({
   productName:  { type: String },
   productCode:  { type: String },
   productImage: { type: String, default: '' },
+  unit:         { type: String, default: '' },
+  purchaseRate: { type: Number, default: 0 },   // Master purchase rate snapshot (Product Master)
   requiredQty:  { type: Number, required: true, min: 0.0001 },
   currentStock: { type: Number, default: 0 },
   stockSnapshotAt: { type: Date },

@@ -33,6 +33,7 @@ import PurchaseRequisition from '../models/PurchaseRequisition.js';
 import SupplierQuotation from '../models/SupplierQuotation.js';
 import PurchaseReturn from '../models/PurchaseReturn.js';
 import Quotation from '../models/Quotation.js';
+import QuotationConversion from '../models/QuotationConversion.js';
 import RecycleBin from '../models/RecycleBin.js';
 import SalarySlip from '../models/SalarySlip.js';
 import SalesOrder from '../models/SalesOrder.js';
@@ -129,6 +130,7 @@ const indexedModels = [
   SupplierLedger,
   SalesOrder,
   Quotation,
+  QuotationConversion,
   Invoice,
   PurchaseOrder,
   PurchaseRequisition,
@@ -1098,7 +1100,8 @@ async function run() {
   await backfillSalesOrderLifecycle();
   await backfillPurchaseRequisitionItemIds();
   await preflightActiveInvoiceDuplicates();
-  await preflightSalesOrderQuotationDuplicates();
+  // Multiple Sales Orders per quotation are valid; conversion lineage is
+  // backfilled by scripts/migrateQuotationConversions.js.
   await preflightNumberDuplicates();
 
   await Invoice.collection.updateMany(

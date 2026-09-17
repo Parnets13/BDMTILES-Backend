@@ -4,7 +4,7 @@ import PurchaseReturn from '../models/PurchaseReturn.js';
 import PurchaseOrder from '../models/PurchaseOrder.js';
 import SupplierInvoice from '../models/SupplierInvoice.js';
 import GRN from '../models/GRN.js';
-import Stock from '../models/Stock.js';
+import { applyStockMovement, stockOperationKey } from '../services/stockMovementService.js';
 import Supplier from '../models/Supplier.js';
 import { protect, requirePermission } from '../middleware/auth.js';
 import { assertWarehousesInBranch, requireBranch } from '../utils/branchScope.js';
@@ -410,28 +410,21 @@ router.patch('/:id/approve', requirePermission('debit.note'), async (req, res) =
       await assertWarehousesInBranch(current.items.map((item) => item.warehouse), req.branchId, { session });
       applyTotals(current);
 
-      const requirements = new Map();
       for (const item of current.items) {
         const quantity = Number(item.returnQty);
-        const key = stockKey(item);
-        const previous = requirements.get(key);
-        requirements.set(key, { item, quantity: (previous?.quantity || 0) + quantity });
-      }
-      for (const { item, quantity } of requirements.values()) {
-        const stock = await Stock.findOneAndUpdate(
-          {
-            branch: current.branch,
-            product: item.product,
-            warehouse: item.warehouse,
-            shade: item.shade || '',
-            batch: item.batch || '',
-            totalQty: { $gte: quantity },
-            availableQty: { $gte: quantity },
-          },
-          { $inc: { totalQty: -quantity, availableQty: -quantity } },
-          { new: true, session, runValidators: true }
-        );
-        if (!stock) throw routeError(409, 'Required stock is missing or changed before this purchase return could be posted.');
+        await applyStockMovement({
+          operationKey: stockOperationKey('purchase-return', current._id, item._id, 'post'),
+          correlationKey: stockOperationKey('purchase-return', current._id),
+          movementType: 'purchase_return', phase: 'posted',
+          branch: current.branch, product: item.product, warehouse: item.warehouse, shade: item.shade || '', batch: item.batch || '',
+          deltas: { totalQty: -quantity, availableQty: -quantity },
+          enteredQuantity: quantity, enteredUnit: item.unit || 'Unit', baseUnit: item.unit || 'Unit', conversionFactor: 1,
+          sourceType: 'PurchaseReturn', sourceModel: 'PurchaseReturn', sourceId: current._id, sourceLineId: item._id,
+          sourceNumber: current.debitNoteNumber, actor: req.user._id, occurredAt: new Date(),
+          reason: item.reason || 'Purchase return', remarks: item.reasonDetails || req.body.remarks || '',
+          metadata: { supplierInvoice: current.supplierInvoice, supplierInvoiceItem: item.supplierInvoiceItem, grn: current.grn, grnItem: item.grnItem, purchaseOrder: current.purchaseOrder, purchaseOrderItem: item.purchaseOrderItem },
+          guardMessage: 'Required stock is missing or changed before this purchase return could be posted.',
+        }, { session });
       }
       if (current.grandTotal > 0) {
         await postSubledgerEntry({
@@ -486,19 +479,22 @@ router.patch('/:id/reverse', requirePermission('debit.note'), async (req, res) =
         throw routeError(403, 'Maker-checker violation: the Purchase Return creator or approver cannot reverse it.');
       }
 
-      const requirements = new Map();
       for (const item of current.items) {
-        const key = stockKey(item);
-        const previous = requirements.get(key);
-        requirements.set(key, { item, quantity: (previous?.quantity || 0) + Number(item.returnQty || 0) });
-      }
-      for (const { item, quantity } of requirements.values()) {
-        const stock = await Stock.findOneAndUpdate(
-          { branch: current.branch, product: item.product, warehouse: item.warehouse, shade: item.shade || '', batch: item.batch || '' },
-          { $inc: { totalQty: quantity, availableQty: quantity } },
-          { new: true, session, runValidators: true }
-        );
-        if (!stock) throw routeError(409, 'The original stock bucket no longer exists; reversal was not posted.');
+        const quantity = Number(item.returnQty || 0);
+        const originalOperationKey = stockOperationKey('purchase-return', current._id, item._id, 'post');
+        await applyStockMovement({
+          operationKey: stockOperationKey('purchase-return', current._id, item._id, 'reverse'),
+          correlationKey: stockOperationKey('purchase-return', current._id),
+          movementType: 'purchase_return_reversal', phase: 'reversed',
+          branch: current.branch, product: item.product, warehouse: item.warehouse, shade: item.shade || '', batch: item.batch || '',
+          deltas: { totalQty: quantity, availableQty: quantity },
+          enteredQuantity: quantity, enteredUnit: item.unit || 'Unit', baseUnit: item.unit || 'Unit', conversionFactor: 1,
+          sourceType: 'PurchaseReturn', sourceModel: 'PurchaseReturn', sourceId: current._id, sourceLineId: item._id,
+          sourceNumber: current.debitNoteNumber, actor: req.user._id, occurredAt: new Date(),
+          reason: reversalReason, remarks: current.approvalRemarks || '', reversalOfOperationKey: originalOperationKey,
+          metadata: { supplierInvoice: current.supplierInvoice, grn: current.grn, purchaseOrder: current.purchaseOrder },
+          guardMessage: 'The original stock bucket no longer exists; reversal was not posted.',
+        }, { session });
       }
       if (current.grandTotal > 0) {
         await postSubledgerEntry({

@@ -27,6 +27,7 @@ import { protect, requirePermission } from '../middleware/auth.js';
 import { requireBranch } from '../utils/branchScope.js';
 import { restoreFromBin, permanentDelete, manualCleanup } from '../utils/softDelete.js';
 import { logActivity } from '../middleware/activityLogger.js';
+import { releaseExpiredApprovalReservations } from '../services/reservationExpiryService.js';
 
 const router = Router();
 router.use(protect);
@@ -209,6 +210,15 @@ router.post('/activity-logs/cleanup', requirePermission('users.manage'), async (
     });
   } catch (error) {
     return res.status(500).json({ success: false, message: error.message });
+  }
+});
+
+router.post('/inventory/release-expired-reservations', requirePermission('system.management'), async (req, res) => {
+  try {
+    const summary = await releaseExpiredApprovalReservations({ branch: req.branchId, actor: req.user._id, now: new Date() });
+    return res.json({ success: true, message: `${summary.released} expired reservation(s) released.`, data: summary });
+  } catch (error) {
+    return res.status(error.status || 500).json({ success: false, message: error.message });
   }
 });
 

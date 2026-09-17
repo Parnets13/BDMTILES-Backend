@@ -2,6 +2,11 @@ import mongoose from 'mongoose';
 
 const returnItemSchema = new mongoose.Schema({
   invoiceItem: { type: mongoose.Schema.Types.ObjectId, immutable: true },
+  salesOrderItem: { type: mongoose.Schema.Types.ObjectId, immutable: true },
+  delivery: { type: mongoose.Schema.Types.ObjectId, ref: 'Delivery', immutable: true },
+  deliveryItem: { type: mongoose.Schema.Types.ObjectId, immutable: true },
+  discrepancy: { type: mongoose.Schema.Types.ObjectId, immutable: true },
+  returnContext: { type: String, enum: ['customer_accepted', 'delivery_discrepancy', 'legacy_invoice'], default: 'legacy_invoice', immutable: true },
   product: { type: mongoose.Schema.Types.ObjectId, ref: 'Product', required: true },
   productCode: String,
   productName: String,
@@ -9,6 +14,10 @@ const returnItemSchema = new mongoose.Schema({
   batch: { type: String, default: '' },
   returnQty: { type: Number, required: true, min: 0.0001 },
   unit: { type: String, default: 'Box' },
+  baseQuantity: { type: Number, default: 0, min: 0 },
+  baseUnit: { type: String, default: 'Box' },
+  conversionFactor: { type: Number, default: 1, min: 0.000000001 },
+  uomVersion: { type: Number, default: 1, min: 1 },
   rate: { type: Number, default: 0 },
   discountAmount: { type: Number, default: 0 },
   schemeDiscount: { type: Number, default: 0 },
@@ -81,6 +90,8 @@ const salesReturnSchema = new mongoose.Schema(
 
 salesReturnSchema.index({ branch: 1, status: 1, returnDate: -1 });
 salesReturnSchema.index({ branch: 1, salesOrder: 1 });
+salesReturnSchema.index({ branch: 1, status: 1, 'items.deliveryItem': 1 });
+salesReturnSchema.index({ branch: 1, status: 1, 'items.discrepancy': 1 });
 salesReturnSchema.index({ complaint: 1 }, { unique: true, sparse: true });
 salesReturnSchema.index({ branch: 1, returnNumber: 1 }, { unique: true });
 salesReturnSchema.index(

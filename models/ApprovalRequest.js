@@ -12,14 +12,14 @@ const approvalRequestSchema = new mongoose.Schema(
     },
     type: {
       type: String,
-      enum: ['sales_order', 'sales_order_cancellation', 'quotation', 'purchase_order', 'credit_limit', 'rate_override', 'debit_note', 'credit_note', 'discount', 'other'],
+      enum: ['sales_order', 'sales_order_cancellation', 'sales_order_remaining_cancellation', 'quotation', 'purchase_order', 'stock_adjustment', 'physical_stock_audit', 'credit_limit', 'rate_override', 'debit_note', 'credit_note', 'discount', 'other'],
       required: true,
     },
     title: { type: String, required: true },
     description: String,
 
     // Reference to the document needing approval
-    referenceModel: { type: String, enum: ['SalesOrder', 'Quotation', 'PurchaseOrder', 'PurchaseReturn', 'SalesReturn', 'Dealer', ''] },
+    referenceModel: { type: String, enum: ['SalesOrder', 'Quotation', 'PurchaseOrder', 'PurchaseReturn', 'SalesReturn', 'StockAdjustment', 'PhysicalStockAudit', 'Dealer', ''] },
     referenceId: { type: mongoose.Schema.Types.ObjectId },
     referenceNumber: String,
     isAutomatic: { type: Boolean, default: false },
@@ -35,7 +35,7 @@ const approvalRequestSchema = new mongoose.Schema(
 
     status: {
       type: String,
-      enum: ['pending', 'approved', 'rejected', 'cancelled'],
+      enum: ['pending', 'approved', 'rejected', 'cancelled', 'expired'],
       default: 'pending',
     },
     priority: { type: String, enum: ['normal', 'urgent'], default: 'normal' },

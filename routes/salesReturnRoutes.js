@@ -3,7 +3,7 @@ import mongoose from 'mongoose';
 import SalesReturn from '../models/SalesReturn.js';
 import SalesOrder from '../models/SalesOrder.js';
 import Invoice from '../models/Invoice.js';
-import Stock from '../models/Stock.js';
+import { applyStockMovement, stockOperationKey } from '../services/stockMovementService.js';
 import Dealer from '../models/Dealer.js';
 import Complaint from '../models/Complaint.js';
 import { protect, requirePermission } from '../middleware/auth.js';
@@ -11,7 +11,10 @@ import { assertWarehousesInBranch, requireBranch } from '../utils/branchScope.js
 import { generateBranchNumber } from '../utils/branchSequence.js';
 import { requestFingerprint as fingerprintRequest } from '../utils/idempotency.js';
 import { postSubledgerEntry } from '../utils/subledgerPosting.js';
-import { approveSalesReturn } from '../services/salesReturnService.js';
+import { approveSalesReturn, validateSalesReturnItems } from '../services/salesReturnService.js';
+import { lockSalesReturnLineage } from '../services/salesReturnLineageService.js';
+import { stableUomSnapshot } from '../services/stockUomService.js';
+import { refreshSalesOrderLine, QUANTITY_TOLERANCE } from '../utils/salesOrderInventory.js';
 
 const router = Router();
 router.use(protect);
@@ -64,8 +67,11 @@ async function validateReturnItems(data, invoice, options = {}) {
     }
     const sourceId = String(source._id);
     requested.set(sourceId, (requested.get(sourceId) || 0) + returnQty);
+    const lineage = await resolveSalesReturnDeliveryLineage({ branch: data.branch, invoice, invoiceItem: source, requested: item, returnQty, session: options.session });
     normalizedItems.push({
       invoiceItem: source._id,
+      salesOrderItem: source.salesOrderItem,
+      ...lineage,
       product: source.product,
       productCode: source.productCode || '',
       productName: source.productName || '',
@@ -73,6 +79,10 @@ async function validateReturnItems(data, invoice, options = {}) {
       batch: source.batch || '',
       returnQty,
       unit: source.unit || 'Box',
+      baseQuantity: returnQty * Number(source.conversionFactor || 1),
+      baseUnit: source.baseUnit || source.unit || 'Box',
+      conversionFactor: Number(source.conversionFactor || 1),
+      uomVersion: Number(source.uomVersion || 1),
       reason: item.reason,
       reasonDetails: item.reasonDetails || '',
       condition: item.condition,
@@ -202,7 +212,7 @@ router.get('/orders-for-dealer/:dealerId', requirePermission('credit.note'), asy
       _id: { $in: invoices.map((invoice) => invoice.salesOrder) },
       branch: req.branchId,
       dealer: req.params.dealerId,
-      status: { $in: ['dispatched', 'delivered'] },
+      status: { $in: ['dispatched', 'delivered', 'partially_closed', 'partial_dispatch'] },
     }).select('_id').lean();
     const eligibleOrderIds = new Set(eligibleOrders.map((order) => String(order._id)));
     const eligibleInvoices = invoices.filter((invoice) => eligibleOrderIds.has(String(invoice.salesOrder)));
@@ -289,8 +299,8 @@ router.post('/', requirePermission('credit.note'), async (req, res) => {
     if (!order) throw routeError(404, 'Sales order not found in the active branch.');
     if (!invoice) throw routeError(404, 'Active sales invoice not found in the active branch.');
     if (String(invoice.salesOrder) !== String(order._id)) throw routeError(422, 'Invoice, sales order, and dealer lineage do not match.');
-    if (!['dispatched', 'delivered'].includes(order.status)) {
-      throw routeError(422, 'Only invoiced, dispatched or delivered sales can be returned.');
+    if (!['dispatched', 'delivered', 'partially_closed', 'partial_dispatch'].includes(order.status)) {
+      throw routeError(422, 'Only invoiced dispatched, delivered, or partially closed sales can be returned.');
     }
     if (!['credit_note', 'refund', 'replacement'].includes(req.body.adjustmentType || 'credit_note')) {
       throw routeError(422, 'Invalid sales return adjustment type.');
@@ -318,19 +328,27 @@ router.post('/', requirePermission('credit.note'), async (req, res) => {
       createdBy: req.user._id,
       tallySyncStatus: 'not_synced',
     };
-    data.items = await validateReturnItems(data, invoice);
-    await assertWarehousesInBranch(data.items.map((item) => item.warehouse).filter(Boolean), req.branchId);
-    applyTotals(data);
-    data.returnNumber = await generateBranchNumber(req.branchId, 'salesReturn', data.returnDate || new Date());
-    if (data.adjustmentType === 'credit_note') {
-      data.creditNoteNumber = await generateBranchNumber(req.branchId, 'creditNote', data.returnDate || new Date());
-      data.creditNoteDate = new Date();
-    } else {
-      data.creditNoteNumber = undefined;
-      data.creditNoteDate = undefined;
+    const creationSession = await mongoose.startSession();
+    let salesReturn;
+    try {
+      await creationSession.withTransaction(async () => {
+        await lockSalesReturnLineage(req.body.items || [], req.branchId, creationSession);
+        data.items = await validateSalesReturnItems(data, invoice, { session: creationSession });
+        await assertWarehousesInBranch(data.items.map((item) => item.warehouse).filter(Boolean), req.branchId, { session: creationSession });
+        applyTotals(data);
+        data.returnNumber = await generateBranchNumber(req.branchId, 'salesReturn', data.returnDate || new Date(), { session: creationSession });
+        if (data.adjustmentType === 'credit_note') {
+          data.creditNoteNumber = await generateBranchNumber(req.branchId, 'creditNote', data.returnDate || new Date(), { session: creationSession });
+          data.creditNoteDate = new Date();
+        } else {
+          data.creditNoteNumber = undefined;
+          data.creditNoteDate = undefined;
+        }
+        [salesReturn] = await SalesReturn.create([data], { session: creationSession });
+      });
+    } finally {
+      await creationSession.endSession();
     }
-
-    const salesReturn = await SalesReturn.create(data);
     return res.status(201).json({ success: true, message: 'Invoice-linked Sales Return created.', data: salesReturn });
   } catch (error) {
     if (error.code === 11000) {
@@ -392,34 +410,42 @@ router.patch('/:id/reverse', requirePermission('credit.note'), async (req, res) 
         throw routeError(403, 'Maker-checker violation: the Sales Return creator or approver cannot reverse it.');
       }
 
-      const stockUpdates = new Map();
+      const order = await SalesOrder.findOne({ _id: current.salesOrder, branch: req.branchId }).session(session);
+      if (!order) throw routeError(409, 'The source Sales Order is unavailable for return reversal.');
+      await lockSalesReturnLineage(current.items, req.branchId, session);
       for (const item of current.items) {
-        if (!['resaleable', 'damaged'].includes(item.condition)) continue;
-        const key = stockKey(item);
-        const previous = stockUpdates.get(key);
-        stockUpdates.set(key, { item, quantity: (previous?.quantity || 0) + Number(item.returnQty || 0) });
+        const quantity = Number(item.returnQty || 0);
+        if (['resaleable', 'damaged'].includes(item.condition)) {
+          const snapshot = stableUomSnapshot(item);
+          const baseQuantity = quantity * snapshot.conversionFactor;
+          const decrement = item.condition === 'resaleable'
+            ? { totalQty: -baseQuantity, availableQty: -baseQuantity }
+            : { totalQty: -baseQuantity, damagedQty: -baseQuantity };
+          const originalOperationKey = stockOperationKey('sales-return', current._id, item._id, 'post', item.condition);
+          await applyStockMovement({
+            operationKey: stockOperationKey('sales-return', current._id, item._id, 'reverse', item.condition),
+            correlationKey: stockOperationKey('sales-return', current._id),
+            movementType: 'sales_return_reversal', phase: 'reversed',
+            branch: current.branch, product: item.product, warehouse: item.warehouse, shade: item.shade || '', batch: item.batch || '',
+            deltas: decrement,
+            enteredQuantity: quantity, ...snapshot, baseQuantity,
+            sourceType: 'SalesReturn', sourceModel: 'SalesReturn', sourceId: current._id, sourceLineId: item._id,
+            sourceNumber: current.returnNumber, actor: req.user._id, occurredAt: new Date(),
+            reason: reversalReason, remarks: current.approvalRemarks || '', reversalOfOperationKey: originalOperationKey,
+            metadata: { condition: item.condition, invoice: current.invoice, salesOrder: current.salesOrder, complaint: current.complaint },
+            guardMessage: 'Returned stock has changed and cannot be safely removed for reversal.',
+          }, { session });
+        }
+        if (item.salesOrderItem) {
+          const orderLine = order.items.id(item.salesOrderItem);
+          if (!orderLine || Number(orderLine.returnedQuantity || 0) + QUANTITY_TOLERANCE < quantity) {
+            throw routeError(409, `Returned quantity counter is inconsistent for ${item.productName || 'returned item'}.`);
+          }
+          orderLine.returnedQuantity = Math.max(0, Number(orderLine.returnedQuantity || 0) - quantity);
+          refreshSalesOrderLine(orderLine);
+        }
       }
-      for (const { item, quantity } of stockUpdates.values()) {
-        const quantityGuard = item.condition === 'resaleable'
-          ? { totalQty: { $gte: quantity }, availableQty: { $gte: quantity } }
-          : { totalQty: { $gte: quantity }, damagedQty: { $gte: quantity } };
-        const decrement = item.condition === 'resaleable'
-          ? { totalQty: -quantity, availableQty: -quantity }
-          : { totalQty: -quantity, damagedQty: -quantity };
-        const stock = await Stock.findOneAndUpdate(
-          {
-            branch: current.branch,
-            product: item.product,
-            warehouse: item.warehouse,
-            shade: item.shade || '',
-            batch: item.batch || '',
-            ...quantityGuard,
-          },
-          { $inc: decrement },
-          { new: true, session, runValidators: true }
-        );
-        if (!stock) throw routeError(409, 'Returned stock has changed and cannot be safely removed for reversal.');
-      }
+      await order.save({ session });
       if (current.adjustmentType === 'credit_note' && current.grandTotal > 0) {
         await postSubledgerEntry({
           session,

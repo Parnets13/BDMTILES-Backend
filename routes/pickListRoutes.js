@@ -2,7 +2,8 @@ import { Router } from 'express';
 import mongoose from 'mongoose';
 import PickList from '../models/PickList.js';
 import SalesOrder from '../models/SalesOrder.js';
-import Stock from '../models/Stock.js';
+import { applyStockMovement, stockOperationKey } from '../services/stockMovementService.js';
+import { stableUomSnapshot } from '../services/stockUomService.js';
 import User from '../models/User.js';
 import { ROLE_DEFAULT_PERMISSIONS } from '../config/permissions.js';
 import { protect, requirePermission, requireAnyPermission } from '../middleware/auth.js';
@@ -85,7 +86,7 @@ router.post('/reserve-backorder/:soId', requireAnyPermission('sales.order.approv
       if (['pending', 'rejected'].includes(order.approvalStatus)) {
         throw Object.assign(new Error(`Sales Order cannot reserve backorder stock while approval is ${order.approvalStatus}.`), { status: 409 });
       }
-      await reserveSalesOrderInventory(order, { session });
+      await reserveSalesOrderInventory(order, { session, actor: req.user._id, reason: 'Backorder reservation' });
     });
     return res.json({ success: true, message: 'Remaining backorder quantity is reserved and available for pick-list allocation.', data: order });
   } catch (error) {
@@ -148,6 +149,10 @@ router.post('/generate/:soId', async (req, res) => {
           allocatedQty: requestedQty,
           requestedQty,
           unit: line.unit || 'Box',
+          baseQuantity: requestedQty * Number(line.conversionFactor || 1),
+          baseUnit: line.baseUnit || line.unit || 'Box',
+          conversionFactor: Number(line.conversionFactor || 1),
+          uomVersion: Number(line.uomVersion || 1),
           warehouse: line.warehouse?._id || line.warehouse,
           warehouseName: line.warehouse?.name || '',
           status: 'pending',
@@ -310,22 +315,26 @@ router.patch('/:id/complete-picking', async (req, res) => {
 
         for (const [type, quantity] of [['short', shortQty], ['damaged', damagedQty]]) {
           if (!(quantity > QUANTITY_TOLERANCE)) continue;
+          const snapshot = stableUomSnapshot(pickItem);
+          const baseQuantity = quantity * snapshot.conversionFactor;
           const quantityMove = type === 'short'
-            ? { reservedQty: -quantity, availableQty: quantity }
-            : { reservedQty: -quantity, damagedQty: quantity };
-          const stock = await Stock.findOneAndUpdate(
-            {
-              branch: req.branchId,
-              product: pickItem.product,
-              warehouse: pickItem.warehouse,
-              shade: pickItem.shade || '',
-              batch: pickItem.batch || '',
-              reservedQty: { $gte: quantity },
-            },
-            { $inc: quantityMove },
-            { new: true, session }
-          );
-          if (!stock) throw Object.assign(new Error(`Reserved stock is inconsistent for ${pickItem.productName}.`), { status: 409 });
+            ? { reservedQty: -baseQuantity, availableQty: baseQuantity }
+            : { reservedQty: -baseQuantity, damagedQty: baseQuantity };
+          await applyStockMovement({
+            operationKey: stockOperationKey('pick-list', claimed._id, pickItem._id, type),
+            correlationKey: stockOperationKey('pick-list', claimed._id, 'completion'),
+            movementType: type === 'short' ? 'pick_short_release' : 'pick_damage',
+            phase: type === 'short' ? 'released' : 'reclassified',
+            branch: req.branchId, product: pickItem.product, warehouse: pickItem.warehouse,
+            shade: pickItem.shade || '', batch: pickItem.batch || '', deltas: quantityMove,
+            enteredQuantity: quantity, ...snapshot, baseQuantity,
+            sourceType: 'PickList', sourceModel: 'PickList', sourceId: claimed._id, sourceLineId: pickItem._id,
+            sourceNumber: claimed.pickListNumber, actor: req.user._id, occurredAt: new Date(),
+            reason: type === 'short' ? 'Pick shortage reservation release' : 'Picking damage reclassification',
+            remarks: submittedItem.remarks || '',
+            metadata: { salesOrder: order._id, salesOrderItem: orderLine._id },
+            guardMessage: `Reserved stock is inconsistent for ${pickItem.productName}.`,
+          }, { session });
         }
 
         orderLine.allocatedQuantity = Math.max(0, Number(orderLine.allocatedQuantity || 0) - unfulfilled);
@@ -432,7 +441,8 @@ router.patch('/:id/sort', async (req, res) => {
     await session.withTransaction(async () => {
       const current = await PickList.findOne({ _id: req.params.id, branch: req.branchId }).session(session);
       if (!current) throw Object.assign(new Error('Pick list not found.'), { status: 404 });
-      if (current.status === 'sorted') { sorted = current; return; }
+      if (current.status === 'sorted' && current.sortingPostedAt) { sorted = current; return; }
+      if (current.sortingPostedAt) throw Object.assign(new Error('Posted sorting reconciliation is immutable and cannot be edited.'), { status: 409 });
       if (current.status !== 'verified') throw Object.assign(new Error(`Cannot complete sorting while pick list is "${current.status}". Expected "verified".`), { status: 409 });
       const submitted = req.body.items;
       if (!Array.isArray(submitted) || submitted.length !== current.items.length) {
@@ -446,6 +456,9 @@ router.patch('/:id/sort', async (req, res) => {
         { new: true, session }
       );
       if (!claimed) throw Object.assign(new Error('Sorting verification is already being processed. Refresh before retrying.'), { status: 409 });
+      const order = await SalesOrder.findOne({ _id: claimed.salesOrder, branch: req.branchId }).session(session);
+      if (!order) throw Object.assign(new Error('Linked Sales Order not found.'), { status: 409 });
+      const sortingVersion = Number(claimed.sortingVersion || 0) + 1;
 
       const verifiedAt = new Date();
       for (const item of claimed.items) {
@@ -463,6 +476,55 @@ router.patch('/:id/sort', async (req, res) => {
         if (evidence.barcodeConfirmed !== true || evidence.shadeConfirmed !== true || evidence.batchConfirmed !== true) {
           throw Object.assign(new Error(`Confirm barcode, shade, and batch for ${item.productName}.`), { status: 400 });
         }
+        const discrepancy = sortingShortQty + sortingDamagedQty;
+        const discrepancyReason = String(evidence.remarks || req.body.reason || req.body.remarks || '').trim();
+        if (discrepancy > QUANTITY_TOLERANCE && !discrepancyReason) {
+          throw Object.assign(new Error(`A reason is required for sorting discrepancies on ${item.productName}.`), { status: 422 });
+        }
+        const orderLine = order.items.id(item.salesOrderItem);
+        if (!orderLine) throw Object.assign(new Error(`Source Sales Order item is missing for ${item.productName}.`), { status: 409 });
+        if (Number(orderLine.reservedQuantity || 0) + QUANTITY_TOLERANCE < discrepancy
+            || Number(orderLine.allocatedQuantity || 0) + QUANTITY_TOLERANCE < discrepancy) {
+          throw Object.assign(new Error(`Sales Order reservation changed for ${item.productName}.`), { status: 409 });
+        }
+        const snapshot = stableUomSnapshot(item);
+        if (sortingShortQty > QUANTITY_TOLERANCE) {
+          const baseQuantity = sortingShortQty * snapshot.conversionFactor;
+          const result = await applyStockMovement({
+            operationKey: stockOperationKey('pick-list', claimed._id, item._id, 'sorting-short', sortingVersion),
+            correlationKey: stockOperationKey('pick-list', claimed._id, 'sorting', sortingVersion),
+            movementType: 'sorting_short', phase: 'reclassified',
+            branch: req.branchId, product: item.product, warehouse: item.warehouse, shade: item.shade || '', batch: item.batch || '',
+            deltas: { reservedQty: -baseQuantity, totalQty: -baseQuantity, shortQty: baseQuantity },
+            enteredQuantity: sortingShortQty, ...snapshot, baseQuantity,
+            sourceType: 'PickList', sourceModel: 'PickList', sourceId: claimed._id, sourceLineId: item._id,
+            sourceNumber: claimed.pickListNumber, actor: req.user._id, occurredAt: verifiedAt,
+            reason: discrepancyReason, metadata: { sortingVersion, salesOrder: order._id, salesOrderItem: orderLine._id },
+            guardMessage: `Reserved stock is inconsistent for sorting shortage on ${item.productName}.`,
+          }, { session });
+          item.sortingShortMovement = result.movement._id;
+        }
+        if (sortingDamagedQty > QUANTITY_TOLERANCE) {
+          const baseQuantity = sortingDamagedQty * snapshot.conversionFactor;
+          const result = await applyStockMovement({
+            operationKey: stockOperationKey('pick-list', claimed._id, item._id, 'sorting-damage', sortingVersion),
+            correlationKey: stockOperationKey('pick-list', claimed._id, 'sorting', sortingVersion),
+            movementType: 'sorting_damage', phase: 'reclassified',
+            branch: req.branchId, product: item.product, warehouse: item.warehouse, shade: item.shade || '', batch: item.batch || '',
+            deltas: { reservedQty: -baseQuantity, damagedQty: baseQuantity },
+            enteredQuantity: sortingDamagedQty, ...snapshot, baseQuantity,
+            sourceType: 'PickList', sourceModel: 'PickList', sourceId: claimed._id, sourceLineId: item._id,
+            sourceNumber: claimed.pickListNumber, actor: req.user._id, occurredAt: verifiedAt,
+            reason: discrepancyReason, metadata: { sortingVersion, salesOrder: order._id, salesOrderItem: orderLine._id },
+            guardMessage: `Reserved stock is inconsistent for sorting damage on ${item.productName}.`,
+          }, { session });
+          item.sortingDamageMovement = result.movement._id;
+        }
+        orderLine.reservedQuantity = Math.max(0, Number(orderLine.reservedQuantity || 0) - discrepancy);
+        orderLine.allocatedQuantity = Math.max(0, Number(orderLine.allocatedQuantity || 0) - discrepancy);
+        orderLine.shortQuantity = Number(orderLine.shortQuantity || 0) + sortingShortQty;
+        orderLine.damagedQuantity = Number(orderLine.damagedQuantity || 0) + sortingDamagedQty;
+        refreshSalesOrderLine(orderLine);
         item.sortedQty = sortedQty;
         item.sortingShortQty = sortingShortQty;
         item.sortingDamagedQty = sortingDamagedQty;
@@ -472,11 +534,21 @@ router.patch('/:id/sort', async (req, res) => {
         item.sortingRemarks = String(evidence.remarks || '');
         item.sortingVerifiedBy = req.user._id;
         item.sortingVerifiedAt = verifiedAt;
+        item.sortingVersion = sortingVersion;
+        item.sortingPostedAt = verifiedAt;
+        item.sortingPostedBy = req.user._id;
+        item.sortingReason = discrepancyReason;
+        item.sortingDiscrepancyResolved = true;
       }
-      const hasSortingDiscrepancy = claimed.items.some(item => Number(item.sortingShortQty || 0) > QUANTITY_TOLERANCE || Number(item.sortingDamagedQty || 0) > QUANTITY_TOLERANCE);
-      claimed.status = hasSortingDiscrepancy ? 'verified' : 'sorted';
+      order.reservationStatus = order.items.some(item => Number(item.reservedQuantity || 0) > QUANTITY_TOLERANCE) ? 'partial' : 'released';
+      await order.save({ session });
+      claimed.status = 'sorted';
       claimed.sortedBy = req.user._id;
       claimed.sortingEndTime = verifiedAt;
+      claimed.sortingVersion = sortingVersion;
+      claimed.sortingPostedAt = verifiedAt;
+      claimed.sortingPostedBy = req.user._id;
+      claimed.sortingReason = String(req.body.reason || req.body.remarks || '').trim();
       claimed.deliveryRoute = req.body.deliveryRoute ?? claimed.deliveryRoute;
       claimed.remarks = req.body.remarks ?? claimed.remarks;
       claimed.sortingVerificationProcessing = false;
@@ -485,9 +557,9 @@ router.patch('/:id/sort', async (req, res) => {
     });
     return res.json({
       success: true,
-      message: sorted.status === 'sorted'
-        ? 'Sorting completed with item-level quantity and identity verification.'
-        : 'Sorting discrepancies recorded. Correct or resolve short/damaged quantities before packing.',
+      message: sorted.sortingPostedAt
+        ? 'Sorting posted. Short stock was removed from reserved/total; damaged stock was moved from reserved to damaged.'
+        : 'Sorting already posted.',
       data: sorted,
     });
   } catch (e) {

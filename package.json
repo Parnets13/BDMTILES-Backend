@@ -5,12 +5,23 @@
   "main": "server.js",
   "type": "module",
   "scripts": {
-    "start": "nodemon server.js",
+    "start": "node --use-system-ca server.js",
     "dev": "nodemon server.js",
-    "seed": "node scripts/seed.js",
-    "create-admin": "node scripts/createSuperAdmin.js",
-    "migrate:branches": "node scripts/migrateMultiBranch.js",
-    "test:modules": "node scripts/testAllModules.js"
+    "seed": "node --use-system-ca scripts/seed.js",
+    "create-admin": "node --use-system-ca scripts/createSuperAdmin.js",
+    "migrate:branches": "node --use-system-ca scripts/migrateMultiBranch.js",
+    "migrate:quotation-conversions": "node --use-system-ca scripts/migrateQuotationConversions.js --dry-run",
+    "migrate:quotation-conversions:execute": "node --use-system-ca scripts/migrateQuotationConversions.js --execute",
+    "migrate:quotation-readiness": "node --use-system-ca scripts/migrateQuotationReadiness.js --dry-run",
+    "migrate:quotation-readiness:execute": "node --use-system-ca scripts/migrateQuotationReadiness.js --execute",
+    "validate:quotation-readiness": "node --use-system-ca scripts/validateQuotationReadinessScenarios.js",
+    "migrate:stock-movements": "node --use-system-ca scripts/migrateStockMovements.js --dry-run",
+    "migrate:stock-movements:execute": "node --use-system-ca scripts/migrateStockMovements.js --execute",
+    "migrate:uom-lineage": "node --use-system-ca scripts/migrateUomLineage.js --dry-run",
+    "migrate:uom-lineage:execute": "node --use-system-ca scripts/migrateUomLineage.js --execute",
+    "migrate:delivery-lineage": "node --use-system-ca scripts/migrateDeliveryItemLineage.js --dry-run",
+    "migrate:delivery-lineage:execute": "node --use-system-ca scripts/migrateDeliveryItemLineage.js --execute",
+    "test:modules": "node --use-system-ca scripts/testAllModules.js"
   },
   "keywords": [
     "bdmtiles",

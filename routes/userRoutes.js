@@ -16,6 +16,7 @@ import {
 } from '../utils/branchScope.js';
 import { AVAILABLE_PERMISSIONS, ROLE_DEFAULT_PERMISSIONS, ROLE_INFO } from '../config/permissions.js';
 import { validateStrongPassword } from '../utils/authSecurity.js';
+import { canonicalPhone } from '../utils/phone.js';
 
 const KNOWN_PERMISSIONS = new Set(
   Object.values(AVAILABLE_PERMISSIONS).flat().map((permission) => permission.id)
@@ -29,10 +30,41 @@ const GLOBAL_DIMENSION_REASON = 'Unavailable until these records have branch own
 const MAX_DEPARTMENTS = 50;
 const MAX_DEPARTMENT_LENGTH = 100;
 
-const httpError = (status, message) => Object.assign(new Error(message), { status });
+const httpError = (status, message, code) => Object.assign(
+  new Error(message),
+  { status, ...(code ? { code } : {}) }
+);
 const hasOwn = (object, key) => Object.prototype.hasOwnProperty.call(object, key);
 const escapeRegex = (value) => String(value).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 const idString = (value) => String(value?._id || value || '');
+
+async function assertPhoneAvailable(value, excludeUserId = null) {
+  const phone = String(value || '').trim();
+  const canonical = canonicalPhone(phone);
+  if (!canonical) {
+    throw httpError(422, 'Enter a valid phone number using digits and standard phone formatting.');
+  }
+
+  const excludeFilter = excludeUserId ? { _id: { $ne: excludeUserId } } : {};
+  const indexedMatch = await User.exists({ ...excludeFilter, phoneNormalized: canonical });
+  if (indexedMatch) {
+    throw httpError(409, 'This phone number is already used by another user.', 'PHONE_ALREADY_USED');
+  }
+
+  // Legacy users predate phoneNormalized. Keep checking them until they are
+  // migrated naturally by an update or an explicit data-cleanup migration.
+  const legacyUsers = await User.find({
+    ...excludeFilter,
+    $or: [{ phoneNormalized: { $exists: false } }, { phoneNormalized: null }],
+  }).select('phone').lean();
+  if (legacyUsers.some((user) => canonicalPhone(user.phone) === canonical)) {
+    throw httpError(409, 'This phone number is already used by another user.', 'PHONE_ALREADY_USED');
+  }
+  return phone;
+}
+
+const isPhoneDuplicateKey = (error) => error?.code === 11000
+  && Boolean(error?.keyPattern?.phoneNormalized || error?.keyValue?.phoneNormalized);
 
 function assertCanAssignRole(actor, role) {
   if (!ROLE_INFO[role]) throw httpError(422, 'Unknown user role.');
@@ -610,6 +642,7 @@ router.post('/', async (req, res) => {
       throw httpError(422, 'Name, username, email, phone, and password are required.');
     }
     assertCanAssignRole(req.user, role);
+    const normalizedPhone = await assertPhoneAvailable(phone);
 
     const exists = await User.findOne({
       $or: [{ email: email.toLowerCase() }, { username: username.toLowerCase() }],
@@ -633,7 +666,7 @@ router.post('/', async (req, res) => {
       username: username.toLowerCase(),
       email: email.toLowerCase(),
       password,
-      phone,
+      phone: normalizedPhone,
       role,
       status: status || 'Active',
       mustChangePassword: true,
@@ -649,8 +682,13 @@ router.post('/', async (req, res) => {
       user: await getPopulatedUser(user._id, req.user),
     });
   } catch (error) {
-    return res.status(error.status || (error.code === 11000 ? 400 : 500))
-      .json({ success: false, message: error.message });
+    const phoneConflict = error.code === 'PHONE_ALREADY_USED' || isPhoneDuplicateKey(error);
+    return res.status(phoneConflict ? 409 : (error.status || (error.code === 11000 ? 400 : 500)))
+      .json({
+        success: false,
+        message: phoneConflict ? 'This phone number is already used by another user.' : error.message,
+        ...(phoneConflict ? { code: 'PHONE_ALREADY_USED' } : {}),
+      });
   }
 });
 
@@ -660,6 +698,10 @@ router.put('/:id', async (req, res) => {
     const user = await User.findById(req.params.id).select('+refreshSessions');
     if (!user) return res.status(404).json({ success: false, message: 'User not found.' });
     assertCanManageTarget(req.user, user);
+
+    const normalizedPhone = hasOwn(req.body, 'phone')
+      ? await assertPhoneAvailable(req.body.phone, user._id)
+      : user.phone;
 
     const nextRole = req.body.role || user.role;
     if (idEquals(user._id, req.user._id) && nextRole !== user.role) {
@@ -693,9 +735,10 @@ router.put('/:id', async (req, res) => {
     const assignments = await normalizeAssignments(req.body, branchAssignments, user, req.user);
     const permissionState = resolvePermissions(req.body, nextRole, user, req.user);
 
-    for (const field of ['name', 'username', 'email', 'phone']) {
+    for (const field of ['name', 'username', 'email']) {
       if (hasOwn(req.body, field)) user[field] = req.body[field];
     }
+    user.phone = normalizedPhone;
     user.status = requestedStatus;
     user.role = nextRole;
     Object.assign(user, permissionState, branchAssignments, assignments);
@@ -729,8 +772,15 @@ router.put('/:id', async (req, res) => {
 
     return res.json({ success: true, message: isReactivation ? 'User reactivated.' : 'User updated.', user: responseUser });
   } catch (error) {
-    const status = error.status || (error.code === 11000 ? 400 : (error.name === 'CastError' || error.name === 'ValidationError' ? 422 : 500));
-    return res.status(status).json({ success: false, message: error.message });
+    const phoneConflict = error.code === 'PHONE_ALREADY_USED' || isPhoneDuplicateKey(error);
+    const status = phoneConflict
+      ? 409
+      : (error.status || (error.code === 11000 ? 400 : (error.name === 'CastError' || error.name === 'ValidationError' ? 422 : 500)));
+    return res.status(status).json({
+      success: false,
+      message: phoneConflict ? 'This phone number is already used by another user.' : error.message,
+      ...(phoneConflict ? { code: 'PHONE_ALREADY_USED' } : {}),
+    });
   }
 });
 

@@ -1,4 +1,5 @@
 import 'dotenv/config';
+import mongoose from 'mongoose';
 import express from 'express';
 import cors from 'cors';
 import helmet from 'helmet';
@@ -6,6 +7,9 @@ import cookieParser from 'cookie-parser';
 import connectDB from './config/db.js';
 import errorHandler from './middleware/errorHandler.js';
 import authRoutes from './routes/authRoutes.js';
+import dealerAuthRoutes from './routes/dealerAuthRoutes.js';
+import dealerAppRoutes from './routes/dealerAppRoutes.js';
+import dealerDownloadRoutes from './routes/dealerDownloadRoutes.js';
 import userRoutes from './routes/userRoutes.js';
 import categoryRoutes from './routes/categoryRoutes.js';
 import productRoutes from './routes/productRoutes.js';
@@ -40,9 +44,13 @@ import assetRoutes from './routes/assetRoutes.js';
 import discountMappingRoutes from './routes/discountMappingRoutes.js';
 import invoiceRoutes from './routes/invoiceRoutes.js';
 import stockTransferRoutes from './routes/stockTransferRoutes.js';
+import stockRoutes from './routes/stockRoutes.js';
+import stockAdjustmentRoutes from './routes/stockAdjustmentRoutes.js';
+import physicalStockAuditRoutes from './routes/physicalStockAuditRoutes.js';
 import pickListRoutes from './routes/pickListRoutes.js';
 import dispatchTripRoutes from './routes/dispatchTripRoutes.js';
 import deliveryRoutes from './routes/deliveryRoutes.js';
+import dispatchReturnRoutes from './routes/dispatchReturnRoutes.js';
 import bankReconciliationRoutes from './routes/bankReconciliationRoutes.js';
 import documentRoutes from './routes/documentRoutes.js';
 import taskRoutes from './routes/taskRoutes.js';
@@ -50,10 +58,9 @@ import notificationRoutes from './routes/notificationRoutes.js';
 import accessPolicyRoutes from './routes/accessPolicyRoutes.js';
 import incentiveRoutes from './routes/incentiveRoutes.js';
 import branchRoutes from './routes/branchRoutes.js';
-
-import dns from 'dns';
-
-dns.setServers(['8.8.8.8', '8.8.4.4']);
+import salesExecutiveRoutes from './routes/salesExecutiveRoutes.js';
+import dealerOrderRequestRoutes from './routes/dealerOrderRequestRoutes.js';
+import { startReservationExpiryScheduler } from './services/reservationExpiryScheduler.js';
 
 const app = express();
 const allowedOrigins = String(process.env.FRONTEND_URL || 'http://localhost:5173')
@@ -65,8 +72,6 @@ if (process.env.TRUST_PROXY) {
   const trustProxy = Number.parseInt(process.env.TRUST_PROXY, 10);
   app.set('trust proxy', Number.isNaN(trustProxy) ? process.env.TRUST_PROXY : trustProxy);
 }
-
-connectDB();
 
 app.use(cors({
   credentials: true,
@@ -80,9 +85,16 @@ app.use(express.urlencoded({ extended: true }));
 app.use(cookieParser());
 app.use(helmet({ crossOriginResourcePolicy: { policy: 'cross-origin' } }));
 
-// Health check
+// Liveness plus database readiness. Returning 503 prevents callers from
+// treating an HTTP listener with an unavailable database as healthy.
 app.get('/api/v1/health', (req, res) => {
-  res.json({ success: true, message: 'BDMTILES API running', version: '1.0.0' });
+  const databaseReady = mongoose.connection.readyState === 1;
+  res.status(databaseReady ? 200 : 503).json({
+    success: databaseReady,
+    message: databaseReady ? 'BDMTILES API running' : 'BDMTILES API waiting for MongoDB',
+    version: '1.0.0',
+    database: databaseReady ? 'connected' : 'unavailable',
+  });
 });
 
 // Auto-log all write operations (POST/PUT/PATCH/DELETE)
@@ -90,6 +102,10 @@ app.use('/api/v1', autoLogMiddleware);
 
 // Routes
 app.use('/api/v1/auth', authRoutes);
+app.use('/api/v1/dealer-app/auth', dealerAuthRoutes);
+app.use('/api/v1/dealer-app', dealerAppRoutes);
+// Token-authorised PDF downloads (opened by the device viewer, not the app itself).
+app.use('/api/v1/dealer-downloads', dealerDownloadRoutes);
 app.use('/api/v1/users', userRoutes);
 app.use('/api/v1/category-setup', categoryRoutes);
 app.use('/api/v1/products', productRoutes);
@@ -104,6 +120,7 @@ app.use('/api/v1/dealer-pricing', dealerPricingRoutes);
 app.use('/api/v1/supplier-invoices', supplierInvoiceRoutes);
 app.use('/api/v1/purchase-returns', purchaseReturnRoutes);
 app.use('/api/v1/quotations', quotationRoutes);
+app.use('/api/v1/dealer-order-requests', dealerOrderRequestRoutes);
 app.use('/api/v1/ledger', ledgerRoutes);
 app.use('/api/v1/cheques', chequeRoutes);
 app.use('/api/v1/vouchers', voucherRoutes);
@@ -123,16 +140,21 @@ app.use('/api/v1/supplier-quotations', supplierQuotationRoutes);
 app.use('/api/v1/assets', assetRoutes);
 app.use('/api/v1/discount-mappings', discountMappingRoutes);
 app.use('/api/v1/invoices', invoiceRoutes);
+app.use('/api/v1/stock', stockRoutes);
+app.use('/api/v1/stock-adjustments', stockAdjustmentRoutes);
+app.use('/api/v1/physical-stock-audits', physicalStockAuditRoutes);
 app.use('/api/v1/stock-transfers', stockTransferRoutes);
 app.use('/api/v1/pick-lists', pickListRoutes);
 app.use('/api/v1/dispatch-trips', dispatchTripRoutes);
 app.use('/api/v1/deliveries', deliveryRoutes);
+app.use('/api/v1/dispatch-returns', dispatchReturnRoutes);
 app.use('/api/v1/bank-reconciliation', bankReconciliationRoutes);
 app.use('/api/v1/documents', documentRoutes);
 app.use('/api/v1/tasks', taskRoutes);
 app.use('/api/v1/notifications', notificationRoutes);
 app.use('/api/v1/access-policies', accessPolicyRoutes);
 app.use('/api/v1/incentives', incentiveRoutes);
+app.use('/api/v1/sales-executive', salesExecutiveRoutes);
 
 // Static uploads (supplier financial evidence is never public)
 app.use('/uploads/supplier-credit-notes', (_req, res) => res.status(404).json({ success: false, message: 'Not found.' }));
@@ -147,8 +169,50 @@ app.use((req, res) => {
 app.use(errorHandler);
 
 const PORT = process.env.PORT || 5000;
-app.listen(PORT, () => {
-  console.log(`\n🚀 BDMTILES Backend | Port ${PORT} | ${process.env.NODE_ENV || 'development'}\n`);
+const HOST = process.env.HOST || '0.0.0.0';
+
+let httpServer;
+let reservationExpiryScheduler;
+let shuttingDown = false;
+
+const start = async () => {
+  await connectDB();
+  reservationExpiryScheduler = startReservationExpiryScheduler();
+  httpServer = app.listen(PORT, HOST, () => {
+    console.log(`\n🚀 BDMTILES Backend | http://${HOST}:${PORT} | ${process.env.NODE_ENV || 'development'}\n`);
+  });
+  return httpServer;
+};
+
+const shutdown = async signal => {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  console.log(`[server] ${signal} received; stopping scheduled work and HTTP listener`);
+  await reservationExpiryScheduler?.stop();
+  if (httpServer?.listening) await new Promise(resolve => httpServer.close(resolve));
+  await mongoose.disconnect();
+};
+
+for (const signal of ['SIGINT', 'SIGTERM']) {
+  process.once(signal, () => {
+    shutdown(signal).catch(error => {
+      console.error(`[server] graceful shutdown failed: ${error.message}`);
+      process.exitCode = 1;
+    });
+  });
+}
+
+start().catch(async (error) => {
+  const topologyErrors = error?.reason?.servers
+    ? [...error.reason.servers.values()].map(description => description.error?.message).filter(Boolean)
+    : [];
+  const details = [...new Set(topologyErrors)];
+  console.error(`❌ Backend startup failed: ${error.message}`);
+  if (details.length) console.error(`   Connection detail: ${details.join(' | ')}`);
+  try { await mongoose.disconnect(); }
+  catch (disconnectError) { console.error(`   Startup cleanup failed: ${disconnectError.message}`); }
+  process.exitCode = 1;
 });
 
+export { shutdown, start };
 export default app;

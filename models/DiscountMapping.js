@@ -22,6 +22,31 @@ const discountMappingSchema = new mongoose.Schema(
     ruleCode: { type: String, unique: true, sparse: true, trim: true },
     branch: { type: mongoose.Schema.Types.ObjectId, ref: 'Branch', index: true },
 
+    // Sales (dealer/builder) discount vs Purchase (supplier) discount.
+    // Existing rules default to 'sales' so nothing changes for them.
+    mappingType: {
+      type: String,
+      enum: ['sales', 'purchase'],
+      default: 'sales',
+      index: true,
+    },
+
+    // Which suppliers this purchase discount applies to (mappingType = 'purchase').
+    // Empty = applies to all suppliers for the matched target.
+    suppliers: [{
+      type: mongoose.Schema.Types.ObjectId,
+      ref: 'Supplier',
+    }],
+
+    // Purchase direct discount: the expected/negotiated baseline % from the supplier.
+    directDiscountPercentage: { type: Number, min: 0, max: 100, default: 0 },
+
+    // Purchase floating range: the buyer may accept MORE discount up to the max
+    // (better for us), never less than the min, during PO / supplier invoice entry.
+    floatingDiscountEnabled: { type: Boolean, default: false },
+    floatingDiscountMin: { type: Number, min: 0, max: 100, default: 0 },
+    floatingDiscountMax: { type: Number, min: 0, max: 100, default: 0 },
+
     // What this discount targets
     targetType: {
       type: String,
@@ -135,6 +160,7 @@ discountMappingSchema.statics.findBestDiscount = async function (productDoc, dea
   const now = new Date();
   const baseFilter = {
     branch: branchId,
+    mappingType: 'sales',
     status: 'active',
     validFrom: { $lte: now },
     validTo: { $gte: now },
@@ -199,6 +225,7 @@ discountMappingSchema.statics.bulkResolveDiscounts = async function (products, d
   const now = new Date();
   const baseFilter = {
     branch: branchId,
+    mappingType: 'sales',
     status: 'active',
     validFrom: { $lte: now },
     validTo: { $gte: now },
@@ -235,6 +262,45 @@ discountMappingSchema.statics.bulkResolveDiscounts = async function (products, d
   }
 
   return results;
+};
+
+/**
+ * Static: Find the best PURCHASE discount for a product + supplier.
+ * Resolution order (most specific wins): product > brand > subcategory > category.
+ * A rule matches a supplier when it lists that supplier OR lists no suppliers (all).
+ * Supplier-specific rules are preferred over all-supplier rules at the same level.
+ */
+discountMappingSchema.statics.findBestPurchaseDiscount = async function (productDoc, supplierId, branchId) {
+  if (!branchId) throw new Error('branch is required to resolve purchase discounts.');
+  const now = new Date();
+  const base = {
+    branch: branchId,
+    mappingType: 'purchase',
+    status: 'active',
+    validFrom: { $lte: now },
+    validTo: { $gte: now },
+  };
+  const levels = [
+    productDoc._id && { targetType: 'product', product: productDoc._id },
+    productDoc.brand && { targetType: 'brand', brand: productDoc.brand?._id || productDoc.brand },
+    productDoc.subcategory && { targetType: 'subcategory', subcategory: productDoc.subcategory?._id || productDoc.subcategory },
+    productDoc.category && { targetType: 'category', category: productDoc.category?._id || productDoc.category },
+  ].filter(Boolean);
+
+  for (const level of levels) {
+    const candidates = await this.find({ ...base, ...level }).sort({ priority: -1 }).lean();
+    if (!candidates.length) continue;
+    if (supplierId) {
+      const supplierSpecific = candidates.find(rule =>
+        (rule.suppliers || []).some(id => String(id) === String(supplierId)));
+      if (supplierSpecific) return supplierSpecific;
+    }
+    const allSuppliers = candidates.find(rule => !(rule.suppliers || []).length);
+    if (allSuppliers) return allSuppliers;
+    // Level had only supplier-specific rules that don't include this supplier;
+    // fall through to the next (less specific) level.
+  }
+  return null;
 };
 
 discountMappingSchema.statics.calculateRuleDiscount = function (rule, rate, quantity = 1, options = {}) {

@@ -1,6 +1,7 @@
 import { Router } from 'express';
 import mongoose from 'mongoose';
 import Delivery from '../models/Delivery.js';
+import DispatchReturn from '../models/DispatchReturn.js';
 import DispatchTrip from '../models/DispatchTrip.js';
 import SalesOrder from '../models/SalesOrder.js';
 import PickList from '../models/PickList.js';
@@ -155,6 +156,14 @@ router.post('/', async (req, res) => {
 
     const pickList = tripOrder.pickList ? await PickList.findOne({ _id: tripOrder.pickList, branch: req.branchId }).lean() : null;
     const unfulfilledQty = pickList?.items?.reduce((sum, item) => sum + Number(item.shortQty || 0) + Number(item.damagedQty || 0), 0) || 0;
+    const deliveryItems = (pickList?.items || []).filter(item => Number(item.dispatchedQty || 0) > QUANTITY_TOLERANCE).map(item => ({
+      pickList: pickList._id, pickListItem: item._id, salesOrderItem: item.salesOrderItem,
+      originalDispatchOperationKey: `dispatch-trip:${trip._id}:${pickList._id}:${item._id}:consume`,
+      product: item.product, warehouse: item.warehouse, shade: item.shade || '', batch: item.batch || '',
+      dispatchedQuantity: Number(item.dispatchedQty || 0), acceptedQuantity: 0, shortQuantity: 0, damagedRejectedQuantity: 0,
+      enteredUnit: item.enteredUnit || item.unit || 'Unit', baseQuantity: Number(item.dispatchedQty || 0) * Number(item.conversionFactor || 1),
+      baseUnit: item.baseUnit || item.unit || 'Unit', conversionFactor: Number(item.conversionFactor || 1), uomVersion: Number(item.uomVersion || 1),
+    }));
     const deliveryNumber = await generateBranchNumber(req.branchId, 'delivery', new Date());
     const delivery = await Delivery.create({
       deliveryNumber,
@@ -173,6 +182,8 @@ router.post('/', async (req, res) => {
       totalBoxes: tripOrder.totalBoxes,
       unfulfilledQty,
       hasFulfillmentShortage: unfulfilledQty > 0,
+      items: deliveryItems,
+      itemReconciliationState: deliveryItems.length ? 'pending' : 'legacy',
       otp: String(Math.floor(100000 + Math.random() * 900000)),
       status: 'in_transit',
       startTime: trip.dispatchTime || new Date(),
@@ -192,6 +203,8 @@ router.get('/:id', async (req, res) => {
       .populate('salesOrder', 'orderNumber grandTotal items status deliveryAddress customerPhone')
       .populate('dispatchTrip', 'tripNumber status vehicleNumber vehicleType driverName driverPhone routeName dispatchTime remarks orders finalDispatchVerification')
       .populate('deliveryExecutive', 'name phone')
+      .populate('items.product', 'productCode itemName images')
+      .populate('items.warehouse', 'warehouseCode name')
       .populate('dealer', 'businessName dealerCode mobile address city')
       .lean();
     if (!delivery) return res.status(404).json({ success: false, message: 'Delivery not found.' });
@@ -277,6 +290,11 @@ router.patch('/:id/complete', async (req, res) => {
         };
         return;
       }
+      const activeRecovery = await DispatchReturn.exists({ delivery: current._id, branch: current.branch, status: { $in: ['requested', 'warehouse_verified', 'approved'] } }).session(session);
+      if (activeRecovery) {
+        response = { status: 409, body: { success: false, message: 'Resolve the active dispatched-goods recovery request before recording customer acceptance.' } };
+        return;
+      }
 
       const exceptionRequested = req.body.verificationException === true;
       const exceptionReason = String(req.body.exceptionReason || '').trim();
@@ -302,13 +320,67 @@ router.patch('/:id/complete', async (req, res) => {
         return;
       }
 
-      const deliveredBoxes = req.body.deliveredBoxes === undefined ? current.totalBoxes : Number(req.body.deliveredBoxes);
-      const shortBoxes = Number(req.body.shortBoxes || 0);
-      const damagedBoxes = Number(req.body.damagedBoxes || 0);
+      let deliveredBoxes = req.body.deliveredBoxes === undefined ? current.totalBoxes : Number(req.body.deliveredBoxes);
+      let shortBoxes = Number(req.body.shortBoxes || 0);
+      let damagedBoxes = Number(req.body.damagedBoxes || 0);
       if (![deliveredBoxes, shortBoxes, damagedBoxes].every(value => Number.isFinite(value) && value >= 0) ||
           Math.abs(deliveredBoxes + shortBoxes + damagedBoxes - current.totalBoxes) > 0.0001) {
         response = { status: 400, body: { success: false, message: 'Delivered + short + damaged boxes must equal the delivery total.' } };
         return;
+      }
+      let reconciledItems = null;
+      let itemDiscrepancies = null;
+      let hasItemDiscrepancy = false;
+      if (current.items?.length) {
+        const submittedItems = Array.isArray(req.body.items) ? req.body.items : null;
+        if (!submittedItems && current.items.length > 1 && (shortBoxes > 0 || damagedBoxes > 0)) {
+          response = { status: 422, body: { success: false, message: 'Multi-line delivery discrepancies require accepted, short, and damaged-rejected quantities for every delivery item.' } };
+          return;
+        }
+        if (submittedItems) {
+          if (submittedItems.length !== current.items.length) {
+            response = { status: 422, body: { success: false, message: 'Submit reconciliation for every delivery item exactly once.' } };
+            return;
+          }
+          const byId = new Map(submittedItems.map(item => [String(item._id || item.deliveryItem || ''), item]));
+          if (byId.size !== current.items.length) {
+            response = { status: 422, body: { success: false, message: 'Every delivery item must appear exactly once.' } };
+            return;
+          }
+          reconciledItems = current.items.map(item => {
+            const row = byId.get(String(item._id));
+            const acceptedQuantity = Number(row?.acceptedQuantity || 0);
+            const shortQuantity = Number(row?.shortQuantity || 0);
+            const damagedRejectedQuantity = Number(row?.damagedRejectedQuantity || 0);
+            const unrecoveredQuantity = Math.max(0, Number(item.dispatchedQuantity || 0) - Number(item.dispatchReturnedQuantity || 0));
+            if (!row || ![acceptedQuantity, shortQuantity, damagedRejectedQuantity].every(value => Number.isFinite(value) && value >= 0)
+                || Math.abs(acceptedQuantity + shortQuantity + damagedRejectedQuantity - unrecoveredQuantity) > QUANTITY_TOLERANCE) {
+              throw Object.assign(new Error('Each item accepted + short + damaged rejected quantity must equal its unrecovered dispatched quantity.'), { status: 422 });
+            }
+            return { ...item.toObject(), acceptedQuantity, shortQuantity, damagedRejectedQuantity,
+              discrepancyResolutionState: shortQuantity > 0 || damagedRejectedQuantity > 0 ? 'recorded' : 'none', remarks: String(row.remarks || '') };
+          });
+        } else if (current.items.length === 1 && (shortBoxes > 0 || damagedBoxes > 0)) {
+          const item = current.items[0];
+          const unrecoveredQuantity = Math.max(0, Number(item.dispatchedQuantity || 0) - Number(item.dispatchReturnedQuantity || 0));
+          if (Math.abs(deliveredBoxes + shortBoxes + damagedBoxes - unrecoveredQuantity) > QUANTITY_TOLERANCE) {
+            response = { status: 422, body: { success: false, message: 'Legacy single-line aggregate quantities must equal the unrecovered dispatched item quantity.' } };
+            return;
+          }
+          reconciledItems = [{ ...item.toObject(), acceptedQuantity: deliveredBoxes, shortQuantity: shortBoxes,
+            damagedRejectedQuantity: damagedBoxes, discrepancyResolutionState: 'recorded' }];
+        } else {
+          reconciledItems = current.items.map(item => ({ ...item.toObject(), acceptedQuantity: Math.max(0, Number(item.dispatchedQuantity || 0) - Number(item.dispatchReturnedQuantity || 0)),
+            shortQuantity: 0, damagedRejectedQuantity: 0, discrepancyResolutionState: 'none' }));
+        }
+        itemDiscrepancies = reconciledItems.flatMap(item => [
+          ...(item.shortQuantity > 0 ? [{ type: 'short', deliveryItem: item._id, salesOrderItem: item.salesOrderItem, boxes: item.shortQuantity, remarks: item.remarks || String(req.body.shortRemarks || ''), recordedBy: req.user._id, recordedAt: new Date() }] : []),
+          ...(item.damagedRejectedQuantity > 0 ? [{ type: 'damaged', deliveryItem: item._id, salesOrderItem: item.salesOrderItem, boxes: item.damagedRejectedQuantity, remarks: item.remarks || String(req.body.damagedRemarks || ''), recordedBy: req.user._id, recordedAt: new Date() }] : []),
+        ]);
+        hasItemDiscrepancy = itemDiscrepancies.length > 0;
+        deliveredBoxes = reconciledItems.reduce((sum, item) => sum + Number(item.acceptedQuantity || 0), 0);
+        shortBoxes = reconciledItems.reduce((sum, item) => sum + Number(item.shortQuantity || 0), 0);
+        damagedBoxes = reconciledItems.reduce((sum, item) => sum + Number(item.damagedRejectedQuantity || 0), 0);
       }
       if (req.body.paymentCollected && !userHasPermission(req.user, 'payment')) {
         response = { status: 403, body: { success: false, message: 'Payment permission is required to post a delivery collection.' } };
@@ -338,7 +410,13 @@ router.patch('/:id/complete', async (req, res) => {
         authorizedBy: req.user._id,
         authorizedAt: new Date(),
       } : { used: false };
-      claimedDelivery.discrepancies = [
+      if (reconciledItems) {
+        claimedDelivery.items = reconciledItems;
+        claimedDelivery.itemReconciliationState = itemDiscrepancies.length ? 'discrepancy' : 'reconciled';
+        claimedDelivery.reconciledAt = new Date();
+        claimedDelivery.reconciledBy = req.user._id;
+      }
+      claimedDelivery.discrepancies = itemDiscrepancies || [
         ...(shortBoxes > 0 ? [{ type: 'short', boxes: shortBoxes, remarks: String(req.body.shortRemarks || ''), recordedBy: req.user._id, recordedAt: new Date() }] : []),
         ...(damagedBoxes > 0 ? [{ type: 'damaged', boxes: damagedBoxes, remarks: String(req.body.damagedRemarks || ''), recordedBy: req.user._id, recordedAt: new Date() }] : []),
       ];
@@ -450,7 +528,8 @@ router.patch('/:id/complete', async (req, res) => {
         }
       }
 
-      claimedDelivery.status = shortBoxes > 0 || damagedBoxes > 0 ? 'partially_delivered' : 'delivered';
+      claimedDelivery.status = hasItemDiscrepancy || shortBoxes > 0 || damagedBoxes > 0 ? 'partially_delivered' : 'delivered';
+      claimedDelivery.hasFulfillmentShortage = claimedDelivery.hasFulfillmentShortage || hasItemDiscrepancy;
       claimedDelivery.completionProcessing = false;
       await claimedDelivery.save({ session });
       if (claimedDelivery.salesOrder) {

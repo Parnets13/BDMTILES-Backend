@@ -80,7 +80,6 @@ const assetSchema = new mongoose.Schema(
 );
 
 // Indexes
-assetSchema.index({ assetCode: 1 });
 assetSchema.index({ status: 1 });
 assetSchema.index({ category: 1 });
 assetSchema.index({ assignedTo: 1 });

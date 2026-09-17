@@ -1,4 +1,5 @@
-import Stock from '../models/Stock.js';
+import { applyStockMovement, stockOperationKey } from '../services/stockMovementService.js';
+import { stableUomSnapshot } from '../services/stockUomService.js';
 
 export const QUANTITY_TOLERANCE = 0.0001;
 
@@ -10,9 +11,18 @@ const rounded = value => Math.round((numeric(value) + Number.EPSILON) * 1e6) / 1
 export function refreshSalesOrderLine(line) {
   const ordered = numeric(line.quantity);
   const dispatched = Math.min(ordered, numeric(line.dispatchedQuantity));
+  const dispatchReversed = Math.min(dispatched, numeric(line.dispatchReversedQuantity));
+  const maxCancellable = Math.max(0, ordered - dispatched + dispatchReversed);
+  const cancelled = Math.min(maxCancellable, numeric(line.cancelledRemainingQuantity));
+  const returned = Math.min(dispatched, numeric(line.returnedQuantity));
   const reserved = Math.max(0, numeric(line.reservedQuantity));
+  // fulfilledQuantity remains the legacy gross-dispatch field for dual-read compatibility.
   line.fulfilledQuantity = rounded(dispatched);
-  line.remainingQuantity = rounded(Math.max(0, ordered - dispatched));
+  line.cancelledRemainingQuantity = rounded(cancelled);
+  line.returnedQuantity = rounded(returned);
+  line.dispatchReversedQuantity = rounded(dispatchReversed);
+  line.netFulfilledQuantity = rounded(Math.max(0, dispatched - dispatchReversed - returned));
+  line.remainingQuantity = rounded(Math.max(0, ordered - dispatched + dispatchReversed - cancelled));
   line.backorderQuantity = rounded(Math.max(0, line.remainingQuantity - reserved));
   return line;
 }
@@ -48,15 +58,23 @@ function aggregate(lines, quantitySelector, branch) {
   return [...requirements.values()];
 }
 
-export async function reserveSalesOrderInventory(order, { session = null } = {}) {
+async function persistedLineVersions(order, session) {
+  const persisted = await order.constructor.findById(order._id)
+    .select('items._id items.reservationVersion items.reservationReleaseVersion')
+    .session(session)
+    .lean();
+  if (!persisted) throw conflict('Sales Order no longer exists.');
+  return new Map((persisted.items || []).map(line => [String(line._id), line]));
+}
+
+export async function reserveSalesOrderInventory(order, { session = null, actor = null, reason = 'Sales Order reservation' } = {}) {
   if (!order) throw conflict('Sales Order is required for stock reservation.');
+  if (!session) throw Object.assign(new Error('Sales Order reservation requires an active transaction.'), { status: 500 });
   const missingByLine = order.items.map((line) => {
     refreshSalesOrderLine(line);
     return rounded(Math.max(0, numeric(line.remainingQuantity) - numeric(line.reservedQuantity)));
   });
-  const missingById = new Map(order.items.map((line, index) => [String(line._id), missingByLine[index]]));
-  const requirements = aggregate(order.items, line => missingById.get(String(line._id)), order.branch);
-  if (!requirements.length) {
+  if (!missingByLine.some(quantity => quantity > QUANTITY_TOLERANCE)) {
     order.reservationStatus = order.items.every(line => numeric(line.remainingQuantity) <= QUANTITY_TOLERANCE)
       ? 'consumed'
       : 'reserved';
@@ -64,26 +82,39 @@ export async function reserveSalesOrderInventory(order, { session = null } = {})
     return order;
   }
 
-  for (const requirement of requirements) {
-    const stock = await Stock.findOneAndUpdate(
-      {
-        branch: requirement.branch,
-        product: requirement.product,
-        warehouse: requirement.warehouse,
-        shade: requirement.shade,
-        batch: requirement.batch,
-        availableQty: { $gte: requirement.quantity },
-      },
-      { $inc: { availableQty: -requirement.quantity, reservedQty: requirement.quantity } },
-      { new: true, ...options(session) }
-    );
-    if (!stock) {
-      throw conflict(`Insufficient available stock for ${requirement.productName} (shade ${requirement.shade || 'default'}, batch ${requirement.batch || 'default'}).`);
-    }
+  // Read committed versions inside this transaction. If withTransaction retries its
+  // callback, the aborted in-memory document cannot advance the event namespace.
+  const versions = await persistedLineVersions(order, session);
+  const nextVersions = new Map();
+  for (let index = 0; index < order.items.length; index += 1) {
+    const line = order.items[index];
+    const quantity = missingByLine[index];
+    if (!(quantity > QUANTITY_TOLERANCE)) continue;
+    if (!line.product || !line.warehouse) throw conflict(`Warehouse is required for ${line.productName || line.productCode || 'every item'}.`);
+    const persistedLine = versions.get(String(line._id));
+    if (!persistedLine) throw conflict('Sales Order line no longer exists.');
+    const nextReservationVersion = numeric(persistedLine.reservationVersion) + 1;
+    const targetReserved = rounded(numeric(line.reservedQuantity) + quantity);
+    const snapshot = stableUomSnapshot(line);
+    const baseQuantity = quantity * snapshot.conversionFactor;
+    await applyStockMovement({
+      operationKey: stockOperationKey('sales-order', order._id, line._id, 'reserve-event', nextReservationVersion),
+      correlationKey: stockOperationKey('sales-order', order._id, 'reservation', nextReservationVersion),
+      movementType: 'sales_reservation', phase: 'reserved',
+      branch: order.branch, product: line.product, warehouse: line.warehouse, shade: line.shade || '', batch: line.batch || '',
+      deltas: { availableQty: -baseQuantity, reservedQty: baseQuantity },
+      enteredQuantity: quantity, ...snapshot, baseQuantity,
+      sourceType: 'SalesOrder', sourceModel: 'SalesOrder', sourceId: order._id, sourceLineId: line._id,
+      sourceNumber: order.orderNumber, actor: actor?._id || actor || order.createdBy, occurredAt: new Date(), reason,
+      metadata: { reservationVersion: nextReservationVersion, reservedQuantity: quantity, targetReservedQuantity: targetReserved },
+      guardMessage: `Insufficient available stock for ${line.productName || line.productCode || 'item'} (shade ${line.shade || 'default'}, batch ${line.batch || 'default'}).`,
+    }, { session });
+    nextVersions.set(String(line._id), nextReservationVersion);
   }
 
   order.items.forEach((line, index) => {
     line.reservedQuantity = rounded(numeric(line.reservedQuantity) + missingByLine[index]);
+    if (nextVersions.has(String(line._id))) line.reservationVersion = nextVersions.get(String(line._id));
     line.allocatedQuantity = rounded(line.allocatedQuantity);
     line.pickedQuantity = rounded(line.pickedQuantity);
     line.shortQuantity = rounded(line.shortQuantity);
@@ -93,39 +124,60 @@ export async function reserveSalesOrderInventory(order, { session = null } = {})
   });
   order.reservationStatus = 'reserved';
   order.reservedAt = order.reservedAt || new Date();
+  if (order.approvalStatus === 'pending' && !order.reservationExpiresAt) {
+    const ttlHours = Number(process.env.APPROVAL_RESERVATION_TTL_HOURS || 0);
+    if (Number.isFinite(ttlHours) && ttlHours > 0) {
+      order.reservationExpiresAt = new Date(Date.now() + ttlHours * 60 * 60 * 1000);
+      order.reservationExpiryState = 'active';
+      order.reservationExpiryVersion = Math.max(1, Number(order.reservationExpiryVersion || 0));
+    }
+  }
   order.reservationReleasedAt = undefined;
   await order.save(options(session));
   return order;
 }
 
-export async function releaseSalesOrderInventory(order, { session = null } = {}) {
+export async function releaseSalesOrderInventory(order, { session = null, actor = null, reason = 'Sales Order reservation release' } = {}) {
   if (!order) return null;
+  if (!session) throw Object.assign(new Error('Sales Order reservation release requires an active transaction.'), { status: 500 });
   if (['released', 'consumed'].includes(order.reservationStatus)
       && order.items.every(line => numeric(line.reservedQuantity) <= QUANTITY_TOLERANCE)) return order;
 
-  const requirements = aggregate(order.items, line => line.reservedQuantity, order.branch);
-  for (const requirement of requirements) {
-    const stock = await Stock.findOneAndUpdate(
-      {
-        branch: requirement.branch,
-        product: requirement.product,
-        warehouse: requirement.warehouse,
-        shade: requirement.shade,
-        batch: requirement.batch,
-        reservedQty: { $gte: requirement.quantity },
-      },
-      { $inc: { reservedQty: -requirement.quantity, availableQty: requirement.quantity } },
-      { new: true, ...options(session) }
-    );
-    if (!stock) throw conflict(`Reserved stock is inconsistent for ${requirement.productName}; cancellation was not applied.`);
+  const releasableLines = order.items.filter(line => rounded(line.reservedQuantity) > QUANTITY_TOLERANCE);
+  const versions = releasableLines.length ? await persistedLineVersions(order, session) : new Map();
+  const nextVersions = new Map();
+  let released = false;
+  for (const line of releasableLines) {
+    const quantity = rounded(line.reservedQuantity);
+    if (!line.product || !line.warehouse) throw conflict(`Warehouse is required for ${line.productName || line.productCode || 'every item'}.`);
+    const persistedLine = versions.get(String(line._id));
+    if (!persistedLine) throw conflict('Sales Order line no longer exists.');
+    const nextReleaseVersion = numeric(persistedLine.reservationReleaseVersion) + 1;
+    const snapshot = stableUomSnapshot(line);
+    const baseQuantity = quantity * snapshot.conversionFactor;
+    await applyStockMovement({
+      operationKey: stockOperationKey('sales-order', order._id, line._id, 'release-event', nextReleaseVersion),
+      correlationKey: stockOperationKey('sales-order', order._id, 'reservation-release', nextReleaseVersion),
+      movementType: 'sales_reservation_release', phase: 'released',
+      branch: order.branch, product: line.product, warehouse: line.warehouse, shade: line.shade || '', batch: line.batch || '',
+      deltas: { reservedQty: -baseQuantity, availableQty: baseQuantity },
+      enteredQuantity: quantity, ...snapshot, baseQuantity,
+      sourceType: 'SalesOrder', sourceModel: 'SalesOrder', sourceId: order._id, sourceLineId: line._id,
+      sourceNumber: order.orderNumber, actor: actor?._id || actor || order.createdBy, occurredAt: new Date(), reason,
+      metadata: { reservationReleaseVersion: nextReleaseVersion, releasedQuantity: quantity },
+      guardMessage: `Reserved stock is inconsistent for ${line.productName || line.productCode || 'item'}; cancellation was not applied.`,
+    }, { session });
+    nextVersions.set(String(line._id), nextReleaseVersion);
+    released = true;
   }
 
   for (const line of order.items) {
+    if (nextVersions.has(String(line._id))) line.reservationReleaseVersion = nextVersions.get(String(line._id));
     line.reservedQuantity = 0;
     line.allocatedQuantity = 0;
     refreshSalesOrderLine(line);
   }
-  order.reservationStatus = requirements.length ? 'released' : order.reservationStatus === 'consumed' ? 'consumed' : 'released';
+  order.reservationStatus = released ? 'released' : order.reservationStatus === 'consumed' ? 'consumed' : 'released';
   order.reservationReleasedAt = order.reservationReleasedAt || new Date();
   await order.save(options(session));
   return order;

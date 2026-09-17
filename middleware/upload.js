@@ -37,10 +37,22 @@ export const uploadProductImages = multer({
   limits: { fileSize: 5 * 1024 * 1024 }, // 5MB per file
 }).array('images', 10); // max 10 images
 
+// Complaint evidence accepts short videos as well as photos (SOW 17.8
+// "Image and video upload"). Videos get a larger ceiling than stills.
+const complaintEvidenceFilter = (req, file, cb) => {
+  const images = ['image/jpeg', 'image/png', 'image/webp', 'image/gif'];
+  const videos = ['video/mp4', 'video/quicktime', 'video/3gpp', 'video/x-matroska', 'video/webm'];
+  if (images.includes(file.mimetype) || videos.includes(file.mimetype)) {
+    cb(null, true);
+  } else {
+    cb(new Error('Only JPG, PNG, WEBP images or MP4/MOV/3GP videos are allowed'), false);
+  }
+};
+
 export const uploadComplaintEvidence = multer({
   storage: storageFor(complaintUploadDirectory),
-  fileFilter,
-  limits: { fileSize: 5 * 1024 * 1024 },
+  fileFilter: complaintEvidenceFilter,
+  limits: { fileSize: 25 * 1024 * 1024 }, // 25MB covers a short clip
 }).array('images', 10);
 
 const creditNoteFileFilter = (_req, file, cb) => {

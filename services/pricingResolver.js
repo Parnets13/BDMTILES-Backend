@@ -181,6 +181,7 @@ async function findOverride({ branchId, dealer, dealerType, productId, quantity,
 async function findDiscount(branchId, product, dealerType, at, session) {
   const base = {
     branch: branchId,
+    mappingType: 'sales',
     status: 'active', validFrom: { $lte: at }, validTo: { $gte: at },
     $or: [{ applicableTo: 'all' }, { applicableDealerTypes: dealerType }],
   };

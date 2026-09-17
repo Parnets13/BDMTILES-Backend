@@ -4,12 +4,24 @@ import PurchaseOrder from '../models/PurchaseOrder.js';
 import Product from '../models/Product.js';
 import GRN from '../models/GRN.js';
 import Stock from '../models/Stock.js';
+import StockMovement from '../models/StockMovement.js';
 import Supplier from '../models/Supplier.js';
-import BranchSettings from '../models/BranchSettings.js';
-import { protect, requirePermission, requireAnyPermission } from '../middleware/auth.js';
+import { protect, requirePermission, requireAnyPermission, userHasPermission } from '../middleware/auth.js';
 import { assertWarehousesInBranch, requireBranch } from '../utils/branchScope.js';
 import { generateBranchNumber } from '../utils/branchSequence.js';
 import { requestFingerprint as fingerprintRequest } from '../utils/idempotency.js';
+import {
+  applyStockMovement,
+  deterministicSourceId,
+  getStockSummary,
+  listStocks,
+  stockOperationKey,
+} from '../services/stockMovementService.js';
+import { resolveStockUom } from '../services/stockUomService.js';
+import {
+  createSubmittedLegacyAdjustment,
+  createSubmittedLegacyAudit,
+} from '../services/stockWorkflowService.js';
 import {
   actionPurchaseOrderApproval,
   amendmentDiff,
@@ -18,10 +30,24 @@ import {
   purchaseOrderSnapshot,
   submitPurchaseOrder,
 } from '../services/purchaseOrderService.js';
+import { getCanonicalStockAlerts } from '../services/stockAlertService.js';
 
 const router = Router();
 router.use(protect);
 router.use(requireBranch);
+
+const requireAllPermissions = (...permissions) => (req, res, next) => {
+  if (!permissions.every((permission) => userHasPermission(req.user, permission))) {
+    return res.status(403).json({ success: false, message: `Access denied: requires ${permissions.join(' and ')}` });
+  }
+  return next();
+};
+const requireLegacyAdjustmentOrAll = (...permissions) => (req, res, next) => {
+  if (!userHasPermission(req.user, 'stock.adjustment') && !permissions.every((permission) => userHasPermission(req.user, permission))) {
+    return res.status(403).json({ success: false, message: `Access denied: requires legacy stock.adjustment or ${permissions.join(' and ')}` });
+  }
+  return next();
+};
 
 // ═══════════════════════════════════════
 // PURCHASE ORDERS
@@ -445,6 +471,73 @@ router.post('/grn', requirePermission('grn.entry'), async (req, res) => {
   }
 });
 
+// Edit a draft GRN: adjust received/accepted/rejected/damaged/held quantities,
+// warehouse, header fields, and item line-up (against its PO). Draft-only; once
+// verified/posted the receipt is part of the stock/payable record and is locked.
+router.patch('/grn/:id', requirePermission('grn.entry'), async (req, res) => {
+  const session = await mongoose.startSession();
+  try {
+    let updated;
+    await session.withTransaction(async () => {
+      const grn = await GRN.findOne({ _id: req.params.id, branch: req.branchId }).session(session);
+      if (!grn) throw grnError(404, 'GRN not found.');
+      if (grn.status !== 'draft') throw grnError(409, `Only a draft GRN can be edited. Current status: ${grn.status}.`);
+
+      const po = await PurchaseOrder.findOne({ _id: grn.purchaseOrder, branch: req.branchId }).session(session);
+      if (!po) throw grnError(404, 'Purchase order not found in the active branch.');
+      if (!['approved', 'sent', 'partial_received'].includes(po.status)) {
+        throw grnError(409, 'Only an approved purchase order with pending quantities can be received.');
+      }
+
+      if (req.body.items !== undefined) {
+        const items = normalizeGRNItems({ items: req.body.items, po, branchId: req.branchId, grnNumber: grn.grnNumber });
+        await assertWarehousesInBranch(
+          items.filter(item => item.receivedQty > 0).map(item => item.warehouse),
+          req.branchId,
+          { session }
+        );
+        grn.items = items;
+      }
+      if (req.body.grnDate !== undefined) grn.grnDate = req.body.grnDate || grn.grnDate;
+      if (req.body.supplierInvoiceNo !== undefined) grn.supplierInvoiceNo = String(req.body.supplierInvoiceNo || '');
+      if (req.body.vehicleNo !== undefined) grn.vehicleNo = String(req.body.vehicleNo || '');
+      if (req.body.driverName !== undefined) grn.driverName = String(req.body.driverName || '');
+      if (req.body.driverMobile !== undefined) grn.driverMobile = String(req.body.driverMobile || '');
+      if (req.body.lrNumber !== undefined) grn.lrNumber = String(req.body.lrNumber || '');
+      if (Array.isArray(req.body.qcPhotos)) grn.qcPhotos = req.body.qcPhotos.map(String);
+      if (req.body.qcRemarks !== undefined || req.body.remarks !== undefined) {
+        grn.qcRemarks = String(req.body.qcRemarks ?? req.body.remarks ?? grn.qcRemarks ?? '');
+      }
+      await grn.save({ session });
+      updated = grn;
+    });
+    return res.json({ success: true, message: `GRN ${updated.grnNumber} updated.`, data: updated });
+  } catch (error) {
+    const status = error.status || (error.name === 'CastError' || error.name === 'ValidationError' ? 422 : 500);
+    return res.status(status).json({ success: false, message: error.name === 'CastError' ? 'Invalid identifier.' : error.message });
+  } finally {
+    await session.endSession();
+  }
+});
+
+// Cancel/delete a draft GRN (recycle-bin soft delete). Draft-only; no stock effects
+// have been posted yet, so removal is safe.
+router.delete('/grn/:id', requirePermission('grn.entry'), async (req, res) => {
+  try {
+    const grn = await GRN.findOne({ _id: req.params.id, branch: req.branchId }).select('status grnNumber').lean();
+    if (!grn) throw grnError(404, 'GRN not found.');
+    if (grn.status !== 'draft') throw grnError(409, `Only a draft GRN can be deleted. Current status: ${grn.status}.`);
+    const { safeDelete } = await import('../middleware/safeDelete.js');
+    const result = await safeDelete(GRN, req.params.id, {
+      user: req.user, module: 'grn', titleField: 'grnNumber', codeField: 'grnNumber',
+    });
+    return res.status(result.status || 200).json(result);
+  } catch (error) {
+    const status = error.status || (error.name === 'CastError' || error.name === 'ValidationError' ? 422 : 500);
+    return res.status(status).json({ success: false, message: error.name === 'CastError' ? 'Invalid identifier.' : error.message });
+  }
+});
+
 router.patch('/grn/:id/verify', requirePermission('grn.entry'), async (req, res) => {
   try {
     const grn = await GRN.findOneAndUpdate(
@@ -502,7 +595,7 @@ router.patch('/grn/:id/approve', requirePermission('grn.approve'), async (req, r
       );
       grn.items = normalizedItems;
 
-      await updateStockFromGRN(grn, session);
+      await updateStockFromGRN(grn, session, req.user._id);
       await updatePOReceivedQty(po, grn.items, session);
       grn.status = 'posted';
       grn.postedBy = req.user._id;
@@ -526,19 +619,43 @@ router.patch('/grn/:id/approve', requirePermission('grn.approve'), async (req, r
   }
 });
 
-// Helper: Update stock from accepted GRN items
-async function updateStockFromGRN(grn, session) {
+// Helper: Update stock from accepted GRN items and append exact source-line movements.
+async function updateStockFromGRN(grn, session, actor) {
+  const occurredAt = new Date();
   for (const item of grn.items) {
     const acceptedQty = Number(item.acceptedQty);
     if (acceptedQty <= 0) continue;
-    await Stock.findOneAndUpdate(
-      { branch: grn.branch, product: item.product, warehouse: item.warehouse, shade: item.shade || '', batch: item.batch || '' },
-      {
-        $inc: { totalQty: acceptedQty, availableQty: acceptedQty },
-        $set: { branch: grn.branch, zone: item.zone || '', rack: item.rack || '', bin: item.bin || '', purchaseRate: Number(item.rate), lastGRNDate: new Date() },
+    await applyStockMovement({
+      operationKey: stockOperationKey('grn', grn._id, item._id, 'accepted'),
+      correlationKey: stockOperationKey('grn', grn._id),
+      movementType: 'grn_receipt',
+      phase: 'posted',
+      branch: grn.branch,
+      product: item.product,
+      warehouse: item.warehouse,
+      shade: item.shade || '',
+      batch: item.batch || '',
+      deltas: { totalQty: acceptedQty, availableQty: acceptedQty },
+      upsert: true,
+      stockSet: {
+        zone: item.zone || '', rack: item.rack || '', bin: item.bin || '',
+        purchaseRate: Number(item.rate), lastGRNDate: occurredAt,
       },
-      { upsert: true, new: true, session }
-    );
+      enteredQuantity: acceptedQty,
+      enteredUnit: item.unit || 'Box',
+      baseUnit: item.unit || 'Box',
+      conversionFactor: 1,
+      sourceType: 'GRN',
+      sourceModel: 'GRN',
+      sourceId: grn._id,
+      sourceLineId: item._id,
+      sourceNumber: grn.grnNumber,
+      actor,
+      occurredAt,
+      reason: 'Accepted goods receipt',
+      remarks: item.remarks || grn.qcRemarks || '',
+      metadata: { purchaseOrder: grn.purchaseOrder, purchaseOrderItem: item.purchaseOrderItem, receiptCode: item.receiptCode },
+    }, { session });
   }
 }
 
@@ -571,80 +688,141 @@ async function updatePOReceivedQty(po, grnItems, session) {
 // ═══════════════════════════════════════
 router.get('/stock', requirePermission('stock.view'), async (req, res) => {
   try {
-    const { page = 1, limit = 50, product, warehouse, shade, batch, search } = req.query;
-    const p = Math.max(1, parseInt(page)); const l = Math.min(200, parseInt(limit) || 50);
-    let filter = { branch: req.branchId };
-    if (product) filter.product = product;
-    if (warehouse) filter.warehouse = warehouse;
-    if (shade) filter.shade = shade;
-    if (batch) filter.batch = batch;
-    if (search) {
-      // Search requires joining with product — use aggregate or filter after
-      // For now, filter by product lookup
-    }
-    const [stocks, total] = await Promise.all([
-      Stock.find(filter).sort({ updatedAt: -1 }).skip((p-1)*l).limit(l)
-        .populate('product', 'productCode itemName tileSize finish brand images reorderLevel minStockLevel')
-        .populate('warehouse', 'name')
-        .lean(),
-      Stock.countDocuments(filter),
-    ]);
-    res.json({ success: true, data: stocks, pagination: { currentPage: p, totalPages: Math.ceil(total/l), totalItems: total, itemsPerPage: l } });
-  } catch (e) { res.status(500).json({ success: false, message: e.message }); }
+    const result = await listStocks(req.branchId, req.query);
+    const branchTotals = await getStockSummary(req.branchId);
+    return res.json({ success: true, data: result.data, pagination: result.pagination, totals: result.totals, branchTotals });
+  } catch (error) {
+    return res.status(error.status || 500).json({ success: false, message: error.message });
+  }
 });
 
 router.get('/stock/summary', requirePermission('stock.view'), async (req, res) => {
   try {
-    const summary = await Stock.aggregate([
-      { $match: { branch: req.branchId } },
-      { $group: { _id: null, totalQty: { $sum: '$totalQty' }, availableQty: { $sum: '$availableQty' }, reservedQty: { $sum: '$reservedQty' }, transitQty: { $sum: '$transitQty' }, damagedQty: { $sum: '$damagedQty' }, shortQty: { $sum: '$shortQty' }, totalValue: { $sum: { $multiply: ['$availableQty', '$purchaseRate'] } } } },
-    ]);
-    const productCount = await Stock.distinct('product', { branch: req.branchId });
-    res.json({ success: true, data: { ...(summary[0] || {}), uniqueProducts: productCount.length } });
-  } catch (e) { res.status(500).json({ success: false, message: e.message }); }
+    const summary = await getStockSummary(req.branchId);
+    return res.json({ success: true, data: { ...summary, inventoryValue: summary.totalValue, totalValue: summary.availableValue } });
+  } catch (error) {
+    return res.status(error.status || 500).json({ success: false, message: error.message });
+  }
 });
 
-// Stock adjustment (manual — with audit reason)
-router.post('/stock/adjust', requirePermission('stock.adjustment'), async (req, res) => {
+// Stock adjustment (manual — transactionally journaled and idempotent)
+router.post('/stock/adjust', requireLegacyAdjustmentOrAll('stock.adjustment.create', 'stock.adjustment.submit'), async (req, res) => {
+  const idempotencyKey = String(req.get('Idempotency-Key') || '').trim();
+  const reason = String(req.body.reason || '').trim();
+  if (!idempotencyKey || idempotencyKey.length > 200) return res.status(422).json({ success: false, message: 'A valid Idempotency-Key header is required.' });
+  if (!reason) return res.status(422).json({ success: false, message: 'reason is required.' });
   try {
-    const { product, warehouse, shade, batch, adjustmentQty, reason, type } = req.body;
-    if (!product || !warehouse || !adjustmentQty) {
-      return res.status(400).json({ success: false, message: 'Product, warehouse, and quantity required.' });
-    }
-    await assertWarehousesInBranch([warehouse], req.branchId);
-    const stock = await Stock.findOneAndUpdate(
-      { branch: req.branchId, product, warehouse, shade: shade || '', batch: batch || '' },
-      { $inc: { totalQty: adjustmentQty, availableQty: adjustmentQty }, $set: { branch: req.branchId } },
-      { upsert: true, new: true }
-    );
-    // TODO: Log this adjustment in audit trail
-    res.json({ success: true, message: `Stock adjusted by ${adjustmentQty}.`, data: stock });
-  } catch (e) { res.status(500).json({ success: false, message: e.message }); }
+    const durable = await createSubmittedLegacyAdjustment({ branchId: req.branchId, actorId: req.user._id, body: req.body, idempotencyKey });
+    return res.json({
+      success: true,
+      message: durable.replayed
+        ? 'Stock adjustment request already exists and remains subject to approval.'
+        : 'Stock adjustment submitted for independent approval. No stock has been posted.',
+      status: durable.document.status,
+      data: durable.document,
+    });
+  } catch (error) {
+    return res.status(error.status || (['CastError', 'ValidationError'].includes(error.name) ? 422 : 500)).json({ success: false, message: error.message, ...(error.details ? { details: error.details } : {}) });
+  }
+
+  /* Retained below only as unreachable historical context; durable workflow above always returns. */
+  const { product, warehouse, shade = '', batch = '' } = req.body;
+  let signedQuantity;
+  if (req.body.adjustmentQty !== undefined) {
+    signedQuantity = Number(req.body.adjustmentQty);
+  } else {
+    const quantity = Number(req.body.quantity);
+    const adjustmentType = String(req.body.adjustmentType || req.body.type || '').toLowerCase();
+    if (!Number.isFinite(quantity) || quantity <= 0) return res.status(422).json({ success: false, message: 'quantity must be a positive finite number.' });
+    if (['increase', 'add', 'in', 'positive'].includes(adjustmentType)) signedQuantity = quantity;
+    else if (['decrease', 'subtract', 'remove', 'out', 'negative'].includes(adjustmentType)) signedQuantity = -quantity;
+    else return res.status(422).json({ success: false, message: 'adjustmentType must identify an increase or decrease.' });
+  }
+  if (!product || !warehouse || !Number.isFinite(signedQuantity) || signedQuantity === 0) {
+    return res.status(422).json({ success: false, message: 'product, warehouse, and a non-zero finite adjustment quantity are required.' });
+  }
+  const session = await mongoose.startSession();
+  try {
+    let result;
+    await session.withTransaction(async () => {
+      await assertWarehousesInBranch([warehouse], req.branchId, { session });
+      const productRecord = await Product.findById(product).session(session).lean();
+      const uom = await resolveStockUom({ product: productRecord || product, enteredQuantity: Math.abs(signedQuantity), enteredUnit: req.body.unit || productRecord?.unit, session });
+      const signedBaseQuantity = signedQuantity < 0 ? -uom.baseQuantity : uom.baseQuantity;
+      const operationKey = stockOperationKey(req.branchId, 'manual-adjustment', idempotencyKey);
+      result = await applyStockMovement({
+        operationKey,
+        correlationKey: operationKey,
+        movementType: 'manual_adjustment',
+        phase: 'posted',
+        branch: req.branchId, product, warehouse, shade, batch,
+        deltas: { totalQty: signedBaseQuantity, availableQty: signedBaseQuantity },
+        upsert: signedBaseQuantity > 0,
+        ...uom,
+        sourceType: 'ManualStockAdjustment', sourceModel: 'Stock',
+        sourceId: deterministicSourceId(operationKey), sourceLineId: 'manual', sourceNumber: idempotencyKey,
+        actor: req.user._id, occurredAt: new Date(), reason, remarks: req.body.remarks || '',
+        metadata: { adjustmentType: signedBaseQuantity > 0 ? 'increase' : 'decrease', enteredSignedQuantity: signedQuantity, baseSignedQuantity: signedBaseQuantity },
+        guardMessage: 'Stock is missing or insufficient for this adjustment.',
+      }, { session });
+    });
+    return res.json({ success: true, message: result.replayed ? 'Stock adjustment already applied.' : `Stock adjusted by ${signedQuantity}.`, data: result.stock });
+  } catch (error) {
+    return res.status(error.status || (['CastError', 'ValidationError'].includes(error.name) ? 422 : 500)).json({ success: false, message: error.message });
+  } finally { await session.endSession(); }
 });
 
-// Stock transfer between warehouses
+// Legacy instant transfer — retained for compatibility, now paired and journaled atomically.
 router.post('/stock/transfer', requirePermission('stock.transfer'), async (req, res) => {
+  const idempotencyKey = String(req.get('Idempotency-Key') || '').trim();
+  const reason = String(req.body.reason || '').trim();
+  const { product, fromWarehouse, toWarehouse, shade = '', batch = '' } = req.body;
+  const quantity = Number(req.body.quantity);
+  if (!idempotencyKey || idempotencyKey.length > 200) return res.status(422).json({ success: false, message: 'A valid Idempotency-Key header is required.' });
+  if (!reason) return res.status(422).json({ success: false, message: 'reason is required.' });
+  if (!product || !fromWarehouse || !toWarehouse || !Number.isFinite(quantity) || quantity <= 0) {
+    return res.status(422).json({ success: false, message: 'product, source, destination, and a positive finite quantity are required.' });
+  }
+  if (String(fromWarehouse) === String(toWarehouse)) return res.status(422).json({ success: false, message: 'Source and destination warehouses must differ.' });
+  const session = await mongoose.startSession();
   try {
-    const { product, fromWarehouse, toWarehouse, shade, batch, quantity, reason } = req.body;
-    if (!product || !fromWarehouse || !toWarehouse || !quantity) {
-      return res.status(400).json({ success: false, message: 'All fields required.' });
-    }
-    await assertWarehousesInBranch([fromWarehouse, toWarehouse], req.branchId);
-    // Deduct from source
-    const source = await Stock.findOneAndUpdate(
-      { branch: req.branchId, product, warehouse: fromWarehouse, shade: shade || '', batch: batch || '', availableQty: { $gte: quantity } },
-      { $inc: { totalQty: -quantity, availableQty: -quantity } },
-      { new: true }
-    );
-    if (!source) return res.status(400).json({ success: false, message: 'Insufficient stock in source warehouse.' });
-    // Add to destination
-    await Stock.findOneAndUpdate(
-      { branch: req.branchId, product, warehouse: toWarehouse, shade: shade || '', batch: batch || '' },
-      { $inc: { totalQty: quantity, availableQty: quantity }, $set: { branch: req.branchId } },
-      { upsert: true, new: true }
-    );
-    res.json({ success: true, message: `${quantity} units transferred.` });
-  } catch (e) { res.status(500).json({ success: false, message: e.message }); }
+    let sourceResult;
+    let destinationResult;
+    await session.withTransaction(async () => {
+      await assertWarehousesInBranch([fromWarehouse, toWarehouse], req.branchId, { session });
+      const productRecord = await Product.findById(product).session(session).lean();
+      const uom = await resolveStockUom({ product: productRecord || product, enteredQuantity: quantity, enteredUnit: req.body.unit || productRecord?.unit, session });
+      const baseQuantity = uom.baseQuantity;
+      const correlationKey = stockOperationKey(req.branchId, 'legacy-transfer', idempotencyKey);
+      const sourceId = deterministicSourceId(correlationKey);
+      const common = {
+        correlationKey, movementType: 'legacy_transfer', phase: 'posted', branch: req.branchId,
+        product, shade, batch, ...uom,
+        sourceType: 'LegacyStockTransfer', sourceModel: 'Stock', sourceId, sourceNumber: idempotencyKey,
+        actor: req.user._id, occurredAt: new Date(), reason, remarks: req.body.remarks || '',
+      };
+      sourceResult = await applyStockMovement({
+        ...common, operationKey: `${correlationKey}:source`, sourceLineId: 'source', warehouse: fromWarehouse,
+        relatedBranch: req.branchId, relatedWarehouse: toWarehouse,
+        deltas: { totalQty: -baseQuantity, availableQty: -baseQuantity },
+        guardMessage: 'Insufficient stock in source warehouse.',
+        metadata: { leg: 'source' },
+      }, { session });
+      destinationResult = await applyStockMovement({
+        ...common, operationKey: `${correlationKey}:destination`, sourceLineId: 'destination', warehouse: toWarehouse,
+        relatedBranch: req.branchId, relatedWarehouse: fromWarehouse,
+        deltas: { totalQty: baseQuantity, availableQty: baseQuantity }, upsert: true,
+        metadata: { leg: 'destination' },
+      }, { session });
+    });
+    return res.json({
+      success: true,
+      message: sourceResult.replayed && destinationResult.replayed ? 'Transfer already applied.' : `${quantity} units transferred.`,
+      data: { source: sourceResult.stock, destination: destinationResult.stock, correlationKey: sourceResult.movement.correlationKey },
+    });
+  } catch (error) {
+    return res.status(error.status || (['CastError', 'ValidationError'].includes(error.name) ? 422 : 500)).json({ success: false, message: error.message });
+  } finally { await session.endSession(); }
 });
 
 // ═══════════════════════════════════════
@@ -652,30 +830,49 @@ router.post('/stock/transfer', requirePermission('stock.transfer'), async (req, 
 // ═══════════════════════════════════════
 router.get('/stock/alerts', requirePermission('stock.view'), async (req, res) => {
   try {
-    const { threshold = 10, warehouse } = req.query;
-    const minQty = parseInt(threshold) || 10;
-    let filter = { branch: req.branchId, availableQty: { $lte: minQty, $gte: 0 } };
-    if (warehouse) filter.warehouse = warehouse;
-
-    const lowStockItems = await Stock.find(filter)
-      .sort({ availableQty: 1 })
-      .limit(100)
-      .populate('product', 'productCode itemName tileSize images mrp reorderLevel')
-      .populate('warehouse', 'name')
-      .lean();
-
-    // Also find zero-stock items
-    const zeroStock = await Stock.countDocuments({ ...filter, availableQty: 0 });
-    const criticalStock = await Stock.countDocuments({ ...filter, availableQty: { $lte: 5, $gte: 1 } });
-
-    res.json({
+    const result = await getCanonicalStockAlerts(req.branchId, {
+      warehouse: req.query.warehouse,
+      includeAdequate: false,
+      sortBy: 'available',
+      sortOrder: 'asc',
+    }, { internalAll: true });
+    const items = result.data.map(row => ({
+      _id: row.stockIds[0] || row.product,
+      product: {
+        _id: row.product,
+        productCode: row.productCode,
+        itemName: row.productName,
+        images: row.productImage ? [row.productImage] : [],
+        tileSize: row.tileSize,
+        reorderLevel: row.thresholds.configuredReorderLevel,
+      },
+      warehouse: row.warehouse,
+      shade: row.buckets.length === 1 ? row.buckets[0].shade : '',
+      batch: row.buckets.length === 1 ? row.buckets[0].batch : '',
+      ...row.quantities,
+      purchaseRate: row.valuation.effectiveRate,
+      landingCost: 0,
+      alertLevel: row.severity,
+      stockIds: row.stockIds,
+      bucketBreakdown: row.buckets,
+      thresholds: row.thresholds,
+      configurationWarnings: row.configurationWarnings,
+    }));
+    return res.json({
       success: true,
       data: {
-        items: lowStockItems,
-        summary: { total: lowStockItems.length, zeroStock, criticalStock, threshold: minQty },
+        items,
+        summary: {
+          total: items.length,
+          zeroStock: result.summary.outOfStock,
+          criticalStock: result.summary.critical,
+          threshold: result.scope.fallbackReorderLevel,
+        },
       },
     });
-  } catch (e) { res.status(500).json({ success: false, message: e.message }); }
+  } catch (error) {
+    return res.status(error.status || (error.name === 'CastError' ? 422 : 500)).json({ success: false, message: error.message });
+  }
 });
 
 // ═══════════════════════════════════════
@@ -683,13 +880,13 @@ router.get('/stock/alerts', requirePermission('stock.view'), async (req, res) =>
 // ═══════════════════════════════════════
 
 // GET /api/v1/purchase/audit/pending — get products to audit for a warehouse
-router.get('/audit/pending', requirePermission('stock.adjustment'), async (req, res) => {
+router.get('/audit/pending', requireAnyPermission('stock.audit.create', 'stock.audit.count', 'stock.adjustment'), async (req, res) => {
   try {
     const { warehouse } = req.query;
     if (!warehouse) return res.status(400).json({ success: false, message: 'Warehouse is required.' });
     await assertWarehousesInBranch([warehouse], req.branchId);
 
-    const stocks = await Stock.find({ branch: req.branchId, warehouse, availableQty: { $gt: 0 } })
+    const stocks = await Stock.find({ branch: req.branchId, warehouse })
       .populate('product', 'productCode itemName tileSize images brand')
       .populate('warehouse', 'name')
       .sort({ 'product.itemName': 1 })
@@ -699,166 +896,223 @@ router.get('/audit/pending', requirePermission('stock.adjustment'), async (req, 
   } catch (e) { res.status(500).json({ success: false, message: e.message }); }
 });
 
-// POST /api/v1/purchase/audit/submit — submit physical count and calculate discrepancy
-router.post('/audit/submit', requirePermission('stock.adjustment'), async (req, res) => {
+// POST /api/v1/purchase/audit/submit — all-or-nothing decimal-safe physical count.
+router.post('/audit/submit', requireAllPermissions('stock.audit.create', 'stock.audit.count', 'stock.audit.submit'), async (req, res) => {
+  const idempotencyKey = String(req.get('Idempotency-Key') || '').trim();
+  const { warehouse, counts } = req.body;
+  const remarks = String(req.body.remarks || '').trim();
+  if (!idempotencyKey || idempotencyKey.length > 200) return res.status(422).json({ success: false, message: 'A valid Idempotency-Key header is required.' });
+  if (!warehouse || !Array.isArray(counts) || !counts.length) return res.status(422).json({ success: false, message: 'warehouse and counts are required.' });
   try {
-    const { warehouse, counts, auditedBy, remarks } = req.body;
-    // counts: [{ stockId, physicalCount }]
-    if (!warehouse || !counts?.length) {
-      return res.status(400).json({ success: false, message: 'Warehouse and counts required.' });
-    }
-    await assertWarehousesInBranch([warehouse], req.branchId);
-
-    const results = [];
-    let totalDiscrepancy = 0;
-    let adjustedCount = 0;
-
-    for (const count of counts) {
-      const stock = await Stock.findOne({ _id: count.stockId, branch: req.branchId, warehouse });
-      if (!stock) continue;
-
-      const systemQty = stock.availableQty;
-      const physicalQty = parseInt(count.physicalCount) || 0;
-      const discrepancy = physicalQty - systemQty;
-
-      if (discrepancy !== 0) {
-        // Auto-adjust stock to match physical count
-        stock.availableQty = physicalQty;
-        stock.totalQty = stock.totalQty + discrepancy;
-        await stock.save();
-        adjustedCount++;
-        totalDiscrepancy += Math.abs(discrepancy);
-      }
-
-      results.push({
-        stockId: stock._id,
-        product: stock.product,
-        systemQty,
-        physicalQty,
-        discrepancy,
-        adjusted: discrepancy !== 0,
-      });
-    }
-
-    res.json({
+    const durable = await createSubmittedLegacyAudit({ branchId: req.branchId, actorId: req.user._id, body: req.body, idempotencyKey });
+    const document = durable.document;
+    const countedLines = document.lines.filter((line) => line.physicalCount !== undefined && line.physicalCount !== null);
+    return res.json({
       success: true,
-      message: `Audit complete. ${adjustedCount} items adjusted. Total discrepancy: ${totalDiscrepancy} units.`,
+      message: durable.replayed
+        ? 'Physical audit request already exists and remains subject to approval.'
+        : 'Physical audit submitted for independent approval. No stock has been posted.',
+      status: document.status,
       data: {
-        totalItems: counts.length,
-        adjustedItems: adjustedCount,
-        totalDiscrepancy,
-        results,
+        ...document.toObject(),
+        totalItems: countedLines.length,
+        adjustedItems: 0,
+        totalDiscrepancy: receiptRound(document.totalVariance),
+        results: countedLines.map((line) => ({ stockId: line.stock, product: line.product, systemQty: line.expectedPhysicalOnPremise, physicalQty: line.physicalCount, discrepancy: line.variance, adjusted: false, status: 'submitted' })),
       },
     });
-  } catch (e) { res.status(500).json({ success: false, message: e.message }); }
+  } catch (error) {
+    return res.status(error.status || (['CastError', 'ValidationError'].includes(error.name) ? 422 : 500)).json({ success: false, message: error.message, ...(error.details ? { details: error.details } : {}) });
+  }
+
+  /* Retained below only as unreachable historical context; durable workflow above always returns. */
+  const normalized = [];
+  const ids = new Set();
+  for (let index = 0; index < counts.length; index += 1) {
+    const stockId = String(counts[index].stockId || '');
+    const physicalQty = Number(counts[index].physicalCount);
+    if (!mongoose.isValidObjectId(stockId) || ids.has(stockId) || !Number.isFinite(physicalQty) || physicalQty < 0) {
+      return res.status(422).json({ success: false, message: `counts[${index}] requires a unique valid stockId and a finite nonnegative physicalCount.` });
+    }
+    ids.add(stockId);
+    normalized.push({ stockId, physicalQty: receiptRound(physicalQty), unit: counts[index].unit || req.body.unit || '', remarks: String(counts[index].remarks || '') });
+  }
+  const auditFingerprint = fingerprintRequest({
+    warehouse: String(warehouse),
+    counts: normalized,
+    remarks,
+    actor: String(req.user._id),
+    enteredUnit: String(req.body.unit || 'Unit'),
+    baseUnit: String(req.body.baseUnit || req.body.unit || 'Unit'),
+    conversionFactor: 1,
+  });
+  const session = await mongoose.startSession();
+  try {
+    let results = [];
+    await session.withTransaction(async () => {
+      await assertWarehousesInBranch([warehouse], req.branchId, { session });
+      const correlationKey = stockOperationKey(req.branchId, 'physical-audit', idempotencyKey);
+      const operationKeys = normalized.map(count => `${correlationKey}:${count.stockId}`);
+      const existingMovements = await StockMovement.find({ branch: req.branchId, operationKey: { $in: operationKeys } }).session(session).lean();
+      if (existingMovements.length) {
+        if (existingMovements.length !== normalized.length) throw grnError(409, 'This audit idempotency key has an incomplete movement set.');
+        const existingByKey = new Map(existingMovements.map(movement => [movement.operationKey, movement]));
+        results = normalized.map((count) => {
+          const movement = existingByKey.get(`${correlationKey}:${count.stockId}`);
+          if (!movement || String(movement.stock) !== count.stockId || movement.metadata?.requestFingerprint !== auditFingerprint) {
+            throw grnError(409, 'This Idempotency-Key was already used for a different physical audit payload.');
+          }
+          const metadata = movement.metadata || {};
+          const ownedTotalBefore = receiptRound(Number(metadata.ownedTotalBefore ?? movement.before?.totalQty ?? 0));
+          const transitQty = receiptRound(Number(metadata.transitQty ?? 0));
+          const expectedPhysicalOnPremise = receiptRound(Number(metadata.expectedPhysicalOnPremise ?? metadata.systemQty ?? ownedTotalBefore - transitQty));
+          const availableBefore = receiptRound(Number(metadata.availableBefore ?? movement.before?.availableQty ?? 0));
+          const classifiedBuckets = metadata.classifiedBuckets || {
+            reservedQty: receiptRound(Number(metadata.reservedQty ?? movement.before?.reservedQty ?? 0)),
+            blockedQty: receiptRound(Number(metadata.blockedQty ?? movement.before?.blockedQty ?? 0)),
+            damagedQty: receiptRound(Number(metadata.damagedQty ?? movement.before?.damagedQty ?? 0)),
+            sampleQty: receiptRound(Number(metadata.sampleQty ?? movement.before?.sampleQty ?? 0)),
+            shortQty: receiptRound(Number(metadata.shortQty ?? movement.before?.shortQty ?? 0)),
+          };
+          const physicalQty = receiptRound(Number(metadata.physicalQty ?? movement.enteredQuantity ?? 0));
+          const discrepancy = receiptRound(Number(metadata.discrepancy ?? movement.deltas?.totalQty ?? 0));
+          return {
+            stockId: movement.stock, product: movement.product,
+            ownedTotalBefore, transitQty, expectedPhysicalOnPremise, availableBefore,
+            classifiedBuckets, physicalQty, discrepancy,
+            systemQty: expectedPhysicalOnPremise,
+            adjusted: Math.abs(discrepancy) > 0,
+            replayed: true,
+          };
+        });
+        return;
+      }
+      const stocks = await Stock.find({ _id: { $in: normalized.map(item => item.stockId) }, branch: req.branchId, warehouse }).session(session);
+      if (stocks.length !== normalized.length) throw grnError(422, 'Every count must reference an existing stock bucket in the selected branch and warehouse.');
+      const stockById = new Map(stocks.map(stock => [String(stock._id), stock]));
+      results = [];
+      for (const count of normalized) {
+        const stock = stockById.get(count.stockId);
+        const ownedTotalBefore = receiptRound(Number(stock.totalQty || 0));
+        const transitQty = receiptRound(Number(stock.transitQty || 0));
+        const expectedPhysicalOnPremise = receiptRound(ownedTotalBefore - transitQty);
+        const availableBefore = receiptRound(Number(stock.availableQty || 0));
+        const classifiedBuckets = {
+          reservedQty: receiptRound(Number(stock.reservedQty || 0)),
+          blockedQty: receiptRound(Number(stock.blockedQty || 0)),
+          damagedQty: receiptRound(Number(stock.damagedQty || 0)),
+          sampleQty: receiptRound(Number(stock.sampleQty || 0)),
+          shortQty: receiptRound(Number(stock.shortQty || 0)),
+        };
+        const uom = await resolveStockUom({ product: stock.product, enteredQuantity: count.physicalQty, enteredUnit: count.unit || undefined, session });
+        const physicalBaseQty = receiptRound(uom.baseQuantity);
+        const discrepancy = receiptRound(physicalBaseQty - expectedPhysicalOnPremise);
+        if (receiptRound(availableBefore + discrepancy) < 0) {
+          throw grnError(409, `Physical count for stock ${stock._id} is below its reserved, blocked, damaged or sample classifications; available stock would become negative.`);
+        }
+        const movement = await applyStockMovement({
+          operationKey: `${correlationKey}:${stock._id}`,
+          correlationKey,
+          movementType: 'physical_count', phase: 'counted',
+          branch: req.branchId, product: stock.product, warehouse: stock.warehouse, shade: stock.shade, batch: stock.batch,
+          deltas: { totalQty: discrepancy, availableQty: discrepancy }, allowZeroDeltas: true,
+          enteredQuantity: count.physicalQty, ...uom,
+          sourceType: 'PhysicalStockAudit', sourceModel: 'Stock', sourceId: deterministicSourceId(correlationKey),
+          sourceLineId: stock._id, sourceNumber: idempotencyKey, actor: req.user._id, occurredAt: new Date(),
+          reason: 'Physical stock count', remarks: count.remarks || remarks,
+          metadata: {
+            ownedTotalBefore, transitQty, expectedPhysicalOnPremise, availableBefore,
+            ...classifiedBuckets, classifiedBuckets,
+            physicalQty: count.physicalQty, physicalBaseQty, discrepancy,
+            auditedBy: req.user._id, requestFingerprint: auditFingerprint,
+          },
+          guardMessage: 'Physical count would make available stock negative or the bucket changed concurrently.',
+        }, { session });
+        results.push({
+          stockId: stock._id, product: stock.product,
+          ownedTotalBefore, transitQty, expectedPhysicalOnPremise, availableBefore,
+          classifiedBuckets, physicalQty: count.physicalQty, discrepancy,
+          systemQty: expectedPhysicalOnPremise,
+          adjusted: Math.abs(discrepancy) > 0.000001,
+          replayed: movement.replayed,
+        });
+      }
+    });
+    const adjustedCount = results.filter(item => item.adjusted).length;
+    const totalDiscrepancy = receiptRound(results.reduce((sum, item) => sum + Math.abs(item.discrepancy), 0));
+    return res.json({ success: true, message: `Audit complete. ${adjustedCount} items adjusted. Total discrepancy: ${totalDiscrepancy} units.`, data: { totalItems: results.length, adjustedItems: adjustedCount, totalDiscrepancy, results } });
+  } catch (error) {
+    return res.status(error.status || (['CastError', 'ValidationError'].includes(error.name) ? 422 : 500)).json({ success: false, message: error.message });
+  } finally { await session.endSession(); }
 });
 
 // ═══════════════════════════════════════
 // REORDER SUGGESTIONS (Out-of-stock → PO)
 // ═══════════════════════════════════════
 
-// GET /api/v1/purchase/stock/reorder-suggestions — branch/warehouse scoped, server-authoritative guidance
+// GET /api/v1/purchase/stock/reorder-suggestions — compatibility shape backed by canonical stock alerts
 router.get('/stock/reorder-suggestions', requirePermission('stock.view'), async (req, res) => {
   try {
-    const { warehouse } = req.query;
-    let warehouseRecord = null;
-    if (warehouse) [warehouseRecord] = await assertWarehousesInBranch([warehouse], req.branchId);
-
-    const [settings, products] = await Promise.all([
-      BranchSettings.findOne({ branch: req.branchId }).select('inventory').lean(),
-      Product.find({ status: 'active' })
-        .select('productCode itemName brand category tileSize reorderLevel minStockLevel images basicPrice')
-        .populate('brand', 'name')
-        .lean(),
-    ]);
-    if (!products.length) return res.json({ success: true, data: [] });
-
-    const fallbackLevel = Math.max(1, Number(settings?.inventory?.reorderFallbackLevel || 10));
-    const minimumReorderQuantity = Math.max(1, Number(settings?.inventory?.minimumReorderQuantity || 10));
-    const productIds = products.map(product => product._id);
-    const stockFilter = { branch: req.branchId, ...(warehouse ? { warehouse: warehouseRecord._id } : {}) };
-    const grnMatch = {
-      branch: new mongoose.Types.ObjectId(String(req.branchId)),
-      status: { $in: ['approved', 'posted'] },
-    };
-    const grnItemMatch = {
-      'items.product': { $in: productIds },
-      ...(warehouse ? { 'items.warehouse': warehouseRecord._id } : {}),
-    };
-    const [stockAgg, supplierHistory] = await Promise.all([
-      Stock.aggregate([
-        { $match: stockFilter },
-        { $group: { _id: '$product', currentStock: { $sum: '$availableQty' }, stockRate: { $max: '$purchaseRate' } } },
-      ]),
-      GRN.aggregate([
-        { $match: grnMatch },
-        { $unwind: '$items' },
-        { $match: grnItemMatch },
-        { $sort: { createdAt: -1, _id: -1 } },
-        { $group: {
-          _id: '$items.product',
-          supplier: { $first: '$supplier' },
-          supplierName: { $first: '$supplierName' },
-          rate: { $first: '$items.rate' },
-          grn: { $first: '$_id' },
-          receivedAt: { $first: '$createdAt' },
-        } },
-      ]),
-    ]);
-    const stockMap = new Map(stockAgg.map(stock => [String(stock._id), stock]));
-    const historyMap = new Map(supplierHistory.map(history => [String(history._id), history]));
-    const snapshotAt = new Date();
-    const scopeWarehouse = warehouseRecord?._id || null;
-    const scopeWarehouseName = warehouseRecord?.name || 'All branch warehouses';
-
-    const suggestions = products.flatMap(product => {
-      const stock = stockMap.get(String(product._id)) || { currentStock: 0, stockRate: 0 };
-      const currentStock = Number(stock.currentStock || 0);
-      const configuredReorderLevel = Number(product.reorderLevel || 0);
-      const effectiveReorderLevel = configuredReorderLevel > 0 ? configuredReorderLevel : fallbackLevel;
-      if (currentStock > effectiveReorderLevel) return [];
-      const minimumStockLevel = Number(product.minStockLevel || 0);
-      const minimumQty = minimumStockLevel > 0 ? minimumStockLevel : minimumReorderQuantity;
-      const suggestedQty = Math.max(effectiveReorderLevel * 2 - currentStock, minimumQty);
-      const history = historyMap.get(String(product._id));
-      const provenanceKey = [req.branchId, scopeWarehouse || 'all', product._id].map(String).join(':');
-      return [{
-        product: product._id,
-        productCode: product.productCode,
-        productName: product.itemName,
-        productImage: product.images?.[0] || '',
-        brand: product.brand?.name || '',
-        tileSize: product.tileSize || '',
-        warehouse: scopeWarehouse,
-        warehouseName: scopeWarehouseName,
-        stockScope: warehouse ? 'warehouse' : 'branch',
-        configuredReorderLevel,
-        reorderLevel: effectiveReorderLevel,
-        reorderLevelSource: configuredReorderLevel > 0 ? 'product' : 'branch_fallback',
-        minimumStockLevel,
-        currentStock,
-        deficit: Math.max(0, effectiveReorderLevel - currentStock),
-        suggestedQty,
-        lastPurchaseRate: Number(history?.rate || stock.stockRate || product.basicPrice || 0),
-        suggestedSupplier: history?.supplier || null,
-        suggestedSupplierName: history?.supplierName || 'No supplier history',
-        lastReceiptAt: history?.receivedAt || null,
-        isZeroStock: currentStock <= 0,
-        urgency: currentStock <= 0 ? 'critical' : currentStock <= effectiveReorderLevel / 2 ? 'high' : 'medium',
+    const result = await getCanonicalStockAlerts(req.branchId, {
+      warehouse: req.query.warehouse,
+      includeAdequate: false,
+      sortBy: 'severity',
+      sortOrder: 'asc',
+    }, { internalAll: true });
+    const suggestions = result.data.map(row => {
+      const urgency = row.severity === 'out_of_stock' ? 'critical' : row.severity === 'critical' ? 'high' : 'medium';
+      return {
+        product: row.product,
+        productCode: row.productCode,
+        productName: row.productName,
+        productImage: row.productImage,
+        brand: row.brand?.name || '',
+        tileSize: row.tileSize,
+        warehouse: row.warehouse?._id || null,
+        warehouseName: row.warehouse?.name || 'All branch warehouses',
+        stockScope: row.stockScope,
+        configuredReorderLevel: row.thresholds.configuredReorderLevel,
+        reorderLevel: row.thresholds.effectiveReorderLevel,
+        reorderLevelSource: row.thresholds.reorderSource,
+        minimumStockLevel: row.thresholds.effectiveMinStockLevel,
+        currentStock: row.quantities.availableQty,
+        deficit: row.deficit,
+        suggestedQty: row.suggestedQuantity,
+        netSuggestedQty: row.netSuggestedQuantity,
+        lastPurchaseRate: row.lastReceipt?.rate || row.valuation.effectiveRate,
+        suggestedSupplier: row.lastReceipt?.supplier || null,
+        suggestedSupplierName: row.lastReceipt?.supplierName || 'No supplier history',
+        lastReceiptAt: row.lastReceipt?.receivedAt || null,
+        isZeroStock: row.quantities.availableQty <= 0,
+        urgency,
+        hasOpenRequisition: row.hasOpenRequisition,
+        openRequisitions: row.openRequisitions,
+        openPurchaseOrders: row.openPurchaseOrders,
+        configurationWarnings: row.configurationWarnings,
         provenance: {
-          source: 'reorder_suggestion', key: provenanceKey, snapshotAt,
-          branch: req.branchId, warehouse: scopeWarehouse,
-          configuredReorderLevel, effectiveReorderLevel, minimumStockLevel,
+          source: 'reorder_suggestion',
+          key: [req.branchId, row.warehouse?._id || 'all', row.product].map(String).join(':'),
+          snapshotAt: result.scope.snapshotAt,
+          branch: req.branchId,
+          warehouse: row.warehouse?._id || null,
+          configuredReorderLevel: row.thresholds.configuredReorderLevel,
+          effectiveReorderLevel: row.thresholds.effectiveReorderLevel,
+          minimumStockLevel: row.thresholds.effectiveMinStockLevel,
         },
-      }];
+      };
     });
-
-    const urgencyOrder = { critical: 0, high: 1, medium: 2 };
-    suggestions.sort((a, b) => urgencyOrder[a.urgency] - urgencyOrder[b.urgency] || a.productName.localeCompare(b.productName));
-    res.json({
+    return res.json({
       success: true,
       data: suggestions,
-      scope: { branch: req.branchId, warehouse: scopeWarehouse, warehouseName: scopeWarehouseName, snapshotAt, fallbackLevel, minimumReorderQuantity },
+      scope: {
+        branch: req.branchId,
+        warehouse: result.scope.warehouse?._id || null,
+        warehouseName: result.scope.warehouse?.name || 'All branch warehouses',
+        snapshotAt: result.scope.snapshotAt,
+        fallbackLevel: result.scope.fallbackReorderLevel,
+        minStockFallbackLevel: result.scope.fallbackMinStockLevel,
+        minimumReorderQuantity: result.scope.minimumReorderQuantity,
+      },
       summary: {
         total: suggestions.length,
         critical: suggestions.filter(item => item.urgency === 'critical').length,
@@ -866,7 +1120,9 @@ router.get('/stock/reorder-suggestions', requirePermission('stock.view'), async 
         medium: suggestions.filter(item => item.urgency === 'medium').length,
       },
     });
-  } catch (e) { res.status(e.status || 500).json({ success: false, message: e.message }); }
+  } catch (error) {
+    return res.status(error.status || (error.name === 'CastError' ? 422 : 500)).json({ success: false, message: error.message });
+  }
 });
 
 // Direct purchase-order creation from stock suggestions is intentionally disabled.

@@ -2,6 +2,7 @@ import mongoose from 'mongoose';
 import Product from '../models/Product.js';
 import { pricingAuditSnapshot, resolvePricing } from './pricingResolver.js';
 import { roundMoney } from '../utils/pricingCalculations.js';
+import { normalizeUom } from './stockUomService.js';
 
 function routeError(status, message) {
   return Object.assign(new Error(message), { status });
@@ -24,7 +25,7 @@ const fieldProvided = (item, field) => {
 const roundQuantity = value => Math.round((Number(value) + Number.EPSILON) * 1e6) / 1e6;
 const quantitiesMatch = (left, right) => Math.abs(left - right) <= Math.max(0.0001, Math.max(Math.abs(left), Math.abs(right)) * 0.000001);
 
-export async function normalizeOrderItemsUom(items, session = null) {
+export async function normalizeOrderItemsUom(items, session = null, { requireItemUnit = false } = {}) {
   if (!Array.isArray(items) || items.length === 0) throw routeError(422, 'At least one item is required.');
   const productIds = items.map((item, index) => {
     const id = item.product?._id || item.product;
@@ -40,6 +41,30 @@ export async function normalizeOrderItemsUom(items, session = null) {
     const product = byId.get(String(productIds[index]));
     if (!product) throw routeError(404, `Product not found for items[${index}].`);
     if (product.status !== 'active') throw routeError(422, `Product ${product.productCode || product._id} is not active.`);
+    if (requireItemUnit) {
+      if (!String(item.unit || '').trim()) throw routeError(422, `items[${index}].unit is required.`);
+      const requestedUnit = normalizeUom(item.unit);
+      const commercialUnit = normalizeUom(product.unit || 'Unit');
+      const configuredUnits = new Set([commercialUnit, ...(product.uomConversions || []).map(row => normalizeUom(row.uom))]);
+      if (!configuredUnits.has(requestedUnit)) throw routeError(422, `items[${index}].unit is not configured for product ${product.productCode || product._id}.`);
+      if (requestedUnit !== commercialUnit) throw routeError(422, `items[${index}].unit must match the product commercial unit ${commercialUnit}.`);
+      const quantity = roundQuantity(quantityValue(item.quantity, `items[${index}].quantity`));
+      const piecesPerBox = finiteNonNegative(product.piecesPerBox, `items[${index}].piecesPerBox`);
+      const sqftPerBox = finiteNonNegative(product.sqftPerBox, `items[${index}].sqftPerBox`);
+      return {
+        source: {
+          ...item,
+          product: product._id,
+          unit: requestedUnit,
+          quantity,
+          boxes: requestedUnit === 'Box' ? quantity : 0,
+          pieces: requestedUnit === 'Piece' ? quantity : requestedUnit === 'Box' && piecesPerBox > 0 ? roundQuantity(quantity * piecesPerBox) : 0,
+          sqft: requestedUnit === 'Sqft' ? quantity : requestedUnit === 'Box' && sqftPerBox > 0 ? roundQuantity(quantity * sqftPerBox) : 0,
+        },
+        product,
+        quantity,
+      };
+    }
     const piecesPerBox = finiteNonNegative(product.piecesPerBox, `items[${index}].piecesPerBox`);
     const sqftPerBox = finiteNonNegative(product.sqftPerBox, `items[${index}].sqftPerBox`);
     if (!(piecesPerBox > 0) || !(sqftPerBox > 0)) {
@@ -183,11 +208,11 @@ export async function deriveOrderPricing(options = {}) {
   const {
     branchId, dealerId, dealerTypeId, scope, orderType = dealerId ? 'dealer' : 'retail',
     pricingDate = new Date(), items, session = null, existingApprovalReasons = [],
-    preserveSnapshots = false, preserveBelowMinimumApprovals = false,
+    preserveSnapshots = false, preserveBelowMinimumApprovals = false, requireItemUnit = false,
     freightCharges = 0, loadingCharges = 0, installationCharges = 0, otherCharges = 0,
     advanceAmount = 0,
   } = options;
-  const normalized = await normalizeOrderItemsUom(items, session);
+  const normalized = await normalizeOrderItemsUom(items, session, { requireItemUnit });
 
   let resolutions;
   if (preserveSnapshots) {
@@ -246,7 +271,7 @@ export async function deriveOrderPricing(options = {}) {
       shade: source.shade || '',
       batch: source.batch || '',
       quantity,
-      unit: product.unit || 'Box',
+      unit: source.unit || product.unit || 'Box',
       boxes: finiteNonNegative(source.boxes, `items[${index}].boxes`),
       pieces: finiteNonNegative(source.pieces, `items[${index}].pieces`),
       sqft: finiteNonNegative(source.sqft, `items[${index}].sqft`),

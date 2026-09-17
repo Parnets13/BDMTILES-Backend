@@ -1,10 +1,14 @@
 import { Router } from 'express';
+import mongoose from 'mongoose';
 import Product from '../models/Product.js';
+import Stock from '../models/Stock.js';
+import StockMovement from '../models/StockMovement.js';
 import Brand from '../models/Brand.js';
 import Category from '../models/Category.js';
 import Subcategory from '../models/Subcategory.js';
 import { protect, requirePermission } from '../middleware/auth.js';
 import { uploadProductImages } from '../middleware/upload.js';
+import { normalizeProductUomConfig } from '../services/stockUomService.js';
 
 const router = Router();
 router.use(protect);
@@ -62,9 +66,38 @@ router.get('/', async (req, res) => {
       Product.countDocuments(filter),
     ]);
 
+    // Attach branch-scoped available/total stock so pickers (PR, quotations, SO)
+    // show real balances instead of an undefined field that renders as 0.
+    const headerBranchId = req.get('X-Branch-Id');
+    const branchScope = mongoose.isValidObjectId(headerBranchId)
+      ? { branch: new mongoose.Types.ObjectId(headerBranchId) }
+      : {};
+    const productIds = products.map((product) => product._id);
+    const stockRows = productIds.length ? await Stock.aggregate([
+      { $match: { ...branchScope, product: { $in: productIds } } },
+      { $group: {
+        _id: '$product',
+        totalQty: { $sum: '$totalQty' },
+        availableQty: { $sum: '$availableQty' },
+        reservedQty: { $sum: '$reservedQty' },
+        damagedQty: { $sum: '$damagedQty' },
+      } },
+    ]) : [];
+    const stockByProduct = new Map(stockRows.map((row) => [String(row._id), row]));
+    const withStock = products.map((product) => {
+      const stock = stockByProduct.get(String(product._id));
+      return {
+        ...product,
+        stockAvailable: Number(stock?.availableQty || 0),
+        stockTotal: Number(stock?.totalQty || 0),
+        stockReserved: Number(stock?.reservedQty || 0),
+        stockDamaged: Number(stock?.damagedQty || 0),
+      };
+    });
+
     res.json({
       success: true,
-      data: products,
+      data: withStock,
       pagination: { currentPage: p, totalPages: Math.ceil(total / l), totalItems: total, itemsPerPage: l },
     });
   } catch (error) {
@@ -121,6 +154,7 @@ router.get('/:id', async (req, res) => {
 router.post('/', async (req, res) => {
   try {
     const productData = { ...req.body, createdBy: req.user._id };
+    Object.assign(productData, normalizeProductUomConfig(productData, productData.unit || 'Box'));
 
     // Auto-generate product code if not provided — check both products AND recycle bin for uniqueness
     if (!productData.productCode) {
@@ -142,6 +176,7 @@ router.post('/', async (req, res) => {
     res.status(201).json({ success: true, message: 'Product created.', data: product });
   } catch (error) {
     if (error.code === 11000) return res.status(400).json({ success: false, message: 'Product code already exists.' });
+    if (error.status || error.name === 'ValidationError') return res.status(error.status || 422).json({ success: false, message: error.message });
     console.error('Create product error:', error.message);
     res.status(500).json({ success: false, message: error.message });
   }
@@ -150,7 +185,25 @@ router.post('/', async (req, res) => {
 // PUT /api/v1/products/:id
 router.put('/:id', async (req, res) => {
   try {
-    const product = await Product.findByIdAndUpdate(req.params.id, req.body, { new: true, runValidators: true })
+    const existing = await Product.findById(req.params.id);
+    if (!existing) return res.status(404).json({ success: false, message: 'Product not found.' });
+    const update = { ...req.body };
+    const nextUom = normalizeProductUomConfig({ ...existing.toObject(), ...update }, existing.unit || 'Box');
+    const previousUom = normalizeProductUomConfig(existing.toObject(), existing.unit || 'Box');
+    const uomChanged = JSON.stringify({ base: previousUom.inventoryBaseUom, conversions: previousUom.uomConversions.map(({ uom, toBaseFactor }) => ({ uom, toBaseFactor })) })
+      !== JSON.stringify({ base: nextUom.inventoryBaseUom, conversions: nextUom.uomConversions.map(({ uom, toBaseFactor }) => ({ uom, toBaseFactor })) });
+    if (uomChanged && (await Promise.all([
+      Stock.exists({ product: existing._id }).then(Boolean),
+      StockMovement.exists({ product: existing._id }).then(Boolean),
+    ])).some(Boolean)) {
+      return res.status(409).json({ success: false, message: 'Inventory base UOM and conversion factors are immutable after stock history exists. Packaging/display fields may still be changed.' });
+    }
+    if (uomChanged && Number(nextUom.inventoryUomVersion) <= Number(existing.inventoryUomVersion || 1)) {
+      nextUom.inventoryUomVersion = Number(existing.inventoryUomVersion || 1) + 1;
+      nextUom.uomConversions = nextUom.uomConversions.map(row => ({ ...row, version: nextUom.inventoryUomVersion }));
+    }
+    Object.assign(update, nextUom);
+    const product = await Product.findByIdAndUpdate(req.params.id, update, { new: true, runValidators: true })
       .populate('brand', 'name')
       .populate('category', 'name')
       .populate('subcategory', 'name');
@@ -158,7 +211,7 @@ router.put('/:id', async (req, res) => {
     res.json({ success: true, message: 'Product updated.', data: product });
   } catch (error) {
     if (error.code === 11000) return res.status(400).json({ success: false, message: 'Product code already exists.' });
-    res.status(500).json({ success: false, message: error.message });
+    res.status(error.status || (error.name === 'ValidationError' ? 422 : 500)).json({ success: false, message: error.message });
   }
 });
 

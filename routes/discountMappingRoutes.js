@@ -14,11 +14,14 @@ router.use(requireBranch);
 // ══════════════════════════════════════════════════════
 router.get('/', requirePermission('dealer.discounts'), async (req, res) => {
   try {
-    const { page = 1, limit = 50, targetType, status, search, dealerType } = req.query;
+    const { page = 1, limit = 50, targetType, status, search, dealerType, mappingType = 'sales' } = req.query;
     const p = Math.max(1, parseInt(page));
     const l = Math.min(100, parseInt(limit) || 50);
 
     const filter = { branch: req.branchId };
+    // Default to sales so the existing dealer/builder tab keeps its behavior;
+    // 'all' explicitly opts out of the mappingType filter.
+    if (mappingType && mappingType !== 'all') filter.mappingType = mappingType;
     if (targetType) filter.targetType = targetType;
     if (status) filter.status = status;
     if (dealerType) {
@@ -47,6 +50,7 @@ router.get('/', requirePermission('dealer.discounts'), async (req, res) => {
         .populate('brand', 'name')
         .populate('category', 'name')
         .populate('subcategory', 'name')
+        .populate('suppliers', 'companyName supplierCode')
         .populate('createdBy', 'name')
         .lean(),
       DiscountMapping.countDocuments(filter),
@@ -66,7 +70,8 @@ router.get('/', requirePermission('dealer.discounts'), async (req, res) => {
 router.get('/stats', requirePermission('dealer.discounts'), async (req, res) => {
   try {
     const now = new Date();
-    const scope = { branch: req.branchId };
+    const { mappingType = 'sales' } = req.query;
+    const scope = { branch: req.branchId, ...(mappingType && mappingType !== 'all' ? { mappingType } : {}) };
     const [total, active, inactive, expired, byType] = await Promise.all([
       DiscountMapping.countDocuments(scope),
       DiscountMapping.countDocuments({ ...scope, status: 'active', validFrom: { $lte: now }, validTo: { $gte: now } }),
@@ -240,6 +245,62 @@ router.post('/bulk-calculate', requirePermission('sales.order.create'), async (r
 });
 
 // ══════════════════════════════════════════════════════
+// GET /api/v1/discount-mappings/calculate-purchase — resolve supplier (purchase) discount
+// Query: ?product=<id>&supplier=<id>&rate=<number>
+// Returns the mapped supplier discount as the expected baseline; the buyer may
+// accept MORE (up to floatingDiscountMax) but not less than floatingDiscountMin.
+// ══════════════════════════════════════════════════════
+router.get('/calculate-purchase', requirePermission('po.management'), async (req, res) => {
+  try {
+    const { product: productId, supplier: supplierId, rate } = req.query;
+    if (!productId) return res.status(400).json({ success: false, message: 'product is required' });
+
+    const productDoc = await Product.findById(productId)
+      .select('_id brand category subcategory itemName productCode')
+      .lean();
+    if (!productDoc) return res.status(404).json({ success: false, message: 'Product not found' });
+
+    const rule = await DiscountMapping.findBestPurchaseDiscount(productDoc, supplierId, req.branchId);
+    const baseRate = parseFloat(rate) || 0;
+
+    if (!rule) {
+      return res.json({
+        success: true,
+        data: { hasDiscount: false, discountPercentage: 0, effectiveRate: baseRate, rule: null },
+      });
+    }
+
+    const direct = Number(rule.directDiscountPercentage || 0);
+    const floatingEnabled = Boolean(rule.floatingDiscountEnabled);
+    const minPct = floatingEnabled ? Number(rule.floatingDiscountMin || 0) : direct;
+    const maxPct = floatingEnabled ? Number(rule.floatingDiscountMax || direct) : direct;
+    const effectiveRate = Math.round(Math.max(0, baseRate - (baseRate * direct) / 100) * 100) / 100;
+
+    res.json({
+      success: true,
+      data: {
+        hasDiscount: direct > 0 || floatingEnabled,
+        discountPercentage: direct,
+        // Buyer bounds: never below min, may go up to max (more discount is better when buying).
+        floatingEnabled,
+        minDiscountPercentage: minPct,
+        maxDiscountPercentage: maxPct,
+        effectiveRate,
+        rule: {
+          _id: rule._id,
+          ruleName: rule.ruleName,
+          targetType: rule.targetType,
+          targetName: rule.targetName,
+          directDiscountPercentage: direct,
+          floatingDiscountMin: rule.floatingDiscountMin,
+          floatingDiscountMax: rule.floatingDiscountMax,
+        },
+      },
+    });
+  } catch (e) { res.status(500).json({ success: false, message: e.message }); }
+});
+
+// ══════════════════════════════════════════════════════
 // GET /api/v1/discount-mappings/:id — get single rule
 // ══════════════════════════════════════════════════════
 router.get('/:id', requirePermission('dealer.discounts'), async (req, res) => {
@@ -249,6 +310,7 @@ router.get('/:id', requirePermission('dealer.discounts'), async (req, res) => {
       .populate('brand', 'name')
       .populate('category', 'name')
       .populate('subcategory', 'name')
+      .populate('suppliers', 'companyName supplierCode')
       .populate('createdBy', 'name')
       .lean();
     if (!rule) return res.status(404).json({ success: false, message: 'Not found' });

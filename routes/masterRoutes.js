@@ -1,16 +1,17 @@
 import { Router } from 'express';
+import mongoose from 'mongoose';
 import DealerType from '../models/DealerType.js';
 import DealerCategory from '../models/DealerCategory.js';
 import Region from '../models/Region.js';
 import Route from '../models/Route.js';
-import Dealer from '../models/Dealer.js';
+import Dealer, { normalizeDealerMobile } from '../models/Dealer.js';
 import Supplier from '../models/Supplier.js';
 import Warehouse from '../models/Warehouse.js';
 import ExpenseCategory from '../models/ExpenseCategory.js';
 import Vehicle from '../models/Vehicle.js';
 import User from '../models/User.js';
 import Expense from '../models/Expense.js';
-import { protect, requirePermission } from '../middleware/auth.js';
+import { protect, requirePermission, userHasPermission } from '../middleware/auth.js';
 import { requireBranch } from '../utils/branchScope.js';
 
 const router = Router();
@@ -68,7 +69,7 @@ const simpleCrud = (Model, permission, dependencyCheck) => {
         if (depError) return res.status(400).json({ success: false, message: depError });
       }
       const { safeDelete } = await import('../middleware/safeDelete.js');
-      const result = await safeDelete(Model, req.params.id, { user: req.user, module: Model.modelName?.toLowerCase() || 'master', titleField: 'name', skipDependencyCheck: true });
+      const result = await safeDelete(Model, req.params.id, { user: req.user, req, branch: req.branchId, module: Model.modelName?.toLowerCase() || 'master', titleField: 'name', skipDependencyCheck: true });
       res.status(result.status || 200).json(result);
     } catch (e) { res.status(500).json({ success: false, message: e.message }); }
   });
@@ -240,7 +241,7 @@ routeRouter.put('/:id', async (req, res) => {
 routeRouter.delete('/:id', async (req, res) => {
   try {
     const { safeDelete } = await import('../middleware/safeDelete.js');
-    const result = await safeDelete(Route, req.params.id, { user: req.user, module: 'route', titleField: 'name' });
+    const result = await safeDelete(Route, req.params.id, { user: req.user, req, branch: req.branchId, module: 'route', titleField: 'name' });
     res.status(result.status || 200).json(result);
   } catch (e) { res.status(500).json({ success: false, message: e.message }); }
 });
@@ -253,9 +254,92 @@ router.use('/routes', routeRouter);
 const dealerRouter = Router();
 dealerRouter.use(requirePermission('dealer.master'));
 
+const dealerError = (status, message) => Object.assign(new Error(message), { status });
+const populateDealer = (query) => query
+  .populate('dealerType', 'name pricingTier')
+  .populate('dealerCategory', 'name')
+  .populate('assignedRegion', 'name')
+  .populate('assignedRoute', 'name')
+  .populate('assignedSalesExecutive', 'name phone status assignedBranches defaultBranch');
+
+async function normalizeDealerAssignment(body, actor, currentAssignment = null) {
+  const data = { ...body };
+  const hasCanonicalField = Object.prototype.hasOwnProperty.call(data, 'assignedSalesExecutive');
+  const hasLegacyField = Object.prototype.hasOwnProperty.call(data, 'salesExecutiveId');
+  const selectedId = hasCanonicalField ? data.assignedSalesExecutive : data.salesExecutiveId;
+  delete data.salesExecutiveId;
+
+  if (!hasCanonicalField && !hasLegacyField) return data;
+  if (!userHasPermission(actor, 'dealer.assignment.manage')) {
+    throw dealerError(403, 'Access denied: dealer.assignment.manage');
+  }
+  if (selectedId === null || selectedId === '') {
+    data.assignedSalesExecutive = null;
+    return data;
+  }
+  if (!mongoose.isValidObjectId(selectedId)) {
+    throw dealerError(422, 'Select a valid Sales Executive.');
+  }
+
+  if (currentAssignment && String(currentAssignment) === String(selectedId)) {
+    data.assignedSalesExecutive = currentAssignment;
+    return data;
+  }
+
+  const salesExecutive = await User.findOne({
+    _id: selectedId,
+    role: 'sales_executive',
+    status: 'Active',
+  }).select('_id').lean();
+  if (!salesExecutive) {
+    throw dealerError(422, 'The selected user is not an active Sales Executive.');
+  }
+  data.assignedSalesExecutive = salesExecutive._id;
+  return data;
+}
+
+const sendDealerError = (res, error) => res.status(
+  error.status || (error.code === 11000 ? 409 : error.name === 'CastError' ? 422 : 500),
+).json({
+  success: false,
+  message: error.code === 11000 && /mobileNormalized/.test(error.message || '')
+    ? 'Another dealer already uses this mobile number. Each dealer must have a unique mobile.'
+    : error.name === 'CastError' ? 'Invalid identifier.' : error.message,
+});
+
+// Ensures a dealer's mobile is present, valid, and unique across dealers, and
+// stamps the normalized login key. Runs for both create and update so a changed
+// number (which bypasses the pre-save hook via findByIdAndUpdate) stays in sync.
+async function applyDealerMobile(data, dealerId = null) {
+  if (!Object.prototype.hasOwnProperty.call(data, 'mobile')) return data;
+  const normalized = normalizeDealerMobile(data.mobile);
+  if (normalized.length < 10) {
+    throw dealerError(422, 'Enter a valid 10-digit mobile number.');
+  }
+  const clash = await Dealer.findOne({
+    mobileNormalized: normalized,
+    ...(dealerId ? { _id: { $ne: dealerId } } : {}),
+  }).select('_id businessName').lean();
+  if (clash) {
+    throw dealerError(409, `Mobile ${data.mobile} is already used by dealer "${clash.businessName}". Each dealer must have a unique mobile.`);
+  }
+  data.mobileNormalized = normalized;
+  return data;
+}
+
 dealerRouter.get('/', async (req, res) => {
   try {
-    const { page = 1, limit = 20, search, status, dealerType, region, route: routeId, pricingTier } = req.query;
+    const {
+      page = 1,
+      limit = 20,
+      search,
+      status,
+      dealerType,
+      region,
+      route: routeId,
+      pricingTier,
+      assignedSalesExecutive,
+    } = req.query;
     const p = Math.max(1, parseInt(page));
     const l = Math.min(100, parseInt(limit) || 20);
 
@@ -268,34 +352,29 @@ dealerRouter.get('/', async (req, res) => {
     if (dealerType) filter.dealerType = dealerType;
     if (region) filter.assignedRegion = region;
     if (routeId) filter.assignedRoute = routeId;
+    if (assignedSalesExecutive === 'unassigned') filter.assignedSalesExecutive = null;
+    else if (assignedSalesExecutive) filter.assignedSalesExecutive = assignedSalesExecutive;
 
-    // Filter by pricingTier: find DealerType IDs that match the tier, then filter dealers
     if (pricingTier) {
       const matchingTypes = await DealerType.find({ pricingTier, status: 'active' }).select('_id').lean();
       const typeIds = matchingTypes.map(t => t._id);
       if (typeIds.length > 0) {
         filter.dealerType = { $in: typeIds };
       } else {
-        // No matching dealer types — return empty
         return res.json({ success: true, data: [], pagination: { currentPage: p, totalPages: 0, totalItems: 0, itemsPerPage: l } });
       }
     }
 
     const [dealers, total] = await Promise.all([
-      Dealer.find(filter).sort({ createdAt: -1 }).skip((p - 1) * l).limit(l)
-        .populate('dealerType', 'name pricingTier')
-        .populate('dealerCategory', 'name')
-        .populate('assignedRegion', 'name')
-        .populate('assignedRoute', 'name')
-        .lean(),
+      populateDealer(Dealer.find(filter).sort({ createdAt: -1 }).skip((p - 1) * l).limit(l)).lean(),
       Dealer.countDocuments(filter),
     ]);
 
-    res.json({ success: true, data: dealers, pagination: { currentPage: p, totalPages: Math.ceil(total / l), totalItems: total, itemsPerPage: l } });
-  } catch (e) { res.status(500).json({ success: false, message: e.message }); }
+    return res.json({ success: true, data: dealers, pagination: { currentPage: p, totalPages: Math.ceil(total / l), totalItems: total, itemsPerPage: l } });
+  } catch (error) { return sendDealerError(res, error); }
 });
 
-dealerRouter.get('/stats', async (req, res) => {
+dealerRouter.get('/stats', async (_req, res) => {
   try {
     const [total, active, inactive, blocked] = await Promise.all([
       Dealer.countDocuments(),
@@ -303,48 +382,60 @@ dealerRouter.get('/stats', async (req, res) => {
       Dealer.countDocuments({ status: 'inactive' }),
       Dealer.countDocuments({ status: 'blocked' }),
     ]);
-    res.json({ success: true, data: { total, active, inactive, blocked } });
-  } catch (e) { res.status(500).json({ success: false, message: e.message }); }
+    return res.json({ success: true, data: { total, active, inactive, blocked } });
+  } catch (error) { return sendDealerError(res, error); }
+});
+
+dealerRouter.get('/sales-executives', requirePermission('dealer.assignment.manage'), async (_req, res) => {
+  try {
+    const salesExecutives = await User.find({ role: 'sales_executive', status: 'Active' })
+      .select('name phone status')
+      .sort({ name: 1 })
+      .lean();
+    return res.json({ success: true, data: salesExecutives });
+  } catch (error) { return sendDealerError(res, error); }
 });
 
 dealerRouter.get('/:id', async (req, res) => {
   try {
-    const dealer = await Dealer.findById(req.params.id)
-      .populate('dealerType', 'name')
-      .populate('dealerCategory', 'name')
-      .populate('assignedRegion', 'name')
-      .populate('assignedRoute', 'name')
-      .populate('assignedSalesExecutive', 'name phone')
-      .lean();
+    const dealer = await populateDealer(Dealer.findById(req.params.id)).lean();
     if (!dealer) return res.status(404).json({ success: false, message: 'Dealer not found.' });
-    res.json({ success: true, data: dealer });
-  } catch (e) { res.status(500).json({ success: false, message: e.message }); }
+    return res.json({ success: true, data: dealer });
+  } catch (error) { return sendDealerError(res, error); }
 });
 
 dealerRouter.post('/', async (req, res) => {
   try {
-    const data = { ...req.body, createdBy: req.user._id };
+    const data = { ...await normalizeDealerAssignment(req.body, req.user), createdBy: req.user._id };
+    await applyDealerMobile(data);
     if (!data.dealerCode) {
       const { generateUniqueCode } = await import('../utils/codeGenerator.js');
       data.dealerCode = await generateUniqueCode(Dealer, 'dealerCode', 'DLR', 5);
     }
-    const dealer = await Dealer.create(data);
-    res.status(201).json({ success: true, message: 'Dealer created.', data: dealer });
-  } catch (e) {
-    if (e.code === 11000) return res.status(400).json({ success: false, message: 'Dealer code already exists.' });
-    res.status(500).json({ success: false, message: e.message });
+    const created = await Dealer.create(data);
+    const dealer = await populateDealer(Dealer.findById(created._id)).lean();
+    return res.status(201).json({ success: true, message: 'Dealer created.', data: dealer });
+  } catch (error) {
+    if (error.code === 11000) return res.status(400).json({ success: false, message: 'Dealer code already exists.' });
+    return sendDealerError(res, error);
   }
 });
 
 dealerRouter.put('/:id', async (req, res) => {
   try {
-    const dealer = await Dealer.findByIdAndUpdate(req.params.id, req.body, { new: true, runValidators: true })
-      .populate('dealerType', 'name')
-      .populate('dealerCategory', 'name')
-      .populate('assignedRegion', 'name');
-    if (!dealer) return res.status(404).json({ success: false, message: 'Dealer not found.' });
-    res.json({ success: true, message: 'Dealer updated.', data: dealer });
-  } catch (e) { res.status(500).json({ success: false, message: e.message }); }
+    const current = await Dealer.findById(req.params.id).select('assignedSalesExecutive').lean();
+    if (!current) return res.status(404).json({ success: false, message: 'Dealer not found.' });
+    const data = await normalizeDealerAssignment(
+      req.body,
+      req.user,
+      current.assignedSalesExecutive,
+    );
+    await applyDealerMobile(data, req.params.id);
+    const dealer = await populateDealer(
+      Dealer.findByIdAndUpdate(req.params.id, data, { new: true, runValidators: true }),
+    );
+    return res.json({ success: true, message: 'Dealer updated.', data: dealer });
+  } catch (error) { return sendDealerError(res, error); }
 });
 
 dealerRouter.delete('/:id', async (req, res) => {
@@ -352,12 +443,14 @@ dealerRouter.delete('/:id', async (req, res) => {
     const { safeDelete } = await import('../middleware/safeDelete.js');
     const result = await safeDelete(Dealer, req.params.id, {
       user: req.user,
+      req,
+      branch: req.branchId,
       module: 'dealer',
       titleField: 'businessName',
       codeField: 'dealerCode',
     });
-    res.status(result.status || 200).json(result);
-  } catch (e) { res.status(500).json({ success: false, message: e.message }); }
+    return res.status(result.status || 200).json(result);
+  } catch (error) { return sendDealerError(res, error); }
 });
 
 router.use('/dealers', dealerRouter);
@@ -421,7 +514,7 @@ supplierRouter.put('/:id', async (req, res) => {
 supplierRouter.delete('/:id', async (req, res) => {
   try {
     const { safeDelete } = await import('../middleware/safeDelete.js');
-    const result = await safeDelete(Supplier, req.params.id, { user: req.user, module: 'supplier', titleField: 'companyName', codeField: 'supplierCode' });
+    const result = await safeDelete(Supplier, req.params.id, { user: req.user, req, branch: req.branchId, module: 'supplier', titleField: 'companyName', codeField: 'supplierCode' });
     res.status(result.status || 200).json(result);
   } catch (e) { res.status(500).json({ success: false, message: e.message }); }
 });
@@ -474,7 +567,7 @@ vehicleRouter.put('/:id', async (req, res) => {
 vehicleRouter.delete('/:id', async (req, res) => {
   try {
     const { safeDelete } = await import('../middleware/safeDelete.js');
-    const result = await safeDelete(Vehicle, req.params.id, { user: req.user, module: 'vehicle', titleField: 'vehicleNumber' });
+    const result = await safeDelete(Vehicle, req.params.id, { user: req.user, req, branch: req.branchId, module: 'vehicle', titleField: 'vehicleNumber' });
     res.status(result.status || 200).json(result);
   } catch (e) { res.status(500).json({ success: false, message: e.message }); }
 });

@@ -2,6 +2,8 @@ import mongoose from 'mongoose';
 
 const deliveryDiscrepancySchema = new mongoose.Schema({
   type: { type: String, enum: ['short', 'damaged'], required: true },
+  deliveryItem: { type: mongoose.Schema.Types.ObjectId },
+  salesOrderItem: { type: mongoose.Schema.Types.ObjectId },
   boxes: { type: Number, required: true, min: 0.000001 },
   remarks: { type: String, default: '' },
   status: { type: String, enum: ['recorded', 'under_review', 'resolved'], default: 'recorded' },
@@ -15,6 +17,29 @@ const deliveryExceptionSchema = new mongoose.Schema({
   authorizedBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User' },
   authorizedAt: Date,
 }, { _id: false });
+
+const deliveryItemSchema = new mongoose.Schema({
+  pickList: { type: mongoose.Schema.Types.ObjectId, ref: 'PickList', immutable: true },
+  pickListItem: { type: mongoose.Schema.Types.ObjectId, immutable: true },
+  salesOrderItem: { type: mongoose.Schema.Types.ObjectId, immutable: true },
+  originalDispatchOperationKey: { type: String, default: '', immutable: true },
+  product: { type: mongoose.Schema.Types.ObjectId, ref: 'Product', required: true, immutable: true },
+  warehouse: { type: mongoose.Schema.Types.ObjectId, ref: 'Warehouse', required: true, immutable: true },
+  shade: { type: String, default: '', immutable: true },
+  batch: { type: String, default: '', immutable: true },
+  dispatchedQuantity: { type: Number, required: true, min: 0 },
+  acceptedQuantity: { type: Number, default: 0, min: 0 },
+  shortQuantity: { type: Number, default: 0, min: 0 },
+  damagedRejectedQuantity: { type: Number, default: 0, min: 0 },
+  dispatchReturnedQuantity: { type: Number, default: 0, min: 0 },
+  enteredUnit: { type: String, default: 'Unit' },
+  baseQuantity: { type: Number, required: true, min: 0 },
+  baseUnit: { type: String, default: 'Unit' },
+  conversionFactor: { type: Number, default: 1, min: 0.000000001 },
+  uomVersion: { type: Number, default: 1, min: 1 },
+  discrepancyResolutionState: { type: String, enum: ['none', 'recorded', 'return_requested', 'resolved'], default: 'none' },
+  remarks: { type: String, default: '' },
+}, { _id: true });
 
 const deliverySchema = new mongoose.Schema(
   {
@@ -41,6 +66,10 @@ const deliverySchema = new mongoose.Schema(
     deliveryExecutiveName: { type: String, default: '' },
 
     // Items summary
+    items: { type: [deliveryItemSchema], default: [] },
+    itemReconciliationState: { type: String, enum: ['legacy', 'pending', 'reconciled', 'discrepancy'], default: 'legacy' },
+    reconciledAt: Date,
+    reconciledBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User' },
     totalBoxes: { type: Number, default: 0 },
     unfulfilledQty: { type: Number, default: 0 },
     hasFulfillmentShortage: { type: Boolean, default: false },
@@ -102,6 +131,7 @@ const deliverySchema = new mongoose.Schema(
     customerFeedback: { type: String, default: '' },
 
     completionProcessing: { type: Boolean, default: false },
+    salesReturnClaimVersion: { type: Number, min: 0, default: 0 },
 
     createdBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User' },
   },

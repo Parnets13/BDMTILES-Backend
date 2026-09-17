@@ -1,8 +1,11 @@
 import { Router } from 'express';
 import mongoose from 'mongoose';
 import StockTransfer from '../models/StockTransfer.js';
-import Warehouse from '../models/Warehouse.js';
 import Stock from '../models/Stock.js';
+import Product from '../models/Product.js';
+import Warehouse from '../models/Warehouse.js';
+import { applyStockMovement, stockOperationKey } from '../services/stockMovementService.js';
+import { resolveStockUom, stableUomSnapshot } from '../services/stockUomService.js';
 import Branch from '../models/Branch.js';
 import { protect, requirePermission } from '../middleware/auth.js';
 import { requireBranch } from '../utils/branchScope.js';
@@ -135,17 +138,33 @@ router.post('/', async (req, res) => {
     data.toWarehouseName = toWarehouse.name;
 
     const requirements = new Map();
-    data.items = data.items.map((item, index) => {
+    const productIds = [...new Set(data.items.map(item => String(item.product || '')))].filter(mongoose.isValidObjectId);
+    const products = await Product.find({ _id: { $in: productIds } }).lean();
+    const productsById = new Map(products.map(product => [String(product._id), product]));
+    const normalizedItems = [];
+    for (let index = 0; index < data.items.length; index += 1) {
+      const item = data.items[index];
       const requestedQty = Number(item.requestedQty);
-      if (!item.product || !Number.isFinite(requestedQty) || requestedQty <= 0) {
-        throw routeError(422, `items[${index}] requires a product and a finite requestedQty greater than zero.`);
+      const product = productsById.get(String(item.product));
+      if (!product || !Number.isFinite(requestedQty) || requestedQty <= 0) {
+        throw routeError(422, `items[${index}] requires a valid product and a finite requestedQty greater than zero.`);
       }
-      const normalized = { ...item, requestedQty, dispatchedQty: 0, receivedQty: 0, damagedQty: 0, shortQty: 0 };
+      const uom = await resolveStockUom({ product, enteredQuantity: requestedQty, enteredUnit: item.unit || product.unit });
+      const normalized = {
+        ...item,
+        requestedQty: uom.enteredQuantity,
+        approvedQty: 0, blockedQty: 0, cancelledQty: 0, releasedQty: 0,
+        dispatchedQty: 0, receivedQty: 0, damagedQty: 0, shortQty: 0,
+        unit: uom.enteredUnit, enteredUnit: uom.enteredUnit,
+        baseQuantity: uom.baseQuantity, baseUnit: uom.baseUnit,
+        conversionFactor: uom.conversionFactor, uomVersion: uom.uomVersion,
+      };
       const key = stockKey(data.sourceBranch, item.product, data.fromWarehouse, item.shade, item.batch);
       const existing = requirements.get(key);
-      requirements.set(key, { item: normalized, quantity: (existing?.quantity || 0) + requestedQty });
-      return normalized;
-    });
+      requirements.set(key, { item: normalized, quantity: (existing?.quantity || 0) + uom.baseQuantity });
+      normalizedItems.push(normalized);
+    }
+    data.items = normalizedItems;
 
     for (const { item, quantity } of requirements.values()) {
       const stock = await Stock.findOne({
@@ -156,6 +175,7 @@ router.post('/', async (req, res) => {
         batch: item.batch || '',
       }).lean();
       const available = Number(stock?.availableQty || 0);
+      item.availableAtRequest = item.conversionFactor > 0 ? available / item.conversionFactor : available;
       if (!Number.isFinite(available) || available < quantity) {
         throw routeError(409, `Insufficient stock for ${item.productName || 'product'}. Available: ${available}, requested: ${quantity}.`);
       }
@@ -172,23 +192,62 @@ router.post('/', async (req, res) => {
 });
 
 router.patch('/:id/approve', async (req, res) => {
+  const session = await mongoose.startSession();
   try {
-    const { action, remarks } = req.body;
-    if (!['approve', 'reject'].includes(action)) throw routeError(422, 'action must be approve or reject.');
-    const transfer = await StockTransfer.findOne({ _id: req.params.id, sourceBranch: req.branchId });
-    if (!transfer) return res.status(404).json({ success: false, message: 'Not found in the active source branch.' });
-    if (transfer.status !== 'requested') throw routeError(409, `Cannot ${action}; status is ${transfer.status}.`);
-
-    transfer.status = action === 'approve' ? 'approved' : 'rejected';
-    transfer.approvedBy = req.user._id;
-    transfer.approvalDate = new Date();
-    if (action === 'approve') transfer.approvalRemarks = remarks || '';
-    else transfer.rejectionReason = remarks || '';
-    await transfer.save();
-    return res.json({ success: true, message: `Transfer ${action}d.`, data: transfer });
+    let transfer;
+    await session.withTransaction(async () => {
+      const { action, remarks } = req.body;
+      if (!['approve', 'reject'].includes(action)) throw routeError(422, 'action must be approve or reject.');
+      transfer = await StockTransfer.findOne({ _id: req.params.id, sourceBranch: req.branchId }).session(session);
+      if (!transfer) throw routeError(404, 'Not found in the active source branch.');
+      if (transfer.status === (action === 'approve' ? 'approved' : 'rejected')) return;
+      if (transfer.status !== 'requested') throw routeError(409, `Cannot ${action}; status is ${transfer.status}.`);
+      if (transfer.requestedBy && String(transfer.requestedBy) === String(req.user._id)) {
+        throw routeError(403, 'Maker-checker violation: the transfer requester cannot approve or reject it.');
+      }
+      const actionedAt = new Date();
+      if (action === 'reject') {
+        transfer.status = 'rejected';
+        transfer.reservationState = 'none';
+        transfer.rejectionReason = String(remarks || '');
+      } else {
+        const version = Number(transfer.reservationVersion || 0) + 1;
+        transfer.reservationState = 'blocking';
+        for (const item of transfer.items) {
+          const snapshot = stableUomSnapshot(item);
+          const enteredQuantity = Number(item.requestedQty || 0);
+          const baseQuantity = enteredQuantity * snapshot.conversionFactor;
+          await applyStockMovement({
+            operationKey: stockOperationKey('stock-transfer', transfer._id, item._id, 'block', version),
+            correlationKey: stockOperationKey('stock-transfer', transfer._id, 'reservation', version),
+            movementType: 'transfer_block', phase: 'reserved',
+            branch: transfer.sourceBranch, product: item.product, warehouse: transfer.fromWarehouse,
+            shade: item.shade || '', batch: item.batch || '', relatedBranch: transfer.destinationBranch, relatedWarehouse: transfer.toWarehouse,
+            deltas: { availableQty: -baseQuantity, blockedQty: baseQuantity },
+            enteredQuantity, ...snapshot, baseQuantity,
+            sourceType: 'StockTransfer', sourceModel: 'StockTransfer', sourceId: transfer._id, sourceLineId: item._id,
+            sourceNumber: transfer.transferNumber, actor: req.user._id, occurredAt: actionedAt,
+            reason: 'Approved transfer stock block', remarks: String(remarks || ''), metadata: { reservationVersion: version },
+            guardMessage: `Insufficient available stock to approve ${item.productName || 'transfer item'}.`,
+          }, { session });
+          item.approvedQty = enteredQuantity;
+          item.blockedQty = enteredQuantity;
+          item.baseQuantity = baseQuantity;
+        }
+        transfer.reservationVersion = version;
+        transfer.reservationState = 'blocked';
+        transfer.reservationPostedAt = actionedAt;
+        transfer.status = 'approved';
+        transfer.approvalRemarks = String(remarks || '');
+      }
+      transfer.approvedBy = req.user._id;
+      transfer.approvalDate = actionedAt;
+      await transfer.save({ session });
+    });
+    return res.json({ success: true, message: `Transfer ${req.body.action === 'approve' ? 'approved and stock blocked' : 'rejected'}.`, data: transfer });
   } catch (error) {
     return res.status(error.status || 500).json({ success: false, message: error.message });
-  }
+  } finally { await session.endSession(); }
 });
 
 router.patch('/:id/dispatch', async (req, res) => {
@@ -199,6 +258,32 @@ router.patch('/:id/dispatch', async (req, res) => {
       transfer = await StockTransfer.findOne({ _id: req.params.id, sourceBranch: req.branchId }).session(session);
       if (!transfer) throw routeError(404, 'Not found in the active source branch.');
       if (transfer.status !== 'approved') throw routeError(409, 'Transfer must be approved first.');
+
+      // Compatibility for approved records created before approval-time blocking existed.
+      if (transfer.reservationState !== 'blocked') {
+        const version = Math.max(1, Number(transfer.reservationVersion || 0));
+        const blockedAt = transfer.approvalDate || new Date();
+        for (const item of transfer.items) {
+          const enteredQuantity = Number(item.approvedQty || item.requestedQty || 0);
+          if (!(enteredQuantity > 0)) continue;
+          const snapshot = stableUomSnapshot(item);
+          const baseQuantity = enteredQuantity * snapshot.conversionFactor;
+          await applyStockMovement({
+            operationKey: stockOperationKey('stock-transfer', transfer._id, item._id, 'block', version),
+            correlationKey: stockOperationKey('stock-transfer', transfer._id, 'reservation', version),
+            movementType: 'transfer_block', phase: 'reserved', branch: transfer.sourceBranch,
+            product: item.product, warehouse: transfer.fromWarehouse, shade: item.shade || '', batch: item.batch || '',
+            relatedBranch: transfer.destinationBranch, relatedWarehouse: transfer.toWarehouse,
+            deltas: { availableQty: -baseQuantity, blockedQty: baseQuantity }, enteredQuantity, ...snapshot, baseQuantity,
+            sourceType: 'StockTransfer', sourceModel: 'StockTransfer', sourceId: transfer._id, sourceLineId: item._id,
+            sourceNumber: transfer.transferNumber, actor: transfer.approvedBy || req.user._id, occurredAt: blockedAt,
+            reason: 'Legacy approved transfer stock block', remarks: transfer.approvalRemarks || '', metadata: { reservationVersion: version, compatibilityBackfill: true },
+            guardMessage: `Insufficient available stock to block legacy approved transfer item ${item.productName || ''}.`,
+          }, { session });
+          item.approvedQty = enteredQuantity; item.blockedQty = enteredQuantity;
+        }
+        transfer.reservationVersion = version; transfer.reservationState = 'blocked'; transfer.reservationPostedAt = blockedAt;
+      }
 
       const submitted = Array.isArray(req.body.items) ? req.body.items : null;
       if (submitted) {
@@ -212,20 +297,20 @@ router.patch('/:id/dispatch', async (req, res) => {
           const item = transfer.items.id(id);
           if (!item) throw routeError(422, `Dispatch item ${index + 1} is not part of this transfer.`);
           const quantity = Number(update.dispatchedQty);
-          if (!Number.isFinite(quantity) || quantity < 0 || quantity > Number(item.requestedQty)) {
-            throw routeError(422, `items[${index}].dispatchedQty must be between zero and requestedQty.`);
+          if (!Number.isFinite(quantity) || quantity < 0 || quantity > Number(item.approvedQty || item.requestedQty)) {
+            throw routeError(422, `items[${index}].dispatchedQty must be between zero and approvedQty.`);
           }
           item.dispatchedQty = quantity;
         }
       } else {
-        transfer.items.forEach((item) => { item.dispatchedQty = Number(item.requestedQty); });
+        transfer.items.forEach((item) => { item.dispatchedQty = Number(item.approvedQty || item.requestedQty); });
       }
 
       const requirements = new Map();
       for (const item of transfer.items) {
         const quantity = Number(item.dispatchedQty);
-        if (!Number.isFinite(quantity) || quantity < 0 || quantity > Number(item.requestedQty)) {
-          throw routeError(422, 'Every dispatched quantity must be finite, nonnegative, and no greater than requested quantity.');
+        if (!Number.isFinite(quantity) || quantity < 0 || quantity > Number(item.approvedQty || item.requestedQty)) {
+          throw routeError(422, 'Every dispatched quantity must be finite, nonnegative, and no greater than approved quantity.');
         }
         if (quantity === 0) continue;
         const key = stockKey(transfer.sourceBranch, item.product, transfer.fromWarehouse, item.shade, item.batch);
@@ -235,30 +320,64 @@ router.patch('/:id/dispatch', async (req, res) => {
       const totalDispatched = [...requirements.values()].reduce((sum, item) => sum + item.quantity, 0);
       if (totalDispatched <= 0) throw routeError(422, 'At least one item must have a dispatched quantity greater than zero.');
 
-      for (const { item, quantity } of requirements.values()) {
-        const deducted = await Stock.findOneAndUpdate(
-          {
-            branch: transfer.sourceBranch,
-            product: item.product,
-            warehouse: transfer.fromWarehouse,
-            shade: item.shade || '',
-            batch: item.batch || '',
-            totalQty: { $gte: quantity },
-            availableQty: { $gte: quantity },
-          },
-          { $inc: { availableQty: -quantity, transitQty: quantity } },
-          { new: true, session }
-        );
-        if (!deducted) throw routeError(409, `Insufficient stock for ${item.productName || 'transfer item'}.`);
+      const dispatchedAt = new Date();
+      for (const item of transfer.items) {
+        const quantity = Number(item.dispatchedQty || 0);
+        if (quantity <= 0) continue;
+        const snapshot = stableUomSnapshot(item);
+        const baseQuantity = quantity * snapshot.conversionFactor;
+        await applyStockMovement({
+          operationKey: stockOperationKey('stock-transfer', transfer._id, item._id, 'dispatch-source'),
+          correlationKey: stockOperationKey('stock-transfer', transfer._id),
+          movementType: 'transfer_dispatch', phase: 'dispatched',
+          branch: transfer.sourceBranch, product: item.product, warehouse: transfer.fromWarehouse, shade: item.shade || '', batch: item.batch || '',
+          relatedBranch: transfer.destinationBranch, relatedWarehouse: transfer.toWarehouse,
+          deltas: { blockedQty: -baseQuantity, transitQty: baseQuantity },
+          enteredQuantity: quantity, ...snapshot, baseQuantity,
+          sourceType: 'StockTransfer', sourceModel: 'StockTransfer', sourceId: transfer._id, sourceLineId: item._id,
+          sourceNumber: transfer.transferNumber, actor: req.user._id, occurredAt: dispatchedAt,
+          reason: 'Canonical stock transfer dispatch', remarks: req.body.remarks || '',
+          metadata: { leg: 'source_dispatch', requestedQty: item.requestedQty, transferType: transfer.transferType },
+          guardMessage: `Insufficient stock for ${item.productName || 'transfer item'}.`,
+        }, { session });
+      }
+
+      for (const item of transfer.items) {
+        const approvedQty = Number(item.approvedQty || item.requestedQty || 0);
+        const dispatchedQty = Number(item.dispatchedQty || 0);
+        const unusedQty = Math.max(0, approvedQty - dispatchedQty);
+        const snapshot = stableUomSnapshot(item);
+        if (unusedQty > 0) {
+          const baseQuantity = unusedQty * snapshot.conversionFactor;
+          await applyStockMovement({
+            operationKey: stockOperationKey('stock-transfer', transfer._id, item._id, 'block-release', transfer.reservationVersion || 1),
+            correlationKey: stockOperationKey('stock-transfer', transfer._id),
+            movementType: 'transfer_block_release', phase: 'released',
+            branch: transfer.sourceBranch, product: item.product, warehouse: transfer.fromWarehouse,
+            shade: item.shade || '', batch: item.batch || '', relatedBranch: transfer.destinationBranch, relatedWarehouse: transfer.toWarehouse,
+            deltas: { blockedQty: -baseQuantity, availableQty: baseQuantity },
+            enteredQuantity: unusedQty, ...snapshot, baseQuantity,
+            sourceType: 'StockTransfer', sourceModel: 'StockTransfer', sourceId: transfer._id, sourceLineId: item._id,
+            sourceNumber: transfer.transferNumber, actor: req.user._id, occurredAt: dispatchedAt,
+            reason: 'Partial transfer dispatch released unused approved stock', remarks: req.body.remarks || '',
+            metadata: { approvedQty, dispatchedQty, releasedQty: unusedQty },
+            guardMessage: `Blocked transfer stock changed for ${item.productName || 'transfer item'}.`,
+          }, { session });
+        }
+        item.cancelledQty = unusedQty;
+        item.releasedQty = unusedQty;
+        item.blockedQty = 0;
       }
 
       transfer.status = 'in_transit';
       transfer.dispatchedBy = req.user._id;
-      transfer.dispatchDate = new Date();
+      transfer.dispatchDate = dispatchedAt;
       transfer.vehicleNumber = req.body.vehicleNumber || '';
       transfer.driverName = req.body.driverName || '';
       transfer.driverPhone = req.body.driverPhone || '';
       transfer.totalDispatchedQty = totalDispatched;
+      transfer.reservationState = 'consumed';
+      transfer.reservationReleasedAt = transfer.items.some(item => Number(item.releasedQty || 0) > 0) ? dispatchedAt : undefined;
       await transfer.save({ session });
     });
     return res.json({ success: true, message: 'Transfer dispatched.', data: transfer });
@@ -281,11 +400,23 @@ router.patch('/:id/receive', async (req, res) => {
       const submitted = Array.isArray(req.body.items) ? req.body.items : null;
       if (submitted) {
         const seen = new Set();
+        const expectedIds = new Set(transfer.items.filter(item => Number(item.dispatchedQty || 0) > 0).map(item => String(item._id)));
+        for (let index = 0; index < submitted.length; index += 1) {
+          const id = String(submitted[index]?._id || '');
+          if (!id || seen.has(id)) throw routeError(422, 'Receipt items must reference every dispatched transfer line exactly once.');
+          if (!expectedIds.has(id)) throw routeError(422, `Receipt item ${index + 1} is extra or was not dispatched.`);
+          seen.add(id);
+        }
+        const missing = [...expectedIds].filter(id => !seen.has(id));
+        if (missing.length || seen.size !== expectedIds.size) {
+          throw routeError(422, `Receipt items must include every dispatched transfer line exactly once. Missing: ${missing.join(', ') || 'none'}.`);
+        }
         transfer.items.forEach((item) => {
           item.receivedQty = 0;
           item.damagedQty = 0;
           item.shortQty = Number(item.dispatchedQty);
         });
+        seen.clear();
         for (let index = 0; index < submitted.length; index += 1) {
           const update = submitted[index];
           const id = String(update._id || '');
@@ -312,73 +443,57 @@ router.patch('/:id/receive', async (req, res) => {
         });
       }
 
-      const sourceClosures = new Map();
+      const receivedAt = new Date();
       for (const item of transfer.items) {
         const dispatchedQty = Number(item.dispatchedQty || 0);
         const shortQty = Number(item.shortQty || 0);
         if (dispatchedQty <= 0) continue;
-        const key = stockKey(transfer.sourceBranch, item.product, transfer.fromWarehouse, item.shade, item.batch);
-        const existing = sourceClosures.get(key);
-        sourceClosures.set(key, {
-          item,
-          dispatchedQty: (existing?.dispatchedQty || 0) + dispatchedQty,
-          shortQty: (existing?.shortQty || 0) + shortQty,
-        });
-      }
-      for (const { item, dispatchedQty, shortQty } of sourceClosures.values()) {
-        const closed = await Stock.findOneAndUpdate(
-          {
-            branch: transfer.sourceBranch,
-            product: item.product,
-            warehouse: transfer.fromWarehouse,
-            shade: item.shade || '',
-            batch: item.batch || '',
-            totalQty: { $gte: dispatchedQty },
-            transitQty: { $gte: dispatchedQty },
-          },
-          { $inc: { totalQty: -dispatchedQty, transitQty: -dispatchedQty, shortQty } },
-          { new: true, session }
-        );
-        if (!closed) throw routeError(409, 'In-transit source stock changed before receipt could be posted.');
+        const snapshot = stableUomSnapshot(item);
+        const baseDispatchedQty = dispatchedQty * snapshot.conversionFactor;
+        const baseShortQty = shortQty * snapshot.conversionFactor;
+        await applyStockMovement({
+          operationKey: stockOperationKey('stock-transfer', transfer._id, item._id, 'receive-source-close'),
+          correlationKey: stockOperationKey('stock-transfer', transfer._id),
+          movementType: shortQty > 0 ? 'transfer_short' : 'transfer_receive', phase: 'received',
+          branch: transfer.sourceBranch, product: item.product, warehouse: transfer.fromWarehouse, shade: item.shade || '', batch: item.batch || '',
+          relatedBranch: transfer.destinationBranch, relatedWarehouse: transfer.toWarehouse,
+          deltas: { totalQty: -baseDispatchedQty, transitQty: -baseDispatchedQty, shortQty: baseShortQty },
+          enteredQuantity: dispatchedQty, ...snapshot, baseQuantity: baseDispatchedQty,
+          sourceType: 'StockTransfer', sourceModel: 'StockTransfer', sourceId: transfer._id, sourceLineId: item._id,
+          sourceNumber: transfer.transferNumber, actor: req.user._id, occurredAt: receivedAt,
+          reason: 'Canonical stock transfer source receipt closure', remarks: item.remarks || req.body.remarks || '',
+          metadata: { leg: 'source_close', dispatchedQty, receivedQty: item.receivedQty, damagedQty: item.damagedQty, shortQty },
+          guardMessage: 'In-transit source stock changed before receipt could be posted.',
+        }, { session });
       }
 
-      const additions = new Map();
       for (const item of transfer.items) {
-        const receivedQty = Number(item.receivedQty);
-        const damagedQty = Number(item.damagedQty);
-        if (!Number.isFinite(receivedQty) || receivedQty < 0 || !Number.isFinite(damagedQty) || damagedQty < 0
-          || receivedQty + damagedQty > Number(item.dispatchedQty)) {
-          throw routeError(422, 'Every received and damaged quantity must be finite, nonnegative, and bounded by dispatched quantity.');
-        }
+        const receivedQty = Number(item.receivedQty || 0);
+        const damagedQty = Number(item.damagedQty || 0);
         if (receivedQty === 0 && damagedQty === 0) continue;
-        const key = stockKey(transfer.destinationBranch, item.product, transfer.toWarehouse, item.shade, item.batch);
-        const existing = additions.get(key);
-        additions.set(key, {
-          item,
-          receivedQty: (existing?.receivedQty || 0) + receivedQty,
-          damagedQty: (existing?.damagedQty || 0) + damagedQty,
-        });
-      }
-      for (const { item, receivedQty, damagedQty } of additions.values()) {
-        await Stock.findOneAndUpdate(
-          {
-            branch: transfer.destinationBranch,
-            product: item.product,
-            warehouse: transfer.toWarehouse,
-            shade: item.shade || '',
-            batch: item.batch || '',
-          },
-          {
-            $inc: { availableQty: receivedQty, totalQty: receivedQty + damagedQty, damagedQty },
-            $set: { branch: transfer.destinationBranch },
-          },
-          { upsert: true, new: true, session }
-        );
+        const snapshot = stableUomSnapshot(item);
+        const enteredQuantity = receivedQty + damagedQty;
+        const baseQuantity = enteredQuantity * snapshot.conversionFactor;
+        const baseReceivedQty = receivedQty * snapshot.conversionFactor;
+        const baseDamagedQty = damagedQty * snapshot.conversionFactor;
+        await applyStockMovement({
+          operationKey: stockOperationKey('stock-transfer', transfer._id, item._id, 'receive-destination'),
+          correlationKey: stockOperationKey('stock-transfer', transfer._id),
+          movementType: 'transfer_receive', phase: 'received',
+          branch: transfer.destinationBranch, product: item.product, warehouse: transfer.toWarehouse, shade: item.shade || '', batch: item.batch || '',
+          relatedBranch: transfer.sourceBranch, relatedWarehouse: transfer.fromWarehouse,
+          deltas: { availableQty: baseReceivedQty, totalQty: baseQuantity, damagedQty: baseDamagedQty }, upsert: true,
+          enteredQuantity, ...snapshot, baseQuantity,
+          sourceType: 'StockTransfer', sourceModel: 'StockTransfer', sourceId: transfer._id, sourceLineId: item._id,
+          sourceNumber: transfer.transferNumber, actor: req.user._id, occurredAt: receivedAt,
+          reason: 'Canonical stock transfer destination receipt', remarks: item.remarks || req.body.remarks || '',
+          metadata: { leg: 'destination_receive', dispatchedQty: item.dispatchedQty, receivedQty, damagedQty, shortQty: item.shortQty },
+        }, { session });
       }
 
       transfer.status = 'completed';
       transfer.receivedBy = req.user._id;
-      transfer.receivedDate = new Date();
+      transfer.receivedDate = receivedAt;
       transfer.receivingRemarks = req.body.remarks || '';
       transfer.totalReceivedQty = transfer.items.reduce((sum, item) => sum + Number(item.receivedQty || 0), 0);
       await transfer.save({ session });
@@ -392,19 +507,51 @@ router.patch('/:id/receive', async (req, res) => {
 });
 
 router.patch('/:id/cancel', async (req, res) => {
+  const session = await mongoose.startSession();
   try {
-    const transfer = await StockTransfer.findOne({ _id: req.params.id, sourceBranch: req.branchId });
-    if (!transfer) return res.status(404).json({ success: false, message: 'Not found in the active source branch.' });
-    if (transfer.status === 'cancelled') return res.json({ success: true, message: 'Transfer is already cancelled.', data: transfer });
-    if (!['requested', 'approved'].includes(transfer.status)) {
-      throw routeError(409, `Cannot cancel a transfer in ${transfer.status} status without reversing stock.`);
-    }
-    transfer.status = 'cancelled';
-    await transfer.save();
-    return res.json({ success: true, message: 'Transfer cancelled.', data: transfer });
+    let transfer;
+    await session.withTransaction(async () => {
+      transfer = await StockTransfer.findOne({ _id: req.params.id, sourceBranch: req.branchId }).session(session);
+      if (!transfer) throw routeError(404, 'Not found in the active source branch.');
+      if (transfer.status === 'cancelled') return;
+      if (!['requested', 'approved'].includes(transfer.status)) {
+        throw routeError(409, `Cannot cancel a transfer in ${transfer.status} status without a dispatch-return workflow.`);
+      }
+      const cancelledAt = new Date();
+      if (transfer.status === 'approved') {
+        for (const item of transfer.items) {
+          const blockedQty = Number(item.blockedQty || item.approvedQty || 0);
+          if (!(blockedQty > 0)) continue;
+          const snapshot = stableUomSnapshot(item);
+          const baseQuantity = blockedQty * snapshot.conversionFactor;
+          await applyStockMovement({
+            operationKey: stockOperationKey('stock-transfer', transfer._id, item._id, 'cancel-block-release', transfer.reservationVersion || 1),
+            correlationKey: stockOperationKey('stock-transfer', transfer._id, 'cancel'),
+            movementType: 'transfer_block_release', phase: 'released',
+            branch: transfer.sourceBranch, product: item.product, warehouse: transfer.fromWarehouse,
+            shade: item.shade || '', batch: item.batch || '', relatedBranch: transfer.destinationBranch, relatedWarehouse: transfer.toWarehouse,
+            deltas: { blockedQty: -baseQuantity, availableQty: baseQuantity },
+            enteredQuantity: blockedQty, ...snapshot, baseQuantity,
+            sourceType: 'StockTransfer', sourceModel: 'StockTransfer', sourceId: transfer._id, sourceLineId: item._id,
+            sourceNumber: transfer.transferNumber, actor: req.user._id, occurredAt: cancelledAt,
+            reason: String(req.body.reason || 'Approved transfer cancelled'),
+            guardMessage: `Blocked transfer stock changed for ${item.productName || 'transfer item'}.`,
+          }, { session });
+          item.cancelledQty = blockedQty;
+          item.releasedQty = blockedQty;
+          item.blockedQty = 0;
+        }
+        transfer.reservationState = 'released';
+        transfer.reservationReleasedAt = cancelledAt;
+      }
+      transfer.status = 'cancelled';
+      transfer.remarks = String(req.body.reason || transfer.remarks || '');
+      await transfer.save({ session });
+    });
+    return res.json({ success: true, message: 'Transfer cancelled; any approved stock block was released.', data: transfer });
   } catch (error) {
     return res.status(error.status || 500).json({ success: false, message: error.message });
-  }
+  } finally { await session.endSession(); }
 });
 
 export default router;

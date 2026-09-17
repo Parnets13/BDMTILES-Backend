@@ -46,7 +46,6 @@ const voucherSchema = new mongoose.Schema(
   { timestamps: true }
 );
 
-voucherSchema.index({ voucherNumber: 1 });
 voucherSchema.index({ voucherDate: -1, voucherType: 1 });
 
 export default mongoose.model('Voucher', voucherSchema);
