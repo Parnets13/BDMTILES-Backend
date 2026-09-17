@@ -23,17 +23,26 @@ router.use(protect);
 router.use(requireBranch);
 
 const requireSalesOrderStatusPermission = (req, res, next) =>
-  requirePermission('sales.order.create')(req, res, next);
+  requireAnyPermission(['sales.order.create', 'sales.order.dashboard', 'dispatch.management'])(req, res, next);
 
 const SALES_ORDER_STATUSES = new Set([
   'draft', 'confirmed', 'approved', 'processing', 'partial_dispatch',
   'dispatched', 'delivered', 'cancelled', 'expired',
 ]);
+const DIRECT_STATUS_FLOW = [
+  'draft', 'confirmed', 'approved', 'processing',
+  'partial_dispatch', 'dispatched', 'delivered',
+];
 const USER_STATUS_TRANSITIONS = {
-  draft: new Set(['confirmed', 'cancelled']), confirmed: new Set([]),
-  approved: new Set([]), processing: new Set([]),
-  partial_dispatch: new Set([]), dispatched: new Set([]), delivered: new Set([]),
-  cancelled: new Set([]), expired: new Set([]),
+  draft: new Set(['confirmed', 'cancelled']),
+  confirmed: new Set(['approved', 'processing', 'dispatched', 'delivered', 'cancelled']),
+  approved: new Set(['processing', 'dispatched', 'delivered', 'cancelled']),
+  processing: new Set(['partial_dispatch', 'dispatched', 'delivered', 'cancelled']),
+  partial_dispatch: new Set(['dispatched', 'delivered', 'cancelled']),
+  dispatched: new Set(['delivered', 'cancelled']),
+  delivered: new Set([]),
+  cancelled: new Set([]),
+  expired: new Set([]),
 };
 const SERVER_MANAGED_ORDER_FIELDS = new Set([
   'orderNumber', 'branch', 'legacyBranch', 'createdBy', 'status', 'paymentStatus',
@@ -136,6 +145,7 @@ router.get('/', requirePermission('sales.order.dashboard'), async (req, res) => 
     const {
       page = 1, limit = 20, search, status, dealer, customerName, customer,
       product, category, region, deliveryStatus, paymentStatus, dateFrom, dateTo, salesExecutive,
+      orderType,
     } = req.query;
     const p = Math.max(1, Number.parseInt(page, 10) || 1);
     const l = Math.min(100, Number.parseInt(limit, 10) || 20);
@@ -153,6 +163,22 @@ router.get('/', requirePermission('sales.order.dashboard'), async (req, res) => 
     addTextCondition(customer, ['customerName', 'dealerName', 'dealerCode']);
     if (status) filter.status = status;
     if (dealer) conditions.push({ dealer });
+    if (orderType) {
+      if (orderType === 'online') {
+        conditions.push({
+          $or: [
+            { orderType: 'online' },
+            {
+              orderType: { $in: [null, 'retail'] },
+              customerName: { $exists: true, $ne: '' },
+              dealer: { $in: [null, undefined] },
+            },
+          ],
+        });
+      } else {
+        filter.orderType = orderType;
+      }
+    }
     if (paymentStatus) filter.paymentStatus = paymentStatus;
     if (salesExecutive) filter.salesExecutive = salesExecutive;
     if (product) conditions.push({ 'items.product': product });

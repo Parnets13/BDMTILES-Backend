@@ -4,6 +4,7 @@ import SalesOrder from '../../models/SalesOrder.js';
 import Product from '../../models/Product.js';
 import Customer from '../../models/Customer.js';
 import Delivery from '../../models/Delivery.js';
+import Warehouse from '../../models/Warehouse.js';
 import { deriveOrderPricing } from '../../services/orderPricingService.js';
 import { generateBranchNumber } from '../../utils/branchSequence.js';
 import { reserveSalesOrderInventory } from '../../utils/salesOrderInventory.js';
@@ -96,6 +97,19 @@ router.post('/', async (req, res) => {
       // Online orders never need staff pricing approval; drop any below-minimum flags.
       const orderNumber = await generateBranchNumber(branchId, 'salesOrder', new Date(), { session });
 
+      // Auto-assign the default (first active) warehouse for the online branch to any
+      // item that has no warehouse set — customers don't pick a warehouse.
+      const defaultWarehouse = await Warehouse.findOne({ branch: branchId, status: 'active' })
+        .sort({ type: 1, createdAt: 1 }) // prefer 'main' type first (alphabetically 'main' < 'transit')
+        .select('_id')
+        .session(session)
+        .lean();
+      if (defaultWarehouse) {
+        priced.items.forEach((item) => {
+          if (!item.warehouse) item.warehouse = defaultWarehouse._id;
+        });
+      }
+
       [order] = await SalesOrder.create([{
         orderNumber,
         branch: branchId,
@@ -125,7 +139,16 @@ router.post('/', async (req, res) => {
       }], { session });
 
       // Reserve inventory exactly like a confirmed CRM order.
-      await reserveSalesOrderInventory(order, { session });
+      // For online orders: if no warehouse exists or stock is insufficient,
+      // log the issue but don't block the order — staff will manage fulfilment.
+      try {
+        if (defaultWarehouse) {
+          await reserveSalesOrderInventory(order, { session });
+        }
+      } catch (stockError) {
+        // Record as partial/pending but don't rollback the order
+        console.warn('[shop/orders] Inventory reservation skipped:', stockError.message);
+      }
 
       // Keep the customer's default delivery address fresh for next time.
       await Customer.updateOne(
@@ -173,7 +196,31 @@ router.get('/', async (req, res) => {
   }
 });
 
-// GET /api/v1/shop/orders/:orderNumber — single order tracking (scoped to this customer)
+// GET /api/v1/shop/orders/by-number?orderNumber=SO/BLR001/...
+// Uses a query param instead of a path param so slashes in the order number don't break routing.
+router.get('/by-number', async (req, res) => {
+  try {
+    const orderNumber = String(req.query.orderNumber || '').trim();
+    if (!orderNumber) return res.status(422).json({ success: false, message: 'orderNumber is required.' });
+
+    const order = await SalesOrder.findOne({
+      orderNumber,
+      orderType: 'online',
+      customerPhone: req.customer.contactNumber,
+    }).lean();
+    if (!order) return res.status(404).json({ success: false, message: 'Order not found.' });
+
+    const delivery = await Delivery.findOne({ salesOrder: order._id })
+      .select('status deliveryNumber otp deliveryDate')
+      .lean();
+
+    return res.json({ success: true, data: toTracking(order, delivery) });
+  } catch (error) {
+    return res.status(500).json({ success: false, message: error.message });
+  }
+});
+
+// GET /api/v1/shop/orders/:orderNumber — kept for backward compat (simple IDs without slashes)
 router.get('/:orderNumber', async (req, res) => {
   try {
     const order = await SalesOrder.findOne({

@@ -2,6 +2,8 @@ import { Router } from 'express';
 import mongoose from 'mongoose';
 import Product from '../../models/Product.js';
 import Stock from '../../models/Stock.js';
+import Category from '../../models/Category.js';
+import Brand from '../../models/Brand.js';
 import { getOnlineBranchId } from '../../utils/onlineBranch.js';
 
 const router = Router();
@@ -75,16 +77,56 @@ const toPublic = (p) => {
 };
 
 // GET /api/v1/shop/products
-// query: page, limit, search, category, subcategory, brand, tileSize, finish, tileType, colour, applicationArea, sortBy, order
+// query: page, limit, search, category, categoryName, subcategory, brand, tileSize, finish, tileType, colour, applicationArea, sortBy, order
 router.get('/', async (req, res) => {
   try {
     const page = Math.max(1, parseInt(req.query.page, 10) || 1);
     const limit = Math.min(100, Math.max(1, parseInt(req.query.limit, 10) || 24));
     const filter = { ...ONLY_ONLINE };
 
-    const { search, category, subcategory, brand, tileSize, finish, tileType, colour, applicationArea } = req.query;
-    if (search) filter.$text = { $search: String(search) };
-    if (category && mongoose.isValidObjectId(category)) filter.category = category;
+    const { search, category, categoryName, subcategory, brand, tileSize, finish, tileType, colour, applicationArea } = req.query;
+    const escapeRegex = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+
+    if (search) {
+      const searchStr = String(search).trim();
+      const searchRegex = new RegExp(escapeRegex(searchStr), 'i');
+
+      const [matchedBrands, matchedCats] = await Promise.all([
+        Brand.find({ name: searchRegex, status: 'active' }).select('_id').lean().catch(() => []),
+        Category.find({ name: searchRegex, status: 'active' }).select('_id').lean().catch(() => []),
+      ]);
+
+      const orConditions = [
+        { itemName: searchRegex },
+        { aliasName: searchRegex },
+        { productCode: searchRegex },
+        { tileSize: searchRegex },
+        { colour: searchRegex },
+        { finish: searchRegex },
+        { tileType: searchRegex },
+      ];
+
+      if (matchedBrands.length > 0) {
+        orConditions.push({ brand: { $in: matchedBrands.map(b => b._id) } });
+      }
+      if (matchedCats.length > 0) {
+        orConditions.push({ category: { $in: matchedCats.map(c => c._id) } });
+      }
+
+      filter.$or = orConditions;
+    }
+    if (category && mongoose.isValidObjectId(category)) {
+      filter.category = category;
+    } else if (categoryName) {
+      const catName = String(categoryName).trim();
+      let matchedCats = await Category.find({ name: new RegExp(`^${escapeRegex(catName)}$`, 'i'), status: 'active' }).select('_id').lean();
+      if (matchedCats.length === 0) {
+        matchedCats = await Category.find({ name: new RegExp(escapeRegex(catName), 'i'), status: 'active' }).select('_id').lean();
+      }
+      if (matchedCats.length > 0) {
+        filter.category = { $in: matchedCats.map(c => c._id) };
+      }
+    }
     if (subcategory && mongoose.isValidObjectId(subcategory)) filter.subcategory = subcategory;
     if (brand && mongoose.isValidObjectId(brand)) filter.brand = brand;
     if (tileSize) filter.tileSize = String(tileSize);

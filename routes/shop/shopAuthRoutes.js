@@ -54,10 +54,15 @@ router.post('/verify-otp', async (req, res) => {
     let customer = await Customer.findOne({ contactNumber: phone, status: 'active' })
       .sort({ updatedAt: -1 });
     if (!customer) {
+      // New customer — save all registration fields provided
+      const validTypes = ['retail', 'builder', 'architect', 'contractor', 'interior_designer', 'other'];
+      const customerType = validTypes.includes(req.body?.customerType) ? req.body.customerType : 'retail';
       customer = await Customer.create({
         name: String(req.body?.name || '').trim() || `Customer ${phone.slice(-4)}`,
         contactNumber: phone,
-        customerType: 'retail',
+        email: String(req.body?.email || '').trim().toLowerCase() || '',
+        city: String(req.body?.city || '').trim() || '',
+        customerType,
         source: 'online',
         status: 'active',
       });
@@ -86,7 +91,7 @@ router.get('/me', protectCustomer, (req, res) => {
 // PUT /api/v1/shop/auth/profile  — update name/email/address for the logged-in customer
 router.put('/profile', protectCustomer, async (req, res) => {
   try {
-    const editable = ['name', 'email', 'whatsappNumber', 'city', 'state', 'pinCode', 'billingAddress', 'deliveryAddress'];
+    const editable = ['name', 'email', 'whatsappNumber', 'city', 'state', 'pinCode', 'billingAddress', 'deliveryAddress', 'customerType'];
     const update = {};
     for (const key of editable) {
       if (req.body?.[key] !== undefined) update[key] = String(req.body[key]).trim();

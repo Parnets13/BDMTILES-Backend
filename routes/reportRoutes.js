@@ -97,8 +97,16 @@ router.get('/sales', requirePermission('reports.sales'), async (req, res) => {
       ]),
       SalesOrder.aggregate([
         { $match: match },
-        { $group: { _id: '$dealer', dealerName: { $first: '$dealerName' }, revenue: { $sum: '$grandTotal' }, orders: { $sum: 1 } } },
-        { $sort: { revenue: -1 } }, { $limit: 10 },
+        {
+          $group: {
+            _id: { $ifNull: ['$dealer', '$customerName'] },
+            dealerName: { $first: { $ifNull: ['$dealerName', '$customerName'] } },
+            revenue: { $sum: '$grandTotal' },
+            orders: { $sum: 1 },
+          },
+        },
+        { $sort: { revenue: -1 } },
+        { $limit: 10 },
       ]),
       SalesOrder.aggregate([
         { $match: match }, { $unwind: '$items' },
@@ -315,7 +323,7 @@ router.get('/profit', requirePermission('reports.sales'), async (req, res) => {
           _id: '$_id',
           orderNumber: { $first: '$orderNumber' },
           orderDate: { $first: '$orderDate' },
-          dealerName: { $first: '$dealerName' },
+          dealerName: { $first: { $ifNull: ['$dealerName', '$customerName'] } },
           revenue: { $sum: '$items.taxableAmount' },
           estimatedCost: { $sum: { $multiply: ['$items.quantity', { $ifNull: [{ $first: '$stockInfo.purchaseRate' }, 0] }] } },
         },
@@ -370,14 +378,20 @@ router.get('/dealer-performance', requirePermission('reports.sales'), async (req
 
     const dealerData = await SalesOrder.aggregate([
       { $match: match },
-      { $group: {
-        _id: '$dealer',
-        dealerName: { $first: '$dealerName' }, dealerCode: { $first: '$dealerCode' },
-        revenue: { $sum: '$grandTotal' }, orders: { $sum: 1 },
-        avgOrderValue: { $avg: '$grandTotal' }, paidAmount: { $sum: '$advanceAmount' },
-        balanceAmount: { $sum: '$balanceAmount' },
-      }},
-      { $sort: { revenue: -1 } }, { $limit: 30 },
+      {
+        $group: {
+          _id: { $ifNull: ['$dealer', '$customerName'] },
+          dealerName: { $first: { $ifNull: ['$dealerName', '$customerName'] } },
+          dealerCode: { $first: { $ifNull: ['$dealerCode', '$customerPhone'] } },
+          revenue: { $sum: '$grandTotal' },
+          orders: { $sum: 1 },
+          avgOrderValue: { $avg: '$grandTotal' },
+          paidAmount: { $sum: '$advanceAmount' },
+          balanceAmount: { $sum: '$balanceAmount' },
+        },
+      },
+      { $sort: { revenue: -1 } },
+      { $limit: 30 },
     ]);
 
     res.json({ success: true, data: dealerData });
@@ -455,15 +469,18 @@ router.get('/profitability', requirePermission('reports.sales'), async (req, res
       // Dealer-wise profitability
       SalesOrder.aggregate([
         { $match: match },
-        { $group: {
-          _id: '$dealer',
-          dealerName: { $first: '$dealerName' },
-          dealerCode: { $first: '$dealerCode' },
-          revenue: { $sum: '$grandTotal' },
-          orders: { $sum: 1 },
-          discount: { $sum: '$totalDiscount' },
-        }},
-        { $sort: { revenue: -1 } }, { $limit: 20 },
+        {
+          $group: {
+            _id: { $ifNull: ['$dealer', '$customerName'] },
+            dealerName: { $first: { $ifNull: ['$dealerName', '$customerName'] } },
+            dealerCode: { $first: { $ifNull: ['$dealerCode', '$customerPhone'] } },
+            revenue: { $sum: '$grandTotal' },
+            orders: { $sum: 1 },
+            discount: { $sum: '$totalDiscount' },
+          },
+        },
+        { $sort: { revenue: -1 } },
+        { $limit: 20 },
       ]),
       // Overall summary
       SalesOrder.aggregate([
@@ -496,17 +513,20 @@ router.get('/dealer-performance', requirePermission('reports.sales'), async (req
 
     const dealerPerformance = await SalesOrder.aggregate([
       { $match: match },
-      { $group: {
-        _id: '$dealer',
-        dealerName: { $first: '$dealerName' },
-        dealerCode: { $first: '$dealerCode' },
-        salesValue: { $sum: '$grandTotal' },
-        orderCount: { $sum: 1 },
-        avgOrderValue: { $avg: '$grandTotal' },
-        totalDiscount: { $sum: '$totalDiscount' },
-        firstOrder: { $min: '$orderDate' },
-        lastOrder: { $max: '$orderDate' },
-      }},
+      {
+        $group: {
+          _id: { $ifNull: ['$dealer', '$customerName'] },
+          dealerName: { $first: { $ifNull: ['$dealerName', '$customerName'] } },
+          dealerCode: { $first: { $ifNull: ['$dealerCode', '$customerPhone'] } },
+          salesValue: { $sum: '$grandTotal' },
+          orderCount: { $sum: 1 },
+          avgOrderValue: { $avg: '$grandTotal' },
+          totalDiscount: { $sum: '$totalDiscount' },
+          firstOrder: { $min: '$orderDate' },
+          lastOrder: { $max: '$orderDate' },
+          dealerRef: { $first: '$dealer' },
+        },
+      },
       { $sort: { salesValue: -1 } },
     ]);
 
@@ -521,8 +541,9 @@ router.get('/dealer-performance', requirePermission('reports.sales'), async (req
 
     const enriched = dealerPerformance.map(d => ({
       ...d,
-      collectionValue: paymentMap[String(d._id)] || 0,
-      collectionRatio: d.salesValue > 0 ? Math.round((paymentMap[String(d._id)] || 0) / d.salesValue * 100) : 0,
+      collectionValue: d.dealerRef ? paymentMap[String(d.dealerRef)] || 0 : 0,
+      collectionRatio: d.salesValue > 0 ? Math.round(((d.dealerRef ? paymentMap[String(d.dealerRef)] : 0) || 0) / d.salesValue * 100) : 0,
+      dealerRef: undefined,
     }));
 
     res.json({ success: true, data: enriched });

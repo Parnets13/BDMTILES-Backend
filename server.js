@@ -74,7 +74,20 @@ connectDB();
 app.use(cors({
   credentials: true,
   origin(origin, callback) {
-    if (!origin || allowedOrigins.includes(origin.replace(/\/$/, ''))) return callback(null, true);
+    // React Native doesn't send Origin header, so allow requests without origin
+    if (!origin) {
+      console.log('[CORS] Request without origin header (likely React Native) - ALLOWED');
+      return callback(null, true);
+    }
+    
+    const cleanOrigin = origin.replace(/\/$/, '');
+    if (allowedOrigins.includes(cleanOrigin)) {
+      console.log('[CORS] Origin allowed:', cleanOrigin);
+      return callback(null, true);
+    }
+    
+    console.log('[CORS] Origin blocked:', cleanOrigin);
+    console.log('[CORS] Allowed origins:', allowedOrigins);
     return callback(new Error('Origin is not allowed by CORS.'));
   },
 }));
