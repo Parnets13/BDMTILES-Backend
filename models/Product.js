@@ -6,6 +6,10 @@ const productSchema = new mongoose.Schema(
     itemName: { type: String, required: true, trim: true },
     aliasName: { type: String, trim: true, default: '' },
     description: { type: String, trim: true, default: '' },
+    // Product Details tab content (shown on the website product page)
+    applications: { type: String, trim: true, default: '' }, // newline-separated list or HTML
+    maintenance: { type: String, trim: true, default: '' },
+    disclaimer: { type: String, trim: true, default: '' },
     hsnCode: { type: String, trim: true, default: '' },
     gst: { type: Number, required: true, min: 0, max: 28, default: 18 },
 
@@ -83,12 +87,17 @@ const productSchema = new mongoose.Schema(
     status: { type: String, enum: ['active', 'inactive', 'draft'], default: 'active' },
     isNewArrival: { type: Boolean, default: false },
     isFeatured: { type: Boolean, default: false },
+    isDealOfWeek: { type: Boolean, default: false },  // shown in "Deals of the Week" on the website
     onlineVisible: { type: Boolean, default: true },
     dealerVisible: { type: Boolean, default: true },
 
     // Sales type
     salesType: { type: String, enum: ['Regular Sale', 'CD Sales'], default: 'Regular Sale' },
     productType: { type: String, enum: ['Regular Product', 'AO Product'], default: 'Regular Product' },
+
+    // Storefront ratings (aggregate from reviews; updated when reviews are posted)
+    rating: { type: Number, min: 0, max: 5, default: null },
+    reviewCount: { type: Number, min: 0, default: 0 },
 
     // Tally Integration
     tallyStockItemName: { type: String, trim: true, default: '' },

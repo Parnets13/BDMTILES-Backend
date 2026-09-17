@@ -17,6 +17,10 @@ export const AVAILABLE_PERMISSIONS = {
     { id: "notification.audit", name: "Notification Delivery Audit" },
     { id: "access.policy.manage", name: "Historical Access Policy Management" },
   ],
+  "Web Management": [
+    { id: "webmanagement.manage", name: "Web Management (Storefront CMS)" },
+    { id: "wallet.manage", name: "BDM Cash Wallet Management" },
+  ],
   "Master Management": [
     { id: "product.master", name: "Product Master" },
     { id: "products.create", name: "Create Products" },
@@ -202,7 +206,7 @@ export const ROLE_DEFAULT_PERMISSIONS = {
   owner: ['*'],        // All access — bypasses permission check in middleware
   admin: [
     'dashboard.view', 'system.management', 'users.manage', 'document.management', 'task.management',
-    'notification.inbox',
+    'notification.inbox', 'webmanagement.manage', 'wallet.manage',
     'product.master', 'products.create', 'products.update', 'products.delete',
     'category.setup', 'dealer.master', 'dealer.assignment.manage', 'customer.master', 'dealer.type', 'dealer.category',
     'supplier.master', 'employee.master', 'branch.master', 'warehouse.master', 'vehicle.master',
@@ -232,7 +236,7 @@ export const ROLE_DEFAULT_PERMISSIONS = {
     'asset.management',
   ],
   sub_admin: [
-    'dashboard.view', 'notification.inbox', 'document.management', 'task.management', 'complaint.management', 'product.master', 'category.setup',
+    'dashboard.view', 'notification.inbox', 'webmanagement.manage', 'document.management', 'task.management', 'complaint.management', 'product.master', 'category.setup',
     'dealer.master', 'dealer.assignment.manage', 'supplier.master',
     'quotation.management', 'dealer.discounts',
     'dealer.order_request.review', 'dealer.order_request.approve',

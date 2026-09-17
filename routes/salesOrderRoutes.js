@@ -29,12 +29,23 @@ router.use(protect);
 router.use(requireBranch);
 
 const requireSalesOrderStatusPermission = (req, res, next) =>
-  requirePermission('sales.order.create')(req, res, next);
+  requireAnyPermission(['sales.order.create', 'sales.order.dashboard', 'dispatch.management'])(req, res, next);
 
 const SALES_ORDER_STATUSES = new Set([
   'draft', 'confirmed', 'approved', 'processing', 'partial_dispatch', 'partially_closed',
   'dispatched', 'delivered', 'cancelled', 'expired',
 ]);
+const DIRECT_STATUS_FLOW = [
+  'draft', 'confirmed', 'approved', 'processing',
+  'partial_dispatch', 'dispatched', 'delivered',
+];
+// MERGE NOTE (integration of origin/main):
+// origin/main allowed free-form status jumps here (confirmed -> dispatched, etc.).
+// That path is kept CLOSED deliberately: every transition past `confirmed` also has
+// to move stock, reservations and dispatch records, which only the dedicated
+// endpoints do. Allowing a generic PATCH to set `status` would skip that and leave
+// inventory out of step with the order. Transitions therefore go through their own
+// endpoints, and this map stays locked.
 const USER_STATUS_TRANSITIONS = {
   draft: new Set(['confirmed', 'cancelled']), confirmed: new Set([]),
   approved: new Set([]), processing: new Set([]),
@@ -240,7 +251,23 @@ router.get('/', requirePermission('sales.order.dashboard'), async (req, res) => 
     const reservationValue = enumFilter(reservationStatus, ['none', 'reserving', 'reserved', 'partial', 'released', 'consumed'], 'reservationStatus');
     if (reservationValue) filter.reservationStatus = reservationValue;
     const orderTypeValue = enumFilter(orderType, ['dealer', 'wholesaler', 'retail', 'distributor', 'builder', 'online', 'project'], 'orderType');
-    if (orderTypeValue) filter.orderType = orderTypeValue;
+    if (orderTypeValue === 'online') {
+      // From origin/main: storefront orders are those explicitly marked 'online',
+      // plus legacy rows written before the field existed — retail/unset orderType
+      // carrying a customer name and no dealer. Kept behind enum validation.
+      conditions.push({
+        $or: [
+          { orderType: 'online' },
+          {
+            orderType: { $in: [null, 'retail'] },
+            customerName: { $exists: true, $ne: '' },
+            dealer: { $in: [null, undefined] },
+          },
+        ],
+      });
+    } else if (orderTypeValue) {
+      filter.orderType = orderTypeValue;
+    }
     const priorityValue = enumFilter(deliveryPriority, ['normal', 'urgent', 'vip'], 'deliveryPriority');
     if (priorityValue) filter.deliveryPriority = priorityValue;
     const cancellationValue = enumFilter(cancellationRequestStatus, ['none', 'pending', 'approved', 'rejected'], 'cancellationRequestStatus');

@@ -8,10 +8,14 @@ const uploadRoot = path.join(__dirname, '..', 'uploads');
 const privateUploadRoot = path.join(__dirname, '..', 'private-uploads');
 const productUploadDirectory = path.join(uploadRoot, 'products');
 const complaintUploadDirectory = path.join(uploadRoot, 'complaints');
+const webUploadDirectory = path.join(uploadRoot, 'web');
+const webVideoDirectory = path.join(uploadRoot, 'web-videos');
 export const legacySupplierCreditNoteDirectory = path.join(uploadRoot, 'supplier-credit-notes');
 export const supplierCreditNoteDirectory = path.join(privateUploadRoot, 'supplier-credit-notes');
 fs.mkdirSync(productUploadDirectory, { recursive: true });
 fs.mkdirSync(complaintUploadDirectory, { recursive: true });
+fs.mkdirSync(webUploadDirectory, { recursive: true });
+fs.mkdirSync(webVideoDirectory, { recursive: true });
 fs.mkdirSync(supplierCreditNoteDirectory, { recursive: true });
 
 const storageFor = (directory) => multer.diskStorage({
@@ -23,11 +27,13 @@ const storageFor = (directory) => multer.diskStorage({
 });
 
 const fileFilter = (req, file, cb) => {
-  const allowed = ['image/jpeg', 'image/png', 'image/webp', 'image/gif'];
-  if (allowed.includes(file.mimetype)) {
+  const allowed = ['image/jpeg', 'image/jpg', 'image/png', 'image/webp', 'image/gif', 'image/avif'];
+  const allowedExts = ['.jpg', '.jpeg', '.png', '.webp', '.gif', '.avif'];
+  const ext = path.extname(file.originalname).toLowerCase();
+  if (allowed.includes(file.mimetype) || allowedExts.includes(ext)) {
     cb(null, true);
   } else {
-    cb(new Error('Only JPG, PNG, WEBP images are allowed'), false);
+    cb(new Error(`Unsupported image type: ${file.mimetype} (${ext}). Use JPG, PNG, or WEBP.`), false);
   }
 };
 
@@ -54,6 +60,39 @@ export const uploadComplaintEvidence = multer({
   fileFilter: complaintEvidenceFilter,
   limits: { fileSize: 25 * 1024 * 1024 }, // 25MB covers a short clip
 }).array('images', 10);
+
+// Web Management (storefront CMS) images — hero, banners, categories, testimonials.
+export const uploadWebImages = multer({
+  storage: storageFor(webUploadDirectory),
+  fileFilter,
+  limits: { fileSize: 5 * 1024 * 1024 },
+}).array('images', 10);
+
+// Web Management — video testimonials (MP4, MOV, WEBM, AVI). Max 100 MB per file.
+// We check BOTH mimetype and file extension because browsers/OS sometimes report
+// generic mimetypes (application/octet-stream) for video files.
+const VIDEO_EXTENSIONS = new Set(['.mp4', '.webm', '.mov', '.avi', '.m4v', '.mkv']);
+const VIDEO_MIMETYPES = new Set([
+  'video/mp4', 'video/webm', 'video/quicktime', 'video/x-msvideo',
+  'video/x-matroska', 'video/m4v', 'application/octet-stream',
+]);
+
+const videoFileFilter = (_req, file, cb) => {
+  const ext = path.extname(file.originalname).toLowerCase();
+  const mimeOk = VIDEO_MIMETYPES.has(file.mimetype);
+  const extOk = VIDEO_EXTENSIONS.has(ext);
+  if (mimeOk || extOk) {
+    cb(null, true);
+  } else {
+    cb(new Error(`Unsupported video format. Allowed: MP4, WEBM, MOV, AVI. Got: ${file.mimetype} (${ext})`), false);
+  }
+};
+
+export const uploadWebVideo = multer({
+  storage: storageFor(webVideoDirectory),
+  fileFilter: videoFileFilter,
+  limits: { fileSize: 100 * 1024 * 1024 }, // 100 MB
+}).single('video');
 
 const creditNoteFileFilter = (_req, file, cb) => {
   const allowed = ['application/pdf', 'image/jpeg', 'image/png', 'image/webp'];

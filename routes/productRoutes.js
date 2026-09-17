@@ -18,10 +18,11 @@ router.use(requirePermission('product.master'));
 router.post('/upload-images', (req, res) => {
   uploadProductImages(req, res, (err) => {
     if (err) {
+      console.error('[upload-images] error:', err.message);
       return res.status(400).json({ success: false, message: err.message });
     }
     if (!req.files || req.files.length === 0) {
-      return res.status(400).json({ success: false, message: 'No files uploaded.' });
+      return res.status(400).json({ success: false, message: 'No files uploaded. Make sure the field name is "images" and files are JPG/PNG/WEBP.' });
     }
     const urls = req.files.map(f => `/uploads/products/${f.filename}`);
     res.json({ success: true, message: `${urls.length} image(s) uploaded.`, data: urls });

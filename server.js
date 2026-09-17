@@ -10,6 +10,9 @@ import authRoutes from './routes/authRoutes.js';
 import dealerAuthRoutes from './routes/dealerAuthRoutes.js';
 import dealerAppRoutes from './routes/dealerAppRoutes.js';
 import dealerDownloadRoutes from './routes/dealerDownloadRoutes.js';
+import shopRoutes from './routes/shop/index.js';
+import webManagementRoutes from './routes/webManagementRoutes.js';
+import walletRoutes from './routes/walletRoutes.js';
 import userRoutes from './routes/userRoutes.js';
 import categoryRoutes from './routes/categoryRoutes.js';
 import productRoutes from './routes/productRoutes.js';
@@ -76,7 +79,20 @@ if (process.env.TRUST_PROXY) {
 app.use(cors({
   credentials: true,
   origin(origin, callback) {
-    if (!origin || allowedOrigins.includes(origin.replace(/\/$/, ''))) return callback(null, true);
+    // React Native doesn't send Origin header, so allow requests without origin
+    if (!origin) {
+      console.log('[CORS] Request without origin header (likely React Native) - ALLOWED');
+      return callback(null, true);
+    }
+    
+    const cleanOrigin = origin.replace(/\/$/, '');
+    if (allowedOrigins.includes(cleanOrigin)) {
+      console.log('[CORS] Origin allowed:', cleanOrigin);
+      return callback(null, true);
+    }
+    
+    console.log('[CORS] Origin blocked:', cleanOrigin);
+    console.log('[CORS] Allowed origins:', allowedOrigins);
     return callback(new Error('Origin is not allowed by CORS.'));
   },
 }));
@@ -101,6 +117,9 @@ app.get('/api/v1/health', (req, res) => {
 app.use('/api/v1', autoLogMiddleware);
 
 // Routes
+app.use('/api/v1/shop', shopRoutes); // public customer storefront API
+app.use('/api/v1/web-management', webManagementRoutes); // storefront CMS (staff)
+app.use('/api/v1/wallets', walletRoutes); // customer BDM Cash wallet management
 app.use('/api/v1/auth', authRoutes);
 app.use('/api/v1/dealer-app/auth', dealerAuthRoutes);
 app.use('/api/v1/dealer-app', dealerAppRoutes);
