@@ -2,6 +2,7 @@ import { Router } from 'express';
 import mongoose from 'mongoose';
 import CustomerWallet from '../../models/CustomerWallet.js';
 import WalletTransaction from '../../models/WalletTransaction.js';
+import SalesOrder from '../../models/SalesOrder.js';
 import { protectCustomer } from '../../middleware/customerAuth.js';
 import { getOrCreateWallet, applyWalletTransaction } from '../../services/walletService.js';
 
@@ -37,6 +38,16 @@ router.get('/transactions', async (req, res) => {
       return res.json({ success: true, data: [], pagination: { currentPage: 1, totalPages: 0, totalItems: 0 } });
     }
 
+    const reasonMap = {
+      cashback: 'order_cashback',
+      referral: 'referral',
+      manual_credit: 'top_up',
+      manual_debit: 'adjustment',
+      redemption: 'order_payment',
+      expiry: 'expiry',
+      refund: 'refund',
+    };
+
     const [transactions, total] = await Promise.all([
       WalletTransaction.find({ wallet: wallet._id })
         .sort({ createdAt: -1 })
@@ -46,18 +57,42 @@ router.get('/transactions', async (req, res) => {
       WalletTransaction.countDocuments({ wallet: wallet._id }),
     ]);
 
+    const orderIds = [...new Set(
+      transactions
+        .map(t => t.referenceOrder)
+        .filter(id => id && mongoose.Types.ObjectId.isValid(id))
+        .map(id => new mongoose.Types.ObjectId(id)),
+    )];
+
+    const ordersById = new Map();
+    if (orderIds.length > 0) {
+      const orders = await SalesOrder.find({ _id: { $in: orderIds } })
+        .select('_id orderNumber status')
+        .lean();
+      for (const o of orders) ordersById.set(String(o._id), o);
+    }
+
     res.json({
       success: true,
-      data: transactions.map((t) => ({
-        id: t._id,
-        type: t.type,
-        amount: t.amount,
-        balanceAfter: t.balanceAfter,
-        reason: t.reason,
-        description: t.description || '',
-        referenceOrder: t.referenceOrder || null,
-        createdAt: t.createdAt,
-      })),
+      data: transactions.map((t) => {
+        const order = t.referenceOrder ? ordersById.get(String(t.referenceOrder)) : null;
+        const reason = reasonMap[t.reason] || t.reason;
+        return {
+          _id: String(t._id),
+          id: String(t._id),
+          type: t.type,
+          amount: t.amount,
+          balanceAfter: t.balanceAfter,
+          reason,
+          description: t.description || '',
+          referenceOrder: t.referenceOrder || null,
+          orderNumber: order ? order.orderNumber : undefined,
+          orderStatus: order ? order.status : undefined,
+          status: 'completed',
+          date: t.createdAt,
+          createdAt: t.createdAt,
+        };
+      }),
       pagination: {
         currentPage: page,
         totalPages: Math.ceil(total / limit) || 1,
