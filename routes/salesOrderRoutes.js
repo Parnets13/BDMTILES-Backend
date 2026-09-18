@@ -211,6 +211,7 @@ router.get('/', requirePermission('sales.order.dashboard'), async (req, res) => 
       SalesOrder.find(filter).sort({ createdAt: -1 }).skip((p - 1) * l).limit(l)
         .populate('branch', 'branchCode name').populate('dealer', 'businessName dealerCode mobile city assignedRegion')
         .populate('dealerType', 'name pricingTier').populate('salesExecutive', 'name')
+        .populate('assignedBranch', 'branchCode name').populate('assignedVehicle', 'vehicleNumber vehicleType driverName')
         .populate('sourceQuotation', 'quotationNumber quotationDate validUntil status convertedAt').lean(),
       SalesOrder.countDocuments(filter),
     ]);
@@ -347,6 +348,7 @@ router.get('/:id', requirePermission('sales.order.dashboard'), async (req, res) 
     const order = await SalesOrder.findOne({ _id: req.params.id, branch: req.branchId })
       .populate('dealer', 'businessName dealerCode mobile city creditLimit creditDays currentOutstanding gstin address')
       .populate('dealerType', 'name pricingTier').populate('salesExecutive', 'name phone')
+      .populate('assignedBranch', 'branchCode name').populate('assignedVehicle', 'vehicleNumber vehicleType driverName')
       .populate('sourceQuotation', 'quotationNumber quotationDate validUntil status convertedAt')
       .populate('items.product', 'productCode itemName tileSize finish unit').populate('items.warehouse', 'name').lean();
     if (!order) return res.status(404).json({ success: false, message: 'Order not found.' });
@@ -564,6 +566,96 @@ router.delete('/:id', requirePermission('sales.order.create'), async (req, res) 
     });
     return res.status(result.status || 200).json(result);
   } catch (error) { return res.status(500).json({ success: false, message: error.message }); }
+});
+
+// PATCH /api/v1/sales-orders/:id/assign-branch
+router.patch('/:id/assign-branch', requirePermission('sales.order.create'), async (req, res) => {
+  try {
+    const { branchId } = req.body;
+    if (!branchId || !mongoose.isValidObjectId(branchId)) {
+      return res.status(422).json({ success: false, message: 'Valid branch ID is required.' });
+    }
+
+    const Branch = mongoose.model('Branch');
+    const branch = await Branch.findOne({ _id: branchId, status: 'active' }).lean();
+    if (!branch) {
+      return res.status(404).json({ success: false, message: 'Branch not found or inactive.' });
+    }
+
+    const order = await SalesOrder.findOneAndUpdate(
+      { _id: req.params.id, branch: req.branchId },
+      { 
+        $set: { assignedBranch: branchId },
+        $push: {
+          modificationLogs: {
+            field: 'assignedBranch',
+            newValue: branchId,
+            changedBy: req.user._id,
+            changedAt: new Date(),
+            reason: 'Branch assigned from CRM'
+          }
+        }
+      },
+      { new: true, runValidators: true }
+    ).populate('assignedBranch', 'branchCode name');
+
+    if (!order) {
+      return res.status(404).json({ success: false, message: 'Order not found.' });
+    }
+
+    return res.json({ 
+      success: true, 
+      message: 'Branch assigned successfully.', 
+      data: order 
+    });
+  } catch (error) {
+    return res.status(error.status || 500).json({ success: false, message: error.message });
+  }
+});
+
+// PATCH /api/v1/sales-orders/:id/assign-transport
+router.patch('/:id/assign-transport', requirePermission('sales.order.create'), async (req, res) => {
+  try {
+    const { vehicleId } = req.body;
+    if (!vehicleId || !mongoose.isValidObjectId(vehicleId)) {
+      return res.status(422).json({ success: false, message: 'Valid vehicle ID is required.' });
+    }
+
+    const Vehicle = mongoose.model('Vehicle');
+    const vehicle = await Vehicle.findOne({ _id: vehicleId, isActive: true }).lean();
+    if (!vehicle) {
+      return res.status(404).json({ success: false, message: 'Vehicle not found or inactive.' });
+    }
+
+    const order = await SalesOrder.findOneAndUpdate(
+      { _id: req.params.id, branch: req.branchId },
+      { 
+        $set: { assignedVehicle: vehicleId },
+        $push: {
+          modificationLogs: {
+            field: 'assignedVehicle',
+            newValue: vehicleId,
+            changedBy: req.user._id,
+            changedAt: new Date(),
+            reason: 'Vehicle/Transport assigned from CRM'
+          }
+        }
+      },
+      { new: true, runValidators: true }
+    ).populate('assignedVehicle', 'vehicleNumber vehicleType driverName');
+
+    if (!order) {
+      return res.status(404).json({ success: false, message: 'Order not found.' });
+    }
+
+    return res.json({ 
+      success: true, 
+      message: 'Transport assigned successfully.', 
+      data: order 
+    });
+  } catch (error) {
+    return res.status(error.status || 500).json({ success: false, message: error.message });
+  }
 });
 
 export default router;
