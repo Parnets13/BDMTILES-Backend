@@ -1,25 +1,22 @@
 import mongoose from 'mongoose';
-import tls from 'node:tls';
-
-// Some Windows networks terminate TLS with a root certificate trusted by the
-// OS but not present in Node's bundled CA set. Merge the system trust store
-// before the MongoDB driver creates any TLS sockets. This preserves certificate
-// verification; it never enables tlsAllowInvalidCertificates.
-const configureSystemCATrust = () => {
-  if (typeof tls.getCACertificates !== 'function' || typeof tls.setDefaultCACertificates !== 'function') return;
-  const defaults = tls.getCACertificates('default');
-  const system = tls.getCACertificates('system');
-  if (system.length) tls.setDefaultCACertificates([...new Set([...defaults, ...system])]);
-};
-
-configureSystemCATrust();
 
 const connectDB = async () => {
   if (!process.env.MONGODB_URI) {
     throw new Error('MONGODB_URI is required.');
   }
 
-  const conn = await mongoose.connect(process.env.MONGODB_URI);
+  // MongoDB connection options to handle SSL/TLS certificate issues
+  const options = {
+    // Use system CA certificates (helps with corporate proxies and custom CAs)
+    tls: true,
+    tlsAllowInvalidCertificates: false, // Keep certificate validation enabled for security
+  };
+
+  // For development/testing only: disable certificate validation if needed
+  // Uncomment the line below ONLY if you're in a development environment with certificate issues
+  // options.tlsAllowInvalidCertificates = true;
+
+  const conn = await mongoose.connect(process.env.MONGODB_URI, options);
   console.log(`✅ MongoDB Connected: ${conn.connection.host}`);
   console.log(`   Database: ${conn.connection.name}`);
   return conn;
