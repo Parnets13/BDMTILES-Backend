@@ -2,17 +2,22 @@ import { Router } from 'express';
 import mongoose from 'mongoose';
 import SalesOrder from '../../models/SalesOrder.js';
 import Product from '../../models/Product.js';
+import Stock from '../../models/Stock.js';
 import Customer from '../../models/Customer.js';
 import Delivery from '../../models/Delivery.js';
 import Warehouse from '../../models/Warehouse.js';
 import { deriveOrderPricing } from '../../services/orderPricingService.js';
 import { generateBranchNumber } from '../../utils/branchSequence.js';
-import { reserveSalesOrderInventory } from '../../utils/salesOrderInventory.js';
+import { reserveSalesOrderInventory, QUANTITY_TOLERANCE } from '../../utils/salesOrderInventory.js';
 import { getOnlineBranchId } from '../../utils/onlineBranch.js';
 import { protectCustomer } from '../../middleware/customerAuth.js';
 
 const router = Router();
 router.use(protectCustomer);
+
+// How long an unpaid website order may hold its stock. Two days gives the team
+// time to call and confirm without letting abandoned orders sit on inventory.
+const ONLINE_RESERVATION_TTL_HOURS = Number(process.env.ONLINE_RESERVATION_TTL_HOURS || 48);
 
 // Customer-facing tracking view of a SalesOrder + its Delivery.
 const toTracking = (order, delivery) => ({
@@ -46,6 +51,60 @@ const toTracking = (order, delivery) => ({
       }
     : null,
 });
+
+// A website customer can only order stock that is actually available. The reservation in
+// reserveSalesOrderInventory is the real authority (it moves availableQty -> reservedQty
+// under a guard), but its error names only the product. This pre-check reads the same
+// stock key the reservation will target — branch + warehouse + shade + batch — and reports
+// exactly how much is left, so the storefront can tell the customer what to do.
+const assertOnlineStockAvailable = async (items, { branchId, session }) => {
+  // Aggregate the cart by stock key first: two lines of the same product must be
+  // checked against their combined quantity, not individually.
+  const required = new Map();
+  for (const item of items) {
+    const key = [item.product, item.warehouse, item.shade || '', item.batch || ''].map(String).join('|');
+    const current = required.get(key);
+    if (current) current.quantity += Number(item.quantity || 0);
+    else required.set(key, {
+      product: item.product,
+      warehouse: item.warehouse,
+      shade: item.shade || '',
+      batch: item.batch || '',
+      productName: item.productName || item.productCode || 'item',
+      quantity: Number(item.quantity || 0),
+    });
+  }
+
+  const rows = await Stock.find({
+    branch: branchId,
+    $or: [...required.values()].map(({ product, warehouse, shade, batch }) => ({ product, warehouse, shade, batch })),
+  }).select('product warehouse shade batch availableQty').session(session).lean();
+
+  const availableByKey = new Map(rows.map((row) => [
+    [row.product, row.warehouse, row.shade || '', row.batch || ''].map(String).join('|'),
+    Number(row.availableQty || 0),
+  ]));
+
+  const shortfalls = [];
+  for (const [key, need] of required) {
+    const available = availableByKey.get(key) || 0;
+    if (need.quantity - available > QUANTITY_TOLERANCE) {
+      shortfalls.push({ productName: need.productName, requested: need.quantity, available: Math.max(0, available) });
+    }
+  }
+  if (shortfalls.length) {
+    const detail = shortfalls
+      .map((s) => (s.available > 0
+        ? `${s.productName}: only ${s.available} available (you asked for ${s.requested})`
+        : `${s.productName}: out of stock`))
+      .join('; ');
+    throw Object.assign(new Error(`Some items are no longer available. ${detail}.`), {
+      status: 409,
+      code: 'INSUFFICIENT_STOCK',
+      shortfalls,
+    });
+  }
+};
 
 // POST /api/v1/shop/orders
 // body: { items:[{ productId, quantity(boxes) }], deliveryAddress, name?, notes? }
@@ -84,11 +143,15 @@ router.post('/', async (req, res) => {
         return { product: i.productId, quantity, unit: 'Box' };
       });
 
-      // Reuse the same authoritative pricing engine the CRM uses, with walk-in/online scope.
+      // Reuse the same authoritative pricing engine the CRM uses, with walk-in/online
+      // scope. The website sells at MRP, so the tier is pinned: a walk-in resolution
+      // otherwise lands on retailRate and the customer would be charged something
+      // other than the price they were shown.
       const priced = await deriveOrderPricing({
         branchId,
         scope: 'walk_in',
         orderType: 'online',
+        preferredTier: 'mrp',
         pricingDate: new Date(),
         items,
         session,
@@ -104,11 +167,18 @@ router.post('/', async (req, res) => {
         .select('_id')
         .session(session)
         .lean();
-      if (defaultWarehouse) {
-        priced.items.forEach((item) => {
-          if (!item.warehouse) item.warehouse = defaultWarehouse._id;
-        });
+      if (!defaultWarehouse) {
+        throw Object.assign(new Error('Online ordering is temporarily unavailable. Please try again later.'), { status: 503 });
       }
+      priced.items.forEach((item) => {
+        if (!item.warehouse) item.warehouse = defaultWarehouse._id;
+      });
+
+      // A website customer can only buy what is actually on the shelf. Check availability
+      // up front so the shortfall can be named per item, instead of surfacing the generic
+      // reservation guard error. The reservation below is still the authority — this is
+      // only here to give the customer a useful message.
+      await assertOnlineStockAvailable(priced.items, { branchId, session });
 
       [order] = await SalesOrder.create([{
         orderNumber,
@@ -138,17 +208,19 @@ router.post('/', async (req, res) => {
         tallySyncStatus: 'not_synced',
       }], { session });
 
-      // Reserve inventory exactly like a confirmed CRM order.
-      // For online orders: if no warehouse exists or stock is insufficient,
-      // log the issue but don't block the order — staff will manage fulfilment.
-      try {
-        if (defaultWarehouse) {
-          await reserveSalesOrderInventory(order, { session });
-        }
-      } catch (stockError) {
-        // Record as partial/pending but don't rollback the order
-        console.warn('[shop/orders] Inventory reservation skipped:', stockError.message);
-      }
+      // Reserve inventory exactly like a confirmed CRM order. This must NOT be swallowed:
+      // a website order is a real reservation against real stock, so if it cannot be
+      // reserved the whole transaction aborts and no order is created. Letting the order
+      // through unreserved would sell stock that does not exist and leave the warehouse
+      // holding an order it cannot fulfil.
+      // Nothing is paid up front on a website order, so the reservation gets a
+      // deadline. If the order is not confirmed within it, the expiry sweeper
+      // puts the stock back and cancels the order, otherwise a few abandoned
+      // carts could hold the whole shelf indefinitely.
+      await reserveSalesOrderInventory(order, {
+        session,
+        expiresInHours: ONLINE_RESERVATION_TTL_HOURS,
+      });
 
       // Keep the customer's default delivery address fresh for next time.
       await Customer.updateOne(
@@ -167,6 +239,8 @@ router.post('/', async (req, res) => {
     return res.status(error.status || (['CastError', 'ValidationError'].includes(error.name) ? 422 : 500)).json({
       success: false,
       ...(typeof error.code === 'string' ? { code: error.code } : {}),
+      // Per-item shortfall so the cart can show what to reduce, not just a banner.
+      ...(Array.isArray(error.shortfalls) ? { shortfalls: error.shortfalls } : {}),
       message: error.message,
     });
   } finally {

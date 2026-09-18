@@ -79,6 +79,12 @@ const incentiveSchema = new mongoose.Schema(
     targetValue: { type: Number, default: 0 }, // target amount to achieve
     targetQty: { type: Number, default: 0 },   // target qty to achieve
     bonusOnTarget: { type: Number, default: 0 }, // bonus amount when target met
+    // Which metric targetValue is measured in (SOW 18.7). Absent on rules created
+    // before this field existed — those are read as 'sales'. See targetService.js.
+    targetMetric: {
+      type: String,
+      enum: ['sales', 'orders', 'visits', 'collections'],
+    },
 
     // For 'slab':
     slabs: [slabSchema],

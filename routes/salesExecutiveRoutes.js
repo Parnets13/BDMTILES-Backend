@@ -10,7 +10,6 @@ import Attendance from '../models/Attendance.js';
 import Employee from '../models/Employee.js';
 import HrmsSettings from '../models/HrmsSettings.js';
 import Expense from '../models/Expense.js';
-import Incentive from '../models/Incentive.js';
 import Payment from '../models/Payment.js';
 import Invoice from '../models/Invoice.js';
 import DealerVisit from '../models/DealerVisit.js';
@@ -19,6 +18,7 @@ import { protect, requireAnyPermission, requirePermission } from '../middleware/
 import { requireBranch } from '../utils/branchScope.js';
 import { getDealerCreditExposure } from '../services/dealerCreditService.js';
 import { generateBranchNumber } from '../utils/branchSequence.js';
+import { listMyTargetProgress } from '../services/targetService.js';
 
 const router = Router();
 router.use(protect);
@@ -189,59 +189,19 @@ router.get(
   }
 });
 
+// Reads the same target rules the admin authors through /api/v1/targets, via the
+// shared targetService — so the figure here always matches the admin screen.
+// Unlike the earlier version this covers order-count, visit and collection
+// targets too, not just sales value.
 router.get('/me/target-progress', requirePermission('se.targets.view'), async (req, res) => {
   try {
-    const now = new Date();
-    const rules = await Incentive.find({
-      branch: req.branchId,
-      applicableTo: 'sales_executive',
-      incentiveType: 'target',
-      triggerEvent: { $in: ['monthly_sales', 'quarterly_sales', 'annual_sales'] },
-      status: 'active',
-      targetValue: { $gt: 0 },
-      validFrom: { $lte: now },
-      validTo: { $gte: now },
-      $or: [
-        { specificUsers: req.user._id },
-        { specificUsers: { $size: 0 } },
-        { specificUsers: { $exists: false } },
-      ],
-    }).sort({ validTo: 1, createdAt: -1 }).lean();
-
-    const targets = await Promise.all(rules.map(async (rule) => {
-      const [totals] = await SalesOrder.aggregate([
-        {
-          $match: {
-            branch: req.branchId,
-            salesExecutive: req.user._id,
-            orderDate: { $gte: rule.validFrom, $lte: rule.validTo },
-            status: { $nin: ['draft', 'cancelled'] },
-          },
-        },
-        { $group: { _id: null, achievedAmount: { $sum: '$grandTotal' } } },
-      ]);
-      const targetAmount = round2(rule.targetValue);
-      const achievedAmount = round2(totals?.achievedAmount || 0);
-      return {
-        incentiveId: rule._id,
-        incentiveName: rule.incentiveName,
-        triggerEvent: rule.triggerEvent,
-        period: rule.period,
-        periodStart: rule.validFrom,
-        periodEnd: rule.validTo,
-        targetAmount,
-        achievedAmount,
-        remainingAmount: round2(Math.max(0, targetAmount - achievedAmount)),
-        progressPercent: targetAmount > 0
-          ? round2((achievedAmount / targetAmount) * 100)
-          : 0,
-        isAchieved: achievedAmount >= targetAmount,
-      };
-    }));
-
+    const targets = await listMyTargetProgress({
+      branchId: req.branchId,
+      executiveId: req.user._id,
+    });
     return res.json({ success: true, data: { targets } });
   } catch (error) {
-    return res.status(500).json({ success: false, message: error.message });
+    return res.status(error.status || 500).json({ success: false, message: error.message });
   }
 });
 
@@ -902,6 +862,121 @@ router.patch('/me/visits/:id/check-out', requirePermission('se.route.plan'), asy
     return res.json({ success: true, message: 'Checked out.', data: visitView(visit.toObject()) });
   } catch (error) {
     return res.status(error.name === 'ValidationError' ? 422 : 500).json({ success: false, message: error.message });
+  }
+});
+
+// ── Dealer visits, admin monitoring view (SOW 18.10) ─────────────────────────
+// The /me/visits endpoints above are scoped to the signed-in executive, so back
+// office staff see nothing through them. These give a branch-wide log of the
+// visits the app records. Read-only by design: a visit is field evidence and is
+// only ever written by the executive who made it.
+
+const VISIT_STATUSES = ['checked_in', 'completed', 'cancelled'];
+
+/** Inclusive day window from optional from/to query dates, in local time. */
+function visitDateWindow({ from, to }) {
+  const window = {};
+  if (from) {
+    const start = new Date(from);
+    if (!Number.isNaN(start.getTime())) {
+      start.setHours(0, 0, 0, 0);
+      window.$gte = start;
+    }
+  }
+  if (to) {
+    const end = new Date(to);
+    if (!Number.isNaN(end.getTime())) {
+      end.setHours(23, 59, 59, 999);
+      window.$lte = end;
+    }
+  }
+  return Object.keys(window).length ? window : null;
+}
+
+/**
+ * Ids are cast explicitly here because this filter is fed to `aggregate()` as
+ * well as `find()`. Query helpers cast strings against the schema; the aggregation
+ * pipeline does not, so a raw string id in `$match` silently matches nothing.
+ */
+const asObjectId = (value) => new mongoose.Types.ObjectId(String(value));
+
+function buildVisitFilter(req) {
+  const filter = { branch: asObjectId(req.branchId) };
+  if (mongoose.isValidObjectId(req.query.salesExecutive)) filter.salesExecutive = asObjectId(req.query.salesExecutive);
+  if (mongoose.isValidObjectId(req.query.dealer)) filter.dealer = asObjectId(req.query.dealer);
+  if (VISIT_STATUSES.includes(String(req.query.status))) filter.status = req.query.status;
+  if (VISIT_PURPOSES.has(String(req.query.purpose))) filter.purpose = req.query.purpose;
+  const window = visitDateWindow(req.query);
+  if (window) filter.checkInAt = window;
+  return filter;
+}
+
+router.get('/visits', requirePermission('se.attendance.view'), async (req, res) => {
+  try {
+    const p = Math.max(1, Number.parseInt(req.query.page, 10) || 1);
+    const l = Math.min(200, Math.max(1, Number.parseInt(req.query.limit, 10) || 50));
+    const filter = buildVisitFilter(req);
+
+    const [rows, total] = await Promise.all([
+      DealerVisit.find(filter).sort({ checkInAt: -1 }).skip((p - 1) * l).limit(l)
+        .populate('dealer', 'businessName dealerCode city mobile')
+        .populate('salesExecutive', 'name phone')
+        .lean(),
+      DealerVisit.countDocuments(filter),
+    ]);
+
+    return res.json({
+      success: true,
+      data: rows.map((visit) => ({
+        ...visitView(visit),
+        salesExecutive: visit.salesExecutive || null,
+        dealerCode: visit.dealer?.dealerCode || '',
+        dealerCity: visit.dealer?.city || '',
+        dealerMobile: visit.dealer?.mobile || '',
+      })),
+      pagination: {
+        currentPage: p, totalPages: Math.ceil(total / l), totalItems: total,
+        itemsPerPage: l, hasMore: p * l < total,
+      },
+    });
+  } catch (error) {
+    return res.status(500).json({ success: false, message: error.message });
+  }
+});
+
+router.get('/visits/summary', requirePermission('se.attendance.view'), async (req, res) => {
+  try {
+    const filter = buildVisitFilter(req);
+    const startOfToday = new Date();
+    startOfToday.setHours(0, 0, 0, 0);
+
+    const [byStatus, byPurpose, today, duration, executives] = await Promise.all([
+      DealerVisit.aggregate([{ $match: filter }, { $group: { _id: '$status', count: { $sum: 1 } } }]),
+      DealerVisit.aggregate([{ $match: filter }, { $group: { _id: '$purpose', count: { $sum: 1 } } }]),
+      DealerVisit.countDocuments({ ...filter, checkInAt: { ...(filter.checkInAt || {}), $gte: startOfToday } }),
+      DealerVisit.aggregate([
+        { $match: { ...filter, status: 'completed' } },
+        { $group: { _id: null, avgMinutes: { $avg: '$durationMinutes' } } },
+      ]),
+      DealerVisit.distinct('salesExecutive', filter),
+    ]);
+
+    const statusCounts = Object.fromEntries(byStatus.map((row) => [row._id, row.count]));
+    return res.json({
+      success: true,
+      data: {
+        total: byStatus.reduce((sum, row) => sum + row.count, 0),
+        checkedIn: statusCounts.checked_in || 0,
+        completed: statusCounts.completed || 0,
+        cancelled: statusCounts.cancelled || 0,
+        today,
+        activeExecutives: executives.filter(Boolean).length,
+        avgDurationMinutes: Math.round(duration[0]?.avgMinutes || 0),
+        byPurpose: Object.fromEntries(byPurpose.map((row) => [row._id, row.count])),
+      },
+    });
+  } catch (error) {
+    return res.status(500).json({ success: false, message: error.message });
   }
 });
 

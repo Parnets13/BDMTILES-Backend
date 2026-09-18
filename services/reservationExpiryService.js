@@ -5,11 +5,29 @@ import { releaseSalesOrderInventory, QUANTITY_TOLERANCE } from '../utils/salesOr
 
 const unsafePickStatuses = ['in_progress', 'picked', 'verified', 'sorted', 'packed', 'ready_for_dispatch', 'loaded'];
 
+/**
+ * Which reservations this sweeper is allowed to release.
+ *
+ * Two intended cases, spelled out rather than inferred from the presence of an
+ * expiry date, so an order that picked one up for some other reason is never
+ * swept by accident:
+ *   - orders held while they wait for pricing approval (the original behaviour)
+ *   - unpaid online orders, which reserve stock the moment the customer checks
+ *     out and would otherwise hold it forever, since nothing is paid up front
+ */
+const EXPIRABLE_RESERVATIONS = [
+  { approvalStatus: 'pending' },
+  { orderType: 'online', paymentStatus: 'pending', status: 'confirmed' },
+];
+
+const isAbandonedOnlineOrder = order =>
+  order.orderType === 'online' && order.paymentStatus === 'pending' && order.status === 'confirmed';
+
 export async function releaseExpiredApprovalReservations({ branch, actor, now = new Date(), limit = 100, shouldContinue = () => true } = {}) {
   const batchLimit = Math.min(1000, Math.max(1, Number.parseInt(limit, 10) || 100));
   const due = await SalesOrder.find({
     ...(branch ? { branch } : {}),
-    approvalStatus: 'pending',
+    $or: EXPIRABLE_RESERVATIONS,
     reservationStatus: { $in: ['reserved', 'partial'] },
     reservationExpiresAt: { $lte: now },
     reservationExpiryState: { $nin: ['expired', 'released'] },
@@ -22,7 +40,7 @@ export async function releaseExpiredApprovalReservations({ branch, actor, now = 
       await session.withTransaction(async () => {
         const order = await SalesOrder.findOne({
           _id: candidate._id,
-          approvalStatus: 'pending',
+          $or: EXPIRABLE_RESERVATIONS,
           reservationStatus: { $in: ['reserved', 'partial'] },
           reservationExpiresAt: { $lte: now },
           reservationExpiryState: { $nin: ['expired', 'released'] },
@@ -38,12 +56,27 @@ export async function releaseExpiredApprovalReservations({ branch, actor, now = 
           { $set: { status: 'cancelled', stockReserved: false, reservationState: 'released', reservationReleasedAt: now, cancellationProcessing: false }, $unset: { dispatchTrip: 1, tripClaimedAt: 1 } },
           { session }
         );
+        const abandonedOnline = isAbandonedOnlineOrder(order);
+        const releaseReason = abandonedOnline
+          ? 'Unpaid online order reservation expired'
+          : 'Pending approval reservation expired';
         if (order.items.some(line => Number(line.reservedQuantity || 0) > QUANTITY_TOLERANCE)) {
-          await releaseSalesOrderInventory(order, { session, actor, reason: 'Pending approval reservation expired' });
+          await releaseSalesOrderInventory(order, { session, actor, reason: releaseReason });
         }
         order.reservationExpiryState = 'expired';
         order.reservationExpiredAt = now;
-        order.reservationExpiryReason = 'Pending approval reservation expired without an in-progress PickList owner';
+        order.reservationExpiryReason = abandonedOnline
+          ? 'Unpaid online order was not confirmed before its reservation expired'
+          : 'Pending approval reservation expired without an in-progress PickList owner';
+        // An online order whose stock has gone back on the shelf must not stay
+        // "confirmed" — the warehouse would see an order it can no longer fulfil.
+        // Cancelling it says plainly what happened and lets the customer reorder.
+        if (abandonedOnline) {
+          order.status = 'cancelled';
+          order.remarks = [order.remarks, 'Cancelled automatically: not confirmed before the stock reservation expired.']
+            .filter(Boolean).join(' ');
+          summary.cancelledOnlineOrders = (summary.cancelledOnlineOrders || 0) + 1;
+        }
         await order.save({ session });
         summary.released += 1;
         summary.orderIds.push(String(order._id));

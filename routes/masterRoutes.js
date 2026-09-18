@@ -13,6 +13,11 @@ import User from '../models/User.js';
 import Expense from '../models/Expense.js';
 import { protect, requirePermission, userHasPermission } from '../middleware/auth.js';
 import { requireBranch } from '../utils/branchScope.js';
+import {
+  assignmentSummary,
+  buildAssignmentChange,
+  findAssignableExecutive,
+} from '../services/dealerAssignmentService.js';
 
 const router = Router();
 router.use(protect);
@@ -396,6 +401,16 @@ dealerRouter.get('/sales-executives', requirePermission('dealer.assignment.manag
   } catch (error) { return sendDealerError(res, error); }
 });
 
+// GET /masters/dealers/assignment-summary
+// Counted in the database, so the totals stay correct beyond the first page of
+// dealers. The page used to derive these from 100 loaded rows.
+// Declared before '/:id' so it is not read as a dealer id.
+dealerRouter.get('/assignment-summary', requirePermission('dealer.assignment.manage'), async (_req, res) => {
+  try {
+    return res.json({ success: true, data: await assignmentSummary() });
+  } catch (error) { return sendDealerError(res, error); }
+});
+
 dealerRouter.get('/:id', async (req, res) => {
   try {
     const dealer = await populateDealer(Dealer.findById(req.params.id)).lean();
@@ -431,10 +446,66 @@ dealerRouter.put('/:id', async (req, res) => {
       current.assignedSalesExecutive,
     );
     await applyDealerMobile(data, req.params.id);
+
+    // Record the handover when the executive actually changes. buildAssignmentChange
+    // returns null for a no-op, so an unrelated dealer edit adds no history noise.
+    const change = Object.prototype.hasOwnProperty.call(data, 'assignedSalesExecutive')
+      ? await buildAssignmentChange({
+        dealer: current,
+        nextExecutiveId: data.assignedSalesExecutive,
+        actor: req.user,
+        reason: req.body?.assignmentReason,
+      })
+      : null;
+
     const dealer = await populateDealer(
-      Dealer.findByIdAndUpdate(req.params.id, data, { new: true, runValidators: true }),
+      Dealer.findByIdAndUpdate(
+        req.params.id,
+        change ? { $set: data, $push: { assignmentHistory: change.historyEntry } } : data,
+        { new: true, runValidators: true },
+      ),
     );
     return res.json({ success: true, message: 'Dealer updated.', data: dealer });
+  } catch (error) { return sendDealerError(res, error); }
+});
+
+// POST /masters/dealers/bulk-assign  { dealerIds: [], assignedSalesExecutive, reason }
+// Moving dealers one modal at a time does not scale past a handful.
+dealerRouter.post('/bulk-assign', requirePermission('dealer.assignment.manage'), async (req, res) => {
+  try {
+    const dealerIds = [...new Set((Array.isArray(req.body?.dealerIds) ? req.body.dealerIds : []).map(String))];
+    if (!dealerIds.length) throw dealerError(422, 'Select at least one dealer.');
+    if (dealerIds.length > 500) throw dealerError(422, 'Assign at most 500 dealers at a time.');
+    if (dealerIds.some(id => !mongoose.isValidObjectId(id))) throw dealerError(422, 'One of the dealer ids is invalid.');
+
+    const target = req.body?.assignedSalesExecutive;
+    const executive = target ? await findAssignableExecutive(target) : null;
+
+    const dealers = await Dealer.find({ _id: { $in: dealerIds } }).select('_id businessName assignedSalesExecutive').lean();
+    if (dealers.length !== dealerIds.length) throw dealerError(404, 'One or more dealers no longer exist.');
+
+    let moved = 0;
+    for (const dealer of dealers) {
+      const change = await buildAssignmentChange({
+        dealer,
+        nextExecutiveId: executive?._id || null,
+        actor: req.user,
+        reason: req.body?.reason,
+      });
+      if (!change) continue; // already on that executive
+      await Dealer.updateOne(
+        { _id: dealer._id },
+        { $set: { assignedSalesExecutive: change.assignedSalesExecutive }, $push: { assignmentHistory: change.historyEntry } },
+      );
+      moved += 1;
+    }
+    return res.json({
+      success: true,
+      message: executive
+        ? `${moved} dealer(s) assigned to ${executive.name}.`
+        : `${moved} dealer(s) unassigned.`,
+      data: { moved, skipped: dealers.length - moved },
+    });
   } catch (error) { return sendDealerError(res, error); }
 });
 

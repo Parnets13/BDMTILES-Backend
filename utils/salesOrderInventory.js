@@ -67,7 +67,7 @@ async function persistedLineVersions(order, session) {
   return new Map((persisted.items || []).map(line => [String(line._id), line]));
 }
 
-export async function reserveSalesOrderInventory(order, { session = null, actor = null, reason = 'Sales Order reservation' } = {}) {
+export async function reserveSalesOrderInventory(order, { session = null, actor = null, reason = 'Sales Order reservation', expiresInHours = null } = {}) {
   if (!order) throw conflict('Sales Order is required for stock reservation.');
   if (!session) throw Object.assign(new Error('Sales Order reservation requires an active transaction.'), { status: 500 });
   const missingByLine = order.items.map((line) => {
@@ -124,8 +124,15 @@ export async function reserveSalesOrderInventory(order, { session = null, actor 
   });
   order.reservationStatus = 'reserved';
   order.reservedAt = order.reservedAt || new Date();
-  if (order.approvalStatus === 'pending' && !order.reservationExpiresAt) {
-    const ttlHours = Number(process.env.APPROVAL_RESERVATION_TTL_HOURS || 0);
+  // A reservation that never expires can hold stock for good. Orders awaiting
+  // approval have always had a TTL; callers can now request one explicitly, which
+  // is what unpaid online orders use so an abandoned cart cannot lock inventory
+  // permanently. An existing expiry is never shortened or overwritten here.
+  if (!order.reservationExpiresAt) {
+    const requested = Number(expiresInHours);
+    const ttlHours = Number.isFinite(requested) && requested > 0
+      ? requested
+      : (order.approvalStatus === 'pending' ? Number(process.env.APPROVAL_RESERVATION_TTL_HOURS || 0) : 0);
     if (Number.isFinite(ttlHours) && ttlHours > 0) {
       order.reservationExpiresAt = new Date(Date.now() + ttlHours * 60 * 60 * 1000);
       order.reservationExpiryState = 'active';

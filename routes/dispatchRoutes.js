@@ -5,6 +5,7 @@ import SalesOrder from '../models/SalesOrder.js';
 import { protect, requirePermission } from '../middleware/auth.js';
 import { assertWarehousesInBranch, requireBranch } from '../utils/branchScope.js';
 import { generateBranchNumber } from '../utils/branchSequence.js';
+import { resolveVehicleForAssignment } from '../services/vehicleAssignmentService.js';
 
 const router = Router();
 router.use(protect);
@@ -120,9 +121,35 @@ router.patch('/:id/status', async (req, res) => {
     const current = await Dispatch.findOne({ _id: req.params.id, branch: req.branchId }).lean();
     if (!current) return res.status(404).json({ success: false, message: 'Not found.' });
     const salesOrderIds = await assertSalesOrdersInBranch(current.orders, req.branchId);
+
+    // This route used to write only `status`, so the vehicle and driver sent by
+    // Delivery Assignment were silently discarded. Accept them, and put the
+    // vehicle through Vehicle Master so it cannot be free text either.
+    const updates = { status };
+    if (req.body.vehicle || req.body.vehicleRef) {
+      const { vehicle } = await resolveVehicleForAssignment({
+        vehicleId: req.body.vehicleRef || undefined,
+        vehicleNumber: req.body.vehicleRef ? undefined : req.body.vehicle,
+        // A Dispatch is not a DispatchTrip, so it does not hold a trip slot.
+        allowBusy: true,
+      });
+      updates.vehicleRef = vehicle._id;
+      updates.vehicle = vehicle.vehicleNumber;
+      updates.vehicleType = vehicle.vehicleType || '';
+      if (!String(req.body.driverName || '').trim() && vehicle.driverName) updates.driverName = vehicle.driverName;
+      if (!String(req.body.driverPhone || '').trim() && vehicle.driverPhone) updates.driverPhone = vehicle.driverPhone;
+    }
+    for (const field of ['driverName', 'driverPhone']) {
+      if (String(req.body[field] || '').trim()) updates[field] = String(req.body[field]).trim();
+    }
+    if (req.body.departureTime) {
+      const when = new Date(req.body.departureTime);
+      if (!Number.isNaN(when.getTime())) updates.departureTime = when;
+    }
+
     const dispatch = await Dispatch.findOneAndUpdate(
       { _id: current._id, branch: req.branchId },
-      { status },
+      updates,
       { new: true, runValidators: true }
     );
     // If completed, mark all linked SOs as dispatched

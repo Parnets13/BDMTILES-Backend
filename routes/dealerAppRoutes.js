@@ -397,7 +397,21 @@ router.post('/order-requests', async (req, res) => {
     const seId = dealer.assignedSalesExecutive?._id || dealer.assignedSalesExecutive;
     const se = await User.findById(seId).select('name').lean();
     const fingerprint = orderRequestFingerprint(dealer._id, items);
-    const sourceKey = `dealer-app:${dealer._id}:${requestFingerprint({ items: rawItems, at: Date.now() })}`;
+    // Idempotency: the app sends a stable key per submission attempt, so a retry
+    // or a double tap replays the original request instead of raising a duplicate.
+    // Falling back to the cart fingerprint (never a timestamp) keeps older app
+    // builds safe too — resubmitting the same cart returns the same request.
+    const clientKey = String(req.get('Idempotency-Key') || '').trim().slice(0, 200);
+    const sourceKey = `dealer-app:${dealer._id}:${clientKey || fingerprint}`;
+    const replay = await DealerOrderRequest.findOne({ sourceKey }).lean();
+    if (replay) {
+      return res.status(200).json({
+        success: true,
+        idempotent: true,
+        message: 'This request was already submitted.',
+        data: replay,
+      });
+    }
     const requestNumber = await generateBranchNumber(branch, 'dealerOrderRequest', new Date());
 
     const [created] = await DealerOrderRequest.create([{
@@ -494,6 +508,58 @@ router.get('/order-requests/credit-check', async (req, res) => {
   } catch (error) { sendError(res, error); }
 });
 
+// A request only tells half the story on its own: the dealer wants to know what it
+// became. Resolve the linked quotation and, past that, the sales order it turned
+// into, so the app can show one continuous progress line instead of stopping at
+// "converted to a quotation". sourceSalesOrder is populated going forward; the
+// lookup by sourceQuotation covers requests linked before that field existed.
+async function attachRequestOutcomes(requests, dealerId) {
+  const quotationIds = requests.map(r => r.sourceQuotation).filter(Boolean);
+  if (!quotationIds.length) return requests.map(r => ({ ...r, quotation: null, salesOrder: null }));
+
+  const Quotation = (await import('../models/Quotation.js')).default;
+  const [quotations, orders] = await Promise.all([
+    Quotation.find({ _id: { $in: quotationIds } })
+      .select('quotationNumber status grandTotal validUntil quotationDate').lean(),
+    SalesOrder.find({ dealer: dealerId, sourceQuotation: { $in: quotationIds } })
+      .select('orderNumber status paymentStatus grandTotal orderDate sourceQuotation').lean(),
+  ]);
+  const quotationById = new Map(quotations.map(q => [String(q._id), q]));
+  const orderByQuotation = new Map(orders.map(o => [String(o.sourceQuotation), o]));
+
+  return requests.map((request) => {
+    const key = request.sourceQuotation ? String(request.sourceQuotation) : '';
+    const quotation = key ? quotationById.get(key) || null : null;
+    const salesOrder = key ? orderByQuotation.get(key) || null : null;
+    return {
+      ...request,
+      quotation: quotation && {
+        _id: quotation._id,
+        quotationNumber: quotation.quotationNumber,
+        status: quotation.status,
+        grandTotal: money(quotation.grandTotal),
+        validUntil: quotation.validUntil,
+        quotationDate: quotation.quotationDate,
+      },
+      salesOrder: salesOrder && {
+        _id: salesOrder._id,
+        orderNumber: salesOrder.orderNumber,
+        status: salesOrder.status,
+        paymentStatus: salesOrder.paymentStatus,
+        grandTotal: money(salesOrder.grandTotal),
+        orderDate: salesOrder.orderDate,
+      },
+    };
+  });
+}
+
+const REQUEST_FIELDS = [
+  'requestNumber', 'status', 'items', 'remarks', 'deliveryAddress', 'expectedDeliveryDate',
+  'submittedAt', 'createdAt', 'approvedAt', 'approvalRemarks', 'rejectionReason', 'rejectedAt',
+  'cancelledAt', 'cancellationReason', 'sourceQuotation', 'linkedAt', 'revision',
+  'editHistory', 'editedAt', 'salesExecutiveName',
+].join(' ');
+
 // GET /api/v1/dealer-app/order-requests?status=&page=&limit=
 router.get('/order-requests', async (req, res) => {
   try {
@@ -503,20 +569,58 @@ router.get('/order-requests', async (req, res) => {
     const l = Math.min(50, Math.max(1, parseInt(limit, 10) || 20));
     const filter = { dealer: dealer._id };
     if (status) filter.status = status;
-    const [data, total] = await Promise.all([
+    const [rows, total] = await Promise.all([
       DealerOrderRequest.find(filter).sort({ createdAt: -1 }).skip((p - 1) * l).limit(l)
-        .select('requestNumber status items remarks deliveryAddress expectedDeliveryDate submittedAt createdAt approvedAt rejectionReason sourceQuotation').lean(),
+        .select(REQUEST_FIELDS).lean(),
       DealerOrderRequest.countDocuments(filter),
     ]);
+    const data = await attachRequestOutcomes(rows, dealer._id);
     res.json({ success: true, data, pagination: { currentPage: p, totalPages: Math.ceil(total / l), totalItems: total } });
   } catch (error) { sendError(res, error); }
 });
 
 router.get('/order-requests/:id', async (req, res) => {
   try {
-    const request = await DealerOrderRequest.findOne({ _id: req.params.id, dealer: req.dealer._id }).lean();
+    const request = await DealerOrderRequest.findOne({ _id: req.params.id, dealer: req.dealer._id })
+      .select(REQUEST_FIELDS).lean();
     if (!request) throw appError(404, 'Order request not found.');
-    res.json({ success: true, data: request });
+    const [enriched] = await attachRequestOutcomes([request], req.dealer._id);
+    res.json({ success: true, data: enriched });
+  } catch (error) { sendError(res, error); }
+});
+
+// POST /api/v1/dealer-app/order-requests/:id/cancel   { reason? }
+//
+// A dealer can withdraw their own request while it is still waiting for review.
+// Once the branch has approved it, rejected it, or built a quotation from it, the
+// decision is no longer the dealer's to reverse — they contact their executive.
+// This is the only writer of the 'cancelled' status.
+router.post('/order-requests/:id/cancel', async (req, res) => {
+  try {
+    const reason = String(req.body?.reason || '').trim().slice(0, 1000);
+    const cancelled = await DealerOrderRequest.findOneAndUpdate(
+      { _id: req.params.id, dealer: req.dealer._id, status: 'submitted' },
+      {
+        $set: {
+          status: 'cancelled',
+          cancelledBy: req.dealer._id,
+          cancelledAt: new Date(),
+          cancellationReason: reason,
+        },
+        $inc: { revision: 1 },
+      },
+      { new: true, runValidators: true },
+    ).select(REQUEST_FIELDS).lean();
+
+    if (!cancelled) {
+      const existing = await DealerOrderRequest.findOne({ _id: req.params.id, dealer: req.dealer._id })
+        .select('status').lean();
+      if (!existing) throw appError(404, 'Order request not found.');
+      throw appError(409, existing.status === 'cancelled'
+        ? 'This request is already cancelled.'
+        : `This request is already ${String(existing.status).replace(/_/g, ' ')} and can no longer be cancelled. Please contact your sales executive.`);
+    }
+    res.json({ success: true, message: `Request ${cancelled.requestNumber} cancelled.`, data: cancelled });
   } catch (error) { sendError(res, error); }
 });
 
@@ -1086,6 +1190,19 @@ router.post('/receipts/:id/download-link', async (req, res) => {
 });
 
 // ── Deliveries / tracking (17.4) ─────────────────────────────────────────────
+//
+// The handover OTP is the dealer's proof that they received the goods: the driver
+// asks for it and staff type it into Delivery Tracking to verify. Staff endpoints
+// deliberately strip it (deliveryRoutes uses select('-otp') and safeDelivery
+// deletes it), so the DEALER is the only party who may read it — otherwise the
+// code exists but nobody can produce it and the verification step is unusable.
+//
+// Only while the goods are actually in play, and never once verified: after that
+// the code has served its purpose and there is no reason to keep showing it.
+const OTP_VISIBLE_STATES = ['assigned', 'in_transit', 'reached'];
+const handoverOtp = delivery =>
+  (!delivery?.otpVerified && OTP_VISIBLE_STATES.includes(delivery?.status) ? delivery.otp || '' : '');
+
 // GET /api/v1/dealer-app/deliveries?status=&page=&limit=
 router.get('/deliveries', async (req, res) => {
   try {
@@ -1098,7 +1215,7 @@ router.get('/deliveries', async (req, res) => {
 
     const [data, total] = await Promise.all([
       Delivery.find(filter).sort({ deliveryDate: -1 }).skip((p - 1) * l).limit(l)
-        .select('deliveryNumber deliveryDate status orderNumber invoiceNumber tripNumber deliveryExecutiveName items completionTime')
+        .select('deliveryNumber deliveryDate status orderNumber invoiceNumber tripNumber deliveryExecutiveName items completionTime otp otpVerified vehicleNumber')
         .lean(),
       Delivery.countDocuments(filter),
     ]);
@@ -1115,6 +1232,9 @@ router.get('/deliveries', async (req, res) => {
         itemCount: (d.items || []).length,
         deliveryExecutiveName: d.deliveryExecutiveName || '',
         completionTime: d.completionTime || null,
+        vehicleNumber: d.vehicleNumber || '',
+        otp: handoverOtp(d),
+        otpVerified: Boolean(d.otpVerified),
       })),
       pagination: { currentPage: p, totalPages: Math.ceil(total / l), totalItems: total },
     });
@@ -1125,7 +1245,7 @@ router.get('/deliveries', async (req, res) => {
 router.get('/deliveries/:id', async (req, res) => {
   try {
     const d = await Delivery.findOne({ _id: req.params.id, dealer: req.dealer._id })
-      .select('deliveryNumber deliveryDate status orderNumber invoiceNumber tripNumber deliveryAddress contactPhone deliveryExecutiveName items podImage podSignature podDocumentUrl receiverName startTime reachTime completionTime deliveryRemarks failureReason failureRemarks rescheduleDate')
+      .select('deliveryNumber deliveryDate status orderNumber invoiceNumber tripNumber deliveryAddress contactPhone deliveryExecutiveName items podImage podSignature podDocumentUrl receiverName startTime reachTime completionTime deliveryRemarks failureReason failureRemarks rescheduleDate otp otpVerified otpVerifiedAt vehicleNumber vehicleType driverName driverPhone')
       .populate('items.product', 'itemName productCode unit')
       .lean();
     if (!d) throw appError(404, 'Delivery not found.');
@@ -1151,11 +1271,20 @@ router.get('/deliveries/:id', async (req, res) => {
         deliveryAddress: d.deliveryAddress || '',
         contactPhone: d.contactPhone || '',
         deliveryExecutiveName: d.deliveryExecutiveName || '',
+        // Which vehicle is bringing the goods, and who is driving it.
+        vehicleNumber: d.vehicleNumber || '',
+        vehicleType: d.vehicleType || '',
+        driverName: d.driverName || '',
+        driverPhone: d.driverPhone || '',
         receiverName: d.receiverName || '',
         remarks: d.deliveryRemarks || '',
         failureReason: d.failureReason || '',
         failureRemarks: d.failureRemarks || '',
         rescheduleDate: d.rescheduleDate || null,
+        // Shown to the dealer so they can read it out at the door.
+        otp: handoverOtp(d),
+        otpVerified: Boolean(d.otpVerified),
+        otpVerifiedAt: d.otpVerifiedAt || null,
         timeline,
         pod: {
           image: d.podImage || '',

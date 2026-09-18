@@ -60,6 +60,8 @@ import taskRoutes from './routes/taskRoutes.js';
 import notificationRoutes from './routes/notificationRoutes.js';
 import accessPolicyRoutes from './routes/accessPolicyRoutes.js';
 import incentiveRoutes from './routes/incentiveRoutes.js';
+import targetRoutes from './routes/targetRoutes.js';
+import supportChatRoutes from './routes/supportChatRoutes.js';
 import branchRoutes from './routes/branchRoutes.js';
 import salesExecutiveRoutes from './routes/salesExecutiveRoutes.js';
 import dealerOrderRequestRoutes from './routes/dealerOrderRequestRoutes.js';
@@ -173,6 +175,8 @@ app.use('/api/v1/tasks', taskRoutes);
 app.use('/api/v1/notifications', notificationRoutes);
 app.use('/api/v1/access-policies', accessPolicyRoutes);
 app.use('/api/v1/incentives', incentiveRoutes);
+app.use('/api/v1/targets', targetRoutes); // SE target authoring (facade over target incentive rules)
+app.use('/api/v1/support-chat', supportChatRoutes); // admin view of the dealer<->executive thread
 app.use('/api/v1/sales-executive', salesExecutiveRoutes);
 
 // Static uploads (supplier financial evidence is never public)

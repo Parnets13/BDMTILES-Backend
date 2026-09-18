@@ -10,6 +10,7 @@ import { generateBranchNumber } from '../utils/branchSequence.js';
 import { assertIdempotentReplay, getIdempotencyContext } from '../utils/idempotency.js';
 import {
   buildTrustedRequestItems,
+  orderRequestFingerprint,
   refreshAndFingerprintRequest,
 } from '../services/dealerOrderRequestService.js';
 
@@ -204,6 +205,10 @@ router.post('/', requirePermission('dealer.order_request.create'), async (req, r
       salesExecutiveName: req.user.name || '',
       items,
       remarks: String(req.body?.remarks || '').trim(),
+      // Advisory delivery preference, same as the dealer app captures. Previously
+      // dropped here, which made the field look empty for every SE-raised request.
+      deliveryAddress: String(req.body?.deliveryAddress || '').trim().slice(0, 500),
+      expectedDeliveryDate: req.body?.expectedDeliveryDate ? new Date(req.body.expectedDeliveryDate) : null,
       status: 'submitted',
       sourceKey: idempotency.sourceKey,
       requestFingerprint: idempotency.requestFingerprint,
@@ -248,7 +253,9 @@ router.get('/stats', requirePermission('dealer.order_request.review'), async (re
       { $match: { branch: req.branchId } },
       { $group: { _id: '$status', count: { $sum: 1 } } },
     ]);
-    const byStatus = Object.fromEntries(VALID_STATUSES.values().map(status => [status, 0]));
+    // Spread the Set rather than calling .map() on its iterator — iterator helpers
+    // are Node 22+, and this route should not depend on the runtime version.
+    const byStatus = Object.fromEntries([...VALID_STATUSES].map(status => [status, 0]));
     rows.forEach(row => { byStatus[row._id] = row.count; });
     return res.json({
       success: true,
@@ -316,6 +323,109 @@ router.post('/:id/reject', requirePermission('dealer.order_request.approve'), as
   }
 });
 
+// PATCH /:id — adjust what the dealer asked for before it becomes a quotation.
+//
+// A request carries demand only (no rates), so an edit can change quantities, add
+// or drop products, and correct the advisory delivery details. Two rules keep the
+// downstream contract intact:
+//   1. Only 'submitted' or 'approved' requests can be edited. Once a quotation
+//      exists the products and quantities are frozen by design (the quotation
+//      routes assert against approvedFingerprint), and rejected/cancelled are
+//      terminal.
+//   2. Editing an already-approved request sends it back to 'submitted' and
+//      clears the approval, because approvedFingerprint must always describe the
+//      items as they were at the moment somebody approved them. Re-approving
+//      re-freezes it.
+router.patch('/:id', requirePermission('dealer.order_request.approve'), async (req, res) => {
+  try {
+    const revision = Number(req.body?.revision);
+    if (!Number.isInteger(revision) || revision < 0) throw routeError(422, 'A valid revision is required. Refresh the request and try again.');
+
+    const current = await DealerOrderRequest.findOne({ _id: req.params.id, branch: req.branchId }).lean();
+    if (!current) throw routeError(404, 'Dealer order request not found.');
+    if (!['submitted', 'approved'].includes(current.status)) {
+      throw routeError(409, `A request in "${current.status}" status can no longer be edited.`);
+    }
+    if (current.revision !== revision) throw routeError(409, 'Request changed since it was loaded. Refresh and try again.');
+
+    const hasItems = Array.isArray(req.body?.items);
+    const nextItems = hasItems
+      ? await buildTrustedRequestItems(req.body.items)
+      : current.items;
+
+    // Describe the change in the dealer's terms, before we overwrite anything.
+    const changes = [];
+    if (hasItems) {
+      const before = new Map(current.items.map(item => [String(item.product), item]));
+      const after = new Map(nextItems.map(item => [String(item.product), item]));
+      for (const [key, item] of after) {
+        const previous = before.get(key);
+        if (!previous) changes.push({ type: 'added', productName: item.productName, from: null, to: item.quantity });
+        else if (Math.abs(Number(previous.quantity) - Number(item.quantity)) > 1e-6) {
+          changes.push({ type: 'quantity', productName: item.productName, from: previous.quantity, to: item.quantity });
+        }
+      }
+      for (const [key, item] of before) {
+        if (!after.has(key)) changes.push({ type: 'removed', productName: item.productName, from: item.quantity, to: null });
+      }
+    }
+
+    const set = {
+      items: nextItems,
+      requestFingerprint: orderRequestFingerprint(current.dealer, nextItems),
+      editedAt: new Date(),
+      editedBy: req.user._id,
+    };
+    if (req.body?.remarks !== undefined) set.remarks = String(req.body.remarks || '').trim().slice(0, 2000);
+    if (req.body?.deliveryAddress !== undefined) set.deliveryAddress = String(req.body.deliveryAddress || '').trim().slice(0, 500);
+    if (req.body?.expectedDeliveryDate !== undefined) {
+      if (!req.body.expectedDeliveryDate) set.expectedDeliveryDate = null;
+      else {
+        const when = new Date(req.body.expectedDeliveryDate);
+        if (Number.isNaN(when.getTime())) throw routeError(422, 'expectedDeliveryDate must be a valid date.');
+        set.expectedDeliveryDate = when;
+      }
+    }
+    // Send an approved request back for review so approvedFingerprint is never
+    // left describing items that have since changed.
+    if (current.status === 'approved') {
+      set.status = 'submitted';
+      set.approvedFingerprint = '';
+      set.approvedBy = null;
+      set.approvedAt = null;
+      set.approvalRemarks = '';
+    }
+
+    const push = changes.length
+      ? {
+        editHistory: {
+          at: new Date(),
+          by: req.user._id,
+          byName: req.user.name || '',
+          reason: String(req.body?.reason || '').trim().slice(0, 500),
+          changes,
+        },
+      }
+      : undefined;
+
+    const updated = await DealerOrderRequest.findOneAndUpdate(
+      { _id: current._id, branch: req.branchId, status: current.status, revision },
+      { $set: set, $inc: { revision: 1 }, ...(push ? { $push: push } : {}) },
+      { new: true, runValidators: true },
+    );
+    if (!updated) throw routeError(409, 'Request was changed by another user. Refresh the queue.');
+    return res.json({
+      success: true,
+      message: current.status === 'approved'
+        ? `Request ${updated.requestNumber} updated and sent back for review.`
+        : `Request ${updated.requestNumber} updated.`,
+      data: await populateRequest(DealerOrderRequest.findById(updated._id)).lean(),
+    });
+  } catch (error) {
+    return res.status(errorStatus(error)).json({ success: false, message: error.message });
+  }
+});
+
 router.get('/:id/quotation-prefill', requirePermission('dealer.order_request.review'), async (req, res) => {
   try {
     const request = await DealerOrderRequest.findOne({ _id: req.params.id, branch: req.branchId }).lean();
@@ -347,6 +457,10 @@ router.get('/:id/quotation-prefill', requirePermission('dealer.order_request.rev
           customerType: 'dealer',
           items: refreshed.items.map(item => ({
             product: item.product,
+            // unit travels with the line: POST /quotations requires it, so a
+            // caller that posts this prefill straight back must not have to
+            // re-derive it from the product master.
+            unit: item.unit,
             quantity: item.quantity,
             boxes: item.boxes,
             pieces: item.pieces,

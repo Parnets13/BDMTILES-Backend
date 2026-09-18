@@ -27,6 +27,22 @@ const dealerSchema = new mongoose.Schema(
     assignedRegion: { type: mongoose.Schema.Types.ObjectId, ref: 'Region' },
     assignedRoute: { type: mongoose.Schema.Types.ObjectId, ref: 'Route' },
     assignedSalesExecutive: { type: mongoose.Schema.Types.ObjectId, ref: 'User' },
+    // Who handled this dealer before, and why it changed. Reassignment moves
+    // commission, visits and the chat thread, so the trail matters.
+    assignmentHistory: {
+      type: [{
+        _id: false,
+        at: { type: Date, default: Date.now },
+        from: { type: mongoose.Schema.Types.ObjectId, ref: 'User' },
+        fromName: { type: String, default: '' },
+        to: { type: mongoose.Schema.Types.ObjectId, ref: 'User' },
+        toName: { type: String, default: '' },
+        by: { type: mongoose.Schema.Types.ObjectId, ref: 'User' },
+        byName: { type: String, default: '' },
+        reason: { type: String, default: '', maxlength: 500 },
+      }],
+      default: [],
+    },
 
     // Financial
     creditLimit: { type: Number, default: 0 },

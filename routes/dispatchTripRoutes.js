@@ -10,6 +10,7 @@ import { requireBranch } from '../utils/branchScope.js';
 import { generateBranchNumber } from '../utils/branchSequence.js';
 import { QUANTITY_TOLERANCE, refreshSalesOrderLine, salesOrderIsFullyDispatched } from '../utils/salesOrderInventory.js';
 import { stableUomSnapshot } from '../services/stockUomService.js';
+import { resolveVehicleForAssignment, vehicleSnapshot } from '../services/vehicleAssignmentService.js';
 
 const router = Router();
 router.use(protect);
@@ -127,8 +128,6 @@ router.post('/', async (req, res) => {
     if (!requestedPickListIds.length && !requestedPickListNumbers.length) {
       return res.status(400).json({ success: false, message: 'Select at least one ready pick list.' });
     }
-    if (!String(req.body.vehicleNumber || '').trim()) return res.status(400).json({ success: false, message: 'Vehicle number is required.' });
-
     const pickListSelector = requestedPickListIds.length
       ? { _id: { $in: requestedPickListIds } }
       : { pickListNumber: { $in: requestedPickListNumbers } };
@@ -181,6 +180,18 @@ router.post('/', async (req, res) => {
     });
     });
 
+    // Resolve the vehicle against Vehicle Master before anything is claimed, so a
+    // bad vehicle fails the request instead of leaving pick lists half-claimed.
+    // Totals are known now, which lets the capacity check mean something.
+    const tripBoxes = orders.reduce((sum, order) => sum + Number(order.totalBoxes || 0), 0);
+    const tripWeight = orders.reduce((sum, order) => sum + Number(order.totalWeight || 0), 0);
+    const { vehicle: assignedVehicle, warnings: vehicleWarnings } = await resolveVehicleForAssignment({
+      vehicleId: req.body.vehicle,
+      vehicleNumber: req.body.vehicleNumber,
+      totalBoxes: tripBoxes,
+      totalWeight: tripWeight,
+    });
+
     tripId = new mongoose.Types.ObjectId();
     const tripNumber = await generateBranchNumber(req.branchId, 'dispatchTrip', new Date());
     for (const pickList of pickLists) {
@@ -200,12 +211,12 @@ router.post('/', async (req, res) => {
       _id: tripId,
       tripNumber,
       branch: req.branchId,
-      vehicle: req.body.vehicle || undefined,
-      vehicleNumber: String(req.body.vehicleNumber).trim(),
-      vehicleType: req.body.vehicleType || '',
-      vehicleCapacity: req.body.vehicleCapacity || '',
-      driverName: req.body.driverName || '',
-      driverPhone: req.body.driverPhone || '',
+      // Vehicle fields come from the master record, not the request body, so the
+      // trip can never disagree with Vehicle Master.
+      ...vehicleSnapshot(assignedVehicle),
+      // The driver on the vehicle is the default; a trip may still override it.
+      driverName: String(req.body.driverName || '').trim() || assignedVehicle.driverName || '',
+      driverPhone: String(req.body.driverPhone || '').trim() || assignedVehicle.driverPhone || '',
       deliveryExecutive: req.body.deliveryExecutive || undefined,
       deliveryExecutiveName: req.body.deliveryExecutiveName || '',
       routeName: req.body.routeName || '',
@@ -218,7 +229,14 @@ router.post('/', async (req, res) => {
       totalWeight: orders.reduce((sum, order) => sum + order.totalWeight, 0),
       createdBy: req.user._id,
     });
-    res.status(201).json({ success: true, message: `Trip ${trip.tripNumber} created from ${orders.length} exclusively claimed pick list(s).`, data: trip });
+    res.status(201).json({
+      success: true,
+      message: `Trip ${trip.tripNumber} created from ${orders.length} exclusively claimed pick list(s).`,
+      // Capacity is advisory: the planner is told the load looks over-rated but is
+      // not stopped, because the rating is free text and may be approximate.
+      ...(vehicleWarnings.length ? { warnings: vehicleWarnings } : {}),
+      data: trip,
+    });
   } catch (e) {
     if (tripId && claimedPickListIds.length) {
       await PickList.updateMany(
@@ -568,6 +586,13 @@ router.patch('/:id/dispatch', async (req, res) => {
             orderNumber: order.orderNumber,
             dispatchTrip: lockedTrip._id,
             tripNumber: lockedTrip.tripNumber,
+            // Freeze the vehicle that actually carried this delivery. Editing the
+            // trip later must not rewrite what a completed delivery went out on.
+            vehicle: lockedTrip.vehicle || undefined,
+            vehicleNumber: lockedTrip.vehicleNumber || '',
+            vehicleType: lockedTrip.vehicleType || '',
+            driverName: lockedTrip.driverName || '',
+            driverPhone: lockedTrip.driverPhone || '',
             dealer: salesOrder.dealer || undefined,
             dealerName: order.dealerName,
             dealerCode: order.dealerCode,

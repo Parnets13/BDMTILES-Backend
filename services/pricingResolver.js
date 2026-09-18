@@ -19,6 +19,10 @@ const DISCOUNT_DEALER_TYPES = Object.freeze({
   distributorRate: 'distributor', builderRate: 'builder', projectRate: 'builder',
 });
 const PRICING_SCOPES = new Set(['dealer', 'dealer_type', 'walk_in']);
+// Tiers a caller may ask for explicitly. Wider than TIER_FIELDS because `mrp` is a
+// legitimate selling price for a storefront even though it is not a dealer tier,
+// and TIER_FIELDS is also used to validate DealerType.pricingTier.
+const SELECTABLE_TIERS = new Set([...TIER_FIELDS, 'mrp']);
 
 function pricingError(status, message) {
   return Object.assign(new Error(message), { status });
@@ -105,7 +109,12 @@ async function loadDealerType(dealerTypeId, session) {
   return dealerType;
 }
 async function loadProduct(productOrId, session) {
-  if (productOrId && typeof productOrId === 'object' && productOrId._id) {
+  // An ObjectId is itself an object exposing `_id` (it returns itself), so `_id`
+  // alone cannot tell a loaded document from an id. Rule ids out first, otherwise
+  // passing an ObjectId is mistaken for a document whose status is undefined and
+  // every such call fails with a misleading "not active".
+  const isId = typeof productOrId === 'string' || productOrId instanceof mongoose.Types.ObjectId;
+  if (!isId && productOrId && typeof productOrId === 'object' && productOrId._id) {
     if (productOrId.status !== 'active') throw pricingError(422, `Product ${productOrId.productCode || productOrId._id} is not active.`);
     return productOrId;
   }
@@ -204,9 +213,12 @@ export async function resolvePricing(options = {}) {
   const {
     branchId, dealerId, dealerTypeId, scope: requestedScope, product: productInput,
     quantity = 1, orderType = 'dealer', pricingDate = new Date(), orderAmount,
-    session = null, proposedOverride = null, manualRate,
+    session = null, proposedOverride = null, manualRate, preferredTier: requestedTier = null,
   } = options;
   if (!branchId) throw pricingError(422, 'branch is required for pricing.');
+  if (requestedTier && !SELECTABLE_TIERS.has(requestedTier)) {
+    throw pricingError(422, `preferredTier must be one of: ${[...SELECTABLE_TIERS].join(', ')}.`);
+  }
   const qty = Number(quantity);
   if (!Number.isFinite(qty) || qty <= 0) throw pricingError(422, 'quantity must be greater than zero.');
   const at = new Date(pricingDate);
@@ -223,7 +235,11 @@ export async function resolvePricing(options = {}) {
     loadProduct(productInput, session),
   ]);
   const dealerType = dealer?.dealerType || selectedDealerType;
-  const preferredTier = dealerType && TIER_FIELDS.has(dealerType.pricingTier) ? dealerType.pricingTier : null;
+  // An explicitly requested tier wins over the dealer type's own tier. The website
+  // uses this to sell at MRP; without it a walk-in resolution always lands on
+  // retailRate and the storefront would display one price and charge another.
+  const preferredTier = requestedTier
+    || (dealerType && TIER_FIELDS.has(dealerType.pricingTier) ? dealerType.pricingTier : null);
   const walkIn = !dealer && !dealerType;
   // A registered dealer without a configured DealerType gets the stable dealer
   // tier; request-controlled order/customer type may not select its price tier.
@@ -334,4 +350,4 @@ export function pricingAuditSnapshot(resolution) {
   };
 }
 
-export { ORDER_TYPE_TIERS, TIER_FIELDS, PRICING_SCOPES };
+export { ORDER_TYPE_TIERS, TIER_FIELDS, PRICING_SCOPES, SELECTABLE_TIERS };

@@ -2,6 +2,7 @@ import { Router } from 'express';
 import mongoose from 'mongoose';
 import Product from '../../models/Product.js';
 import Stock from '../../models/Stock.js';
+import Warehouse from '../../models/Warehouse.js';
 import Category from '../../models/Category.js';
 import Brand from '../../models/Brand.js';
 import { getOnlineBranchId } from '../../utils/onlineBranch.js';
@@ -25,9 +26,60 @@ const PUBLIC_PRODUCT_FIELDS = [
 
 const ONLY_ONLINE = { status: 'active', onlineVisible: true };
 
+/**
+ * How much of each product the storefront may actually sell.
+ *
+ * Checkout reserves against exactly one stock key: the online branch's default
+ * warehouse, with no shade or batch, because a customer never picks either.
+ * Summing every stock row would advertise shade- or batch-held stock nobody can
+ * buy, so the cart would accept a quantity the order endpoint then rejects.
+ *
+ * Returned for lists as well as the single product, so a listing page and the
+ * cart can cap the quantity instead of discovering the limit at checkout.
+ * Availability is best-effort: a lookup failure must never hide the catalogue.
+ */
+const onlineAvailability = async (productIds) => {
+  const byProduct = new Map();
+  if (!productIds?.length) return byProduct;
+  try {
+    const branchId = await getOnlineBranchId();
+    const warehouse = await Warehouse.findOne({ branch: branchId, status: 'active' })
+      .sort({ type: 1, createdAt: 1 })
+      .select('_id')
+      .lean();
+    if (!warehouse) return byProduct;
+    const rows = await Stock.find({
+      branch: branchId,
+      warehouse: warehouse._id,
+      shade: '',
+      batch: '',
+      product: { $in: productIds },
+    }).select('product availableQty').lean();
+    for (const row of rows) {
+      byProduct.set(String(row.product), Math.max(0, Number(row.availableQty || 0)));
+    }
+  } catch {
+    // Leave the map empty; callers fall back to zero.
+  }
+  return byProduct;
+};
+
+/** Attaches availability to a list of already-mapped public products (keyed on `id`). */
+const withAvailability = async (products) => {
+  const availability = await onlineAvailability(products.map(p => p.id).filter(Boolean));
+  return products.map((product) => {
+    const availableQty = availability.get(String(product.id)) || 0;
+    return { ...product, availableQty, inStock: availableQty > 0 };
+  });
+};
+
 // Map a product doc to the customer-facing shape (price = retailRate, fallback mrp).
 const toPublic = (p) => {
-  const price = Number(p.retailRate) > 0 ? Number(p.retailRate) : Number(p.mrp) || 0;
+  // The website sells at MRP, and the order endpoint prices at MRP too, so the
+  // figure shown here is the figure charged. retailRate is only a fallback for a
+  // product with no MRP set — it must never be the advertised price, because it is
+  // the walk-in counter rate and lower than what the site is allowed to quote.
+  const price = Number(p.mrp) > 0 ? Number(p.mrp) : Number(p.retailRate) || 0;
   return {
     id: p._id,
     code: p.productCode || '',
@@ -170,7 +222,7 @@ router.get('/', async (req, res) => {
 
     return res.json({
       success: true,
-      data: items.map(toPublic),
+      data: await withAvailability(items.map(toPublic)),
       pagination: {
         currentPage: page,
         totalPages: Math.ceil(totalItems / limit) || 1,
@@ -190,7 +242,7 @@ router.get('/deals', async (_req, res) => {
       .select(PUBLIC_PRODUCT_FIELDS)
       .populate('brand', 'name').populate('category', 'name').populate('subcategory', 'name')
       .sort({ updatedAt: -1 }).limit(10).lean();
-    res.json({ success: true, data: deals.map(toPublic) });
+    res.json({ success: true, data: await withAvailability(deals.map(toPublic)) });
   } catch (error) {
     res.status(500).json({ success: false, message: error.message });
   }
@@ -203,7 +255,7 @@ router.get('/new-arrivals', async (_req, res) => {
       .select(PUBLIC_PRODUCT_FIELDS)
       .populate('brand', 'name').populate('category', 'name').populate('subcategory', 'name')
       .sort({ updatedAt: -1 }).limit(10).lean();
-    res.json({ success: true, data: items.map(toPublic) });
+    res.json({ success: true, data: await withAvailability(items.map(toPublic)) });
   } catch (error) {
     res.status(500).json({ success: false, message: error.message });
   }
@@ -249,17 +301,8 @@ router.get('/:id', async (req, res) => {
       .lean();
     if (!product) return res.status(404).json({ success: false, message: 'Product not found.' });
 
-    let availableQty = 0;
-    try {
-      const branchId = await getOnlineBranchId();
-      const [agg] = await Stock.aggregate([
-        { $match: { branch: branchId, product: product._id } },
-        { $group: { _id: '$product', availableQty: { $sum: '$availableQty' } } },
-      ]);
-      availableQty = agg?.availableQty || 0;
-    } catch {
-      availableQty = 0; // availability best-effort; never block product view
-    }
+    const availabilityById = await onlineAvailability([product._id]);
+    const availableQty = availabilityById.get(String(product._id)) || 0;
 
     return res.json({
       success: true,

@@ -14,7 +14,12 @@ const dispatchSchema = new mongoose.Schema(
     dispatchNumber: { type: String, unique: true, required: true },
     branch: { type: mongoose.Schema.Types.ObjectId, ref: 'Branch', index: true },
     dispatchDate: { type: Date, default: Date.now },
+    // `vehicle` predates Vehicle Master and holds the registration number as text.
+    // Existing documents rely on it, so it stays as the display value while
+    // vehicleRef carries the actual master link for new records.
     vehicle: { type: String, default: '' },
+    vehicleRef: { type: mongoose.Schema.Types.ObjectId, ref: 'Vehicle' },
+    vehicleType: { type: String, default: '' },
     driverName: { type: String, default: '' },
     driverPhone: { type: String, default: '' },
     route: { type: mongoose.Schema.Types.ObjectId, ref: 'Route' },

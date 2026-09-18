@@ -172,6 +172,13 @@ router.post('/', async (req, res) => {
       orderNumber: tripOrder.orderNumber || salesOrder.orderNumber,
       dispatchTrip: trip._id,
       tripNumber: trip.tripNumber,
+      // Same snapshot as the dispatch path: the vehicle is recorded on the
+      // delivery, not read through the trip, so history cannot be rewritten.
+      vehicle: trip.vehicle || undefined,
+      vehicleNumber: trip.vehicleNumber || '',
+      vehicleType: trip.vehicleType || '',
+      driverName: trip.driverName || '',
+      driverPhone: trip.driverPhone || '',
       dealer: salesOrder.dealer || undefined,
       dealerName: tripOrder.dealerName || salesOrder.dealerName || salesOrder.customerName || '',
       dealerCode: tripOrder.dealerCode || salesOrder.dealerCode || '',

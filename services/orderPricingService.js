@@ -207,6 +207,9 @@ export function addCreditApproval(pricingResult, dealer, branchOutstanding, exis
 export async function deriveOrderPricing(options = {}) {
   const {
     branchId, dealerId, dealerTypeId, scope, orderType = dealerId ? 'dealer' : 'retail',
+    // Lets a caller pin the rate column, e.g. the website selling at MRP. Omitted
+    // everywhere else, so existing callers resolve exactly as before.
+    preferredTier = null,
     pricingDate = new Date(), items, session = null, existingApprovalReasons = [],
     preserveSnapshots = false, preserveBelowMinimumApprovals = false, requireItemUnit = false,
     freightCharges = 0, loadingCharges = 0, installationCharges = 0, otherCharges = 0,
@@ -220,19 +223,19 @@ export async function deriveOrderPricing(options = {}) {
       const preserved = await loadPreservedResolution(source, quantity, session);
       if (preserved) return preserved;
       return resolvePricing({
-        branchId, dealerId, dealerTypeId, scope, product: source.product,
+        branchId, dealerId, dealerTypeId, scope, product: source.product, preferredTier,
         quantity, manualRate: source.manualRate, orderType, pricingDate, session,
       });
     }));
   } else {
     const firstPass = await Promise.all(normalized.map(({ source, product, quantity }) => resolvePricing({
       branchId, dealerId, dealerTypeId, scope, product, quantity, manualRate: source.manualRate,
-      orderType, pricingDate, session,
+      preferredTier, orderType, pricingDate, session,
     })));
     const orderAmount = roundMoney(firstPass.reduce((sum, result) => sum + result.pricingRate * result.quantity, 0));
     resolutions = await Promise.all(normalized.map(({ source, product, quantity }) => resolvePricing({
       branchId, dealerId, dealerTypeId, scope, product, quantity, manualRate: source.manualRate,
-      orderType, pricingDate, orderAmount, session,
+      preferredTier, orderType, pricingDate, orderAmount, session,
     })));
   }
 

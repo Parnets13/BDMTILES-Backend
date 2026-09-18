@@ -17,6 +17,7 @@ import {
 import { AVAILABLE_PERMISSIONS, ROLE_DEFAULT_PERMISSIONS, ROLE_INFO } from '../config/permissions.js';
 import { validateStrongPassword } from '../utils/authSecurity.js';
 import { canonicalPhone } from '../utils/phone.js';
+import { dealersHeldBy, reassignAllDealers } from '../services/dealerAssignmentService.js';
 
 const KNOWN_PERMISSIONS = new Set(
   Object.values(AVAILABLE_PERMISSIONS).flat().map((permission) => permission.id)
@@ -835,6 +836,36 @@ router.delete('/:id', async (req, res) => {
     if (!target) return res.status(404).json({ success: false, message: 'User not found.' });
     assertCanManageTarget(req.user, target);
 
+    // A Sales Executive's dealers cannot simply be left behind. A dealer's branch
+    // is derived from their executive, and their order requests, chat, complaints
+    // and gift claims are all routed to that person, so pointing at a deactivated
+    // user silently breaks the dealer's app with no warning to anyone. Force the
+    // decision here: hand the dealers to someone active, or explicitly release
+    // them. The dependency snapshot below records the state either way.
+    let dealerHandover = null;
+    if (target.role === 'sales_executive') {
+      const held = await dealersHeldBy(target._id);
+      if (held.length) {
+        const reassignTo = req.body?.reassignDealersTo;
+        const release = req.body?.unassignDealers === true;
+        if (!reassignTo && !release) {
+          throw Object.assign(
+            httpError(409, `${target.name} still handles ${held.length} dealer(s). Reassign them to another Sales Executive, or confirm they should be left unassigned.`),
+            {
+              code: 'DEALERS_STILL_ASSIGNED',
+              dealers: held.map(dealer => ({ _id: dealer._id, businessName: dealer.businessName, dealerCode: dealer.dealerCode || '' })),
+            },
+          );
+        }
+        dealerHandover = await reassignAllDealers({
+          fromExecutiveId: target._id,
+          toExecutiveId: reassignTo || null,
+          actor: req.user,
+          reason: `Deactivation of ${target.name}: ${reason}`,
+        });
+      }
+    }
+
     let snapshot = target.deactivation?.dependencySnapshot || await captureUserDependencies(target._id);
     const deactivation = {
       at: new Date(),
@@ -931,10 +962,21 @@ router.delete('/:id', async (req, res) => {
       transitioned,
       data: responseUser,
       dependencySummary: dependencySummary(snapshot),
+      ...(dealerHandover ? {
+        dealerHandover: {
+          moved: dealerHandover.moved,
+          to: dealerHandover.to ? { _id: dealerHandover.to._id, name: dealerHandover.to.name } : null,
+          dealers: dealerHandover.dealers,
+        },
+      } : {}),
     });
   } catch (error) {
     const status = error.status || (error.name === 'CastError' || error.name === 'ValidationError' ? 422 : 500);
-    return res.status(status).json({ success: false, message: error.message });
+    return res.status(status).json({
+      success: false,
+      message: error.message,
+      ...(error.code === 'DEALERS_STILL_ASSIGNED' ? { code: error.code, dealers: error.dealers } : {}),
+    });
   }
 });
 

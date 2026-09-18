@@ -1268,6 +1268,24 @@ router.post('/:id/convert', requirePermission('quotation.management'), requirePe
         })),
         createdBy: req.user._id,
       }], { session });
+
+      // Close the loop back to the dealer's original request. Without this the
+      // request stays at "quotation created" forever and the dealer never learns
+      // that their demand actually became an order. Only stamp the first
+      // conversion: a partially converted quotation can produce several orders,
+      // and the request should point at the one that started it.
+      if (current.sourceDealerOrderRequest) {
+        await DealerOrderRequest.updateOne(
+          {
+            _id: current.sourceDealerOrderRequest,
+            branch: req.branchId,
+            sourceSalesOrder: { $exists: false },
+          },
+          { $set: { sourceSalesOrder: salesOrder._id, convertedAt: now } },
+          { session },
+        );
+      }
+
       await syncAutomaticApprovalRequest({
         branchId: req.branchId,
         type: 'sales_order',

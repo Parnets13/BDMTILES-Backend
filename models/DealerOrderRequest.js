@@ -26,6 +26,23 @@ const requestItemSchema = new mongoose.Schema({
   sqftPerBox: { type: Number, required: true, min: 0.000001 },
 }, { _id: false });
 
+// One recorded change to a request's lines, so a dealer can see that the branch
+// adjusted what they asked for and why. Requests carry no money, so an edit can
+// only ever change quantities or the set of products.
+const requestEditSchema = new mongoose.Schema({
+  at: { type: Date, default: Date.now },
+  by: { type: mongoose.Schema.Types.ObjectId, ref: 'User' },
+  byName: { type: String, default: '' },
+  reason: { type: String, trim: true, maxlength: 500, default: '' },
+  changes: [{
+    _id: false,
+    type: { type: String, enum: ['quantity', 'added', 'removed'], required: true },
+    productName: { type: String, default: '' },
+    from: { type: Number, default: null },
+    to: { type: Number, default: null },
+  }],
+}, { _id: false });
+
 const dealerOrderRequestSchema = new mongoose.Schema({
   requestNumber: { type: String, required: true, trim: true },
   branch: { type: mongoose.Schema.Types.ObjectId, ref: 'Branch', required: true },
@@ -58,9 +75,19 @@ const dealerOrderRequestSchema = new mongoose.Schema({
   rejectedBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User' },
   rejectedAt: Date,
   rejectionReason: { type: String, trim: true, maxlength: 1000, default: '' },
+  cancelledBy: { type: mongoose.Schema.Types.ObjectId, ref: 'Dealer' },
+  cancelledAt: Date,
+  cancellationReason: { type: String, trim: true, maxlength: 1000, default: '' },
   sourceQuotation: { type: mongoose.Schema.Types.ObjectId, ref: 'Quotation' },
   linkedAt: Date,
   linkedBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User' },
+  // Set when the linked quotation is converted, so the request can report the
+  // order it finally became without the app having to walk the chain itself.
+  sourceSalesOrder: { type: mongoose.Schema.Types.ObjectId, ref: 'SalesOrder' },
+  convertedAt: Date,
+  editHistory: { type: [requestEditSchema], default: [] },
+  editedAt: Date,
+  editedBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User' },
   sourceKey: { type: String, required: true },
   requestFingerprint: { type: String, required: true },
   approvedFingerprint: { type: String, default: '' },

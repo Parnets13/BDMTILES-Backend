@@ -54,6 +54,16 @@ const deliverySchema = new mongoose.Schema(
     tripNumber: String,
     invoiceNumber: { type: String, default: '' },
 
+    // Vehicle, frozen at the moment the delivery was created from its trip.
+    // Reading it through dispatchTrip instead would let a later edit to the trip
+    // rewrite what a completed delivery says it went out on, so the number and
+    // type are snapshotted here while the ref stays for reporting.
+    vehicle: { type: mongoose.Schema.Types.ObjectId, ref: 'Vehicle' },
+    vehicleNumber: { type: String, default: '' },
+    vehicleType: { type: String, default: '' },
+    driverName: { type: String, default: '' },
+    driverPhone: { type: String, default: '' },
+
     // Customer/Dealer
     dealer: { type: mongoose.Schema.Types.ObjectId, ref: 'Dealer' },
     dealerName: String,
@@ -146,5 +156,7 @@ deliverySchema.index({ dispatchTrip: 1, salesOrder: 1 }, { unique: true, partial
 deliverySchema.index({ status: 1 });
 deliverySchema.index({ deliveryExecutive: 1 });
 deliverySchema.index({ deliveryDate: -1 });
+// Answers "which deliveries did this vehicle run", which was impossible before.
+deliverySchema.index({ branch: 1, vehicle: 1, deliveryDate: -1 });
 
 export default mongoose.model('Delivery', deliverySchema);
