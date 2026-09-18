@@ -529,7 +529,7 @@ vehicleRouter.use(requirePermission('vehicle.master'));
 
 vehicleRouter.get('/', async (req, res) => {
   try {
-    const { page = 1, limit = 100, search, isActive } = req.query;
+    const { page = 1, limit = 100, search, isActive, status } = req.query;
     const p = Math.max(1, parseInt(page));
     const l = Math.min(200, parseInt(limit) || 100);
     let filter = {};
@@ -537,7 +537,9 @@ vehicleRouter.get('/', async (req, res) => {
       const regex = new RegExp(search, 'i');
       filter.$or = [{ vehicleNumber: regex }, { driverName: regex }, { make: regex }];
     }
+    // Support both isActive and status parameters for compatibility
     if (isActive !== undefined) filter.isActive = isActive === 'true';
+    if (status !== undefined) filter.isActive = status === 'active';
     const [vehicles, total] = await Promise.all([
       Vehicle.find(filter).sort({ vehicleNumber: 1 }).skip((p-1)*l).limit(l).lean(),
       Vehicle.countDocuments(filter),

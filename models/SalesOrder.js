@@ -163,6 +163,8 @@ const salesOrderSchema = new mongoose.Schema(
     sourceKey: String,
     requestFingerprint: String,
     salesExecutive: { type: mongoose.Schema.Types.ObjectId, ref: 'User' },
+    assignedBranch: { type: mongoose.Schema.Types.ObjectId, ref: 'Branch' },
+    assignedVehicle: { type: mongoose.Schema.Types.ObjectId, ref: 'Vehicle' },
     legacyBranch: { type: String, default: '' },
     remarks: { type: String, default: '' },
     internalNotes: { type: String, default: '' },

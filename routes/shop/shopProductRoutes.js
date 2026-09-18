@@ -89,22 +89,39 @@ router.get('/', async (req, res) => {
 
     if (search) {
       const searchStr = String(search).trim();
-      const searchRegex = new RegExp(escapeRegex(searchStr), 'i');
+      
+      // Split search into individual words for better matching
+      const searchWords = searchStr.split(/\s+/).filter(w => w.length > 0);
+      
+      // Create regex patterns for each word
+      const wordRegexes = searchWords.map(word => new RegExp(escapeRegex(word), 'i'));
+      
+      // Also keep the full phrase regex for exact matches
+      const fullPhraseRegex = new RegExp(escapeRegex(searchStr), 'i');
 
       const [matchedBrands, matchedCats] = await Promise.all([
-        Brand.find({ name: searchRegex, status: 'active' }).select('_id').lean().catch(() => []),
-        Category.find({ name: searchRegex, status: 'active' }).select('_id').lean().catch(() => []),
+        Brand.find({ name: fullPhraseRegex, status: 'active' }).select('_id').lean().catch(() => []),
+        Category.find({ name: fullPhraseRegex, status: 'active' }).select('_id').lean().catch(() => []),
       ]);
 
-      const orConditions = [
-        { itemName: searchRegex },
-        { aliasName: searchRegex },
-        { productCode: searchRegex },
-        { tileSize: searchRegex },
-        { colour: searchRegex },
-        { finish: searchRegex },
-        { tileType: searchRegex },
-      ];
+      // Build search conditions - match if ANY word appears in ANY field
+      const orConditions = [];
+      
+      // For each word, check all searchable fields
+      wordRegexes.forEach(wordRegex => {
+        orConditions.push(
+          { itemName: wordRegex },
+          { aliasName: wordRegex },
+          { productCode: wordRegex },
+          { description: wordRegex },
+          { applications: wordRegex },
+          { tileSize: wordRegex },
+          { colour: wordRegex },
+          { finish: wordRegex },
+          { tileType: wordRegex },
+          { applicationArea: wordRegex }
+        );
+      });
 
       if (matchedBrands.length > 0) {
         orConditions.push({ brand: { $in: matchedBrands.map(b => b._id) } });
