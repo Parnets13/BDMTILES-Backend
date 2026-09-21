@@ -5,6 +5,7 @@ import SalesOrder from '../models/SalesOrder.js';
 import { applyStockMovement, stockOperationKey } from '../services/stockMovementService.js';
 import { stableUomSnapshot } from '../services/stockUomService.js';
 import User from '../models/User.js';
+import Vehicle from '../models/Vehicle.js';
 import { ROLE_DEFAULT_PERMISSIONS } from '../config/permissions.js';
 import { protect, requirePermission, requireAnyPermission } from '../middleware/auth.js';
 import { requireBranch } from '../utils/branchScope.js';
@@ -18,6 +19,7 @@ router.use(requireBranch);
 router.get(['/', '/stats', '/:id'], requireAnyPermission('picking.management', 'sorting.management', 'dispatch.management'));
 router.get('/assignable-staff', requireAnyPermission('picking.management', 'sorting.management', 'dispatch.management'));
 router.get('/delivery-executives', requireAnyPermission('dispatch.management', 'dispatch.verify'));
+router.get('/available-vehicles', requireAnyPermission('dispatch.management', 'dispatch.verify'));
 router.post('/generate/:soId', requireAnyPermission('sales.order.approve', 'picking.management'));
 router.patch(
   ['/:id/assign', '/:id/start', '/:id/complete-picking', '/:id/verify'],
@@ -237,6 +239,22 @@ router.get('/delivery-executives', async (req, res) => {
       .lean();
 
     res.json({ success: true, data: users });
+  } catch (e) { res.status(500).json({ success: false, message: e.message }); }
+});
+
+// Available vehicles for loading verification — active vehicles.
+// Kept on pickListRoutes so it is reachable by warehouse staff (the /masters/vehicles
+// API is gated behind vehicle.master, which warehouse staff do not hold).
+router.get('/available-vehicles', async (req, res) => {
+  try {
+    const vehicles = await Vehicle.find({
+      isActive: true,
+    })
+      .select('vehicleNumber vehicleType driverName driverPhone')
+      .sort({ vehicleNumber: 1 })
+      .lean();
+
+    res.json({ success: true, data: vehicles });
   } catch (e) { res.status(500).json({ success: false, message: e.message }); }
 });
 
