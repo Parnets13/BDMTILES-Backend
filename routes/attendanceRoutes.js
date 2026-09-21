@@ -18,20 +18,21 @@ router.post('/mark', async (req, res) => {
     const branchId = req.branchId;
     
     // Find or create employee record
-    let employee = await Employee.findOne({ user: userId });
+    let employee = await Employee.findOne({ userId: userId });
     
     // If no employee record exists, create one automatically
     if (!employee) {
       console.log('[Attendance] Creating employee record for user:', userId);
+      const empId = await Employee.generateEmpId();
       employee = await Employee.create({
-        user: userId,
-        employeeCode: `EMP-${Date.now()}`, // Auto-generate employee code
+        userId: userId,
+        empId: empId,
         name: req.user.name || 'Employee',
         mobile: req.user.mobile || '0000000000',
         dateOfJoining: new Date(),
         department: 'Warehouse',
         designation: 'Staff',
-        branch: branchId,
+        branchId: branchId,
         status: 'Active',
       });
     }
@@ -91,20 +92,21 @@ router.get('/today', async (req, res) => {
     const branchId = req.branchId;
 
     // Find or create employee record
-    let employee = await Employee.findOne({ user: userId });
+    let employee = await Employee.findOne({ userId: userId });
     
     // If no employee record, create one automatically
     if (!employee) {
       console.log('[Attendance] Creating employee record for user:', userId);
+      const empId = await Employee.generateEmpId();
       employee = await Employee.create({
-        user: userId,
-        employeeCode: `EMP-${Date.now()}`,
+        userId: userId,
+        empId: empId,
         name: req.user.name || 'Employee',
         mobile: req.user.mobile || '0000000000',
         dateOfJoining: new Date(),
         department: 'Warehouse',
         designation: 'Staff',
-        branch: branchId,
+        branchId: branchId,
         status: 'Active',
       });
     }
@@ -142,17 +144,18 @@ router.get('/calendar', async (req, res) => {
     const branchId = req.branchId;
     
     // Find or create employee record
-    let employee = await Employee.findOne({ user: userId });
+    let employee = await Employee.findOne({ userId: userId });
     if (!employee) {
+      const empId = await Employee.generateEmpId();
       employee = await Employee.create({
-        user: userId,
-        employeeCode: `EMP-${Date.now()}`,
+        userId: userId,
+        empId: empId,
         name: req.user.name || 'Employee',
         mobile: req.user.mobile || '0000000000',
         dateOfJoining: new Date(),
         department: 'Warehouse',
         designation: 'Staff',
-        branch: branchId,
+        branchId: branchId,
         status: 'Active',
       });
     }
@@ -225,17 +228,18 @@ router.get('/summary', async (req, res) => {
     const branchId = req.branchId;
     
     // Find or create employee record
-    let employee = await Employee.findOne({ user: userId });
+    let employee = await Employee.findOne({ userId: userId });
     if (!employee) {
+      const empId = await Employee.generateEmpId();
       employee = await Employee.create({
-        user: userId,
-        employeeCode: `EMP-${Date.now()}`,
+        userId: userId,
+        empId: empId,
         name: req.user.name || 'Employee',
         mobile: req.user.mobile || '0000000000',
         dateOfJoining: new Date(),
         department: 'Warehouse',
         designation: 'Staff',
-        branch: branchId,
+        branchId: branchId,
         status: 'Active',
       });
     }
