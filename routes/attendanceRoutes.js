@@ -1,7 +1,8 @@
 import { Router } from 'express';
 import Attendance from '../models/Attendance.js';
 import Employee from '../models/Employee.js';
-import { protect, requireBranch } from '../middleware/auth.js';
+import { protect } from '../middleware/auth.js';
+import { requireBranch } from '../utils/branchScope.js';
 
 const router = Router();
 router.use(protect);
