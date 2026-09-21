@@ -27,9 +27,12 @@ router.post('/mark', async (req, res) => {
         user: userId,
         employeeCode: `EMP-${Date.now()}`, // Auto-generate employee code
         name: req.user.name || 'Employee',
+        mobile: req.user.mobile || '0000000000',
+        dateOfJoining: new Date(),
+        department: 'Warehouse',
+        designation: 'Staff',
         branch: branchId,
         status: 'Active',
-        joiningDate: new Date(),
       });
     }
 
@@ -97,9 +100,12 @@ router.get('/today', async (req, res) => {
         user: userId,
         employeeCode: `EMP-${Date.now()}`,
         name: req.user.name || 'Employee',
+        mobile: req.user.mobile || '0000000000',
+        dateOfJoining: new Date(),
+        department: 'Warehouse',
+        designation: 'Staff',
         branch: branchId,
         status: 'Active',
-        joiningDate: new Date(),
       });
     }
 
@@ -142,9 +148,12 @@ router.get('/calendar', async (req, res) => {
         user: userId,
         employeeCode: `EMP-${Date.now()}`,
         name: req.user.name || 'Employee',
+        mobile: req.user.mobile || '0000000000',
+        dateOfJoining: new Date(),
+        department: 'Warehouse',
+        designation: 'Staff',
         branch: branchId,
         status: 'Active',
-        joiningDate: new Date(),
       });
     }
 
@@ -222,9 +231,12 @@ router.get('/summary', async (req, res) => {
         user: userId,
         employeeCode: `EMP-${Date.now()}`,
         name: req.user.name || 'Employee',
+        mobile: req.user.mobile || '0000000000',
+        dateOfJoining: new Date(),
+        department: 'Warehouse',
+        designation: 'Staff',
         branch: branchId,
         status: 'Active',
-        joiningDate: new Date(),
       });
     }
 
