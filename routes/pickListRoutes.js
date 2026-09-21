@@ -17,6 +17,7 @@ router.use(requireBranch);
 
 router.get(['/', '/stats', '/:id'], requireAnyPermission('picking.management', 'sorting.management', 'dispatch.management'));
 router.get('/assignable-staff', requireAnyPermission('picking.management', 'sorting.management', 'dispatch.management'));
+router.get('/delivery-executives', requireAnyPermission('dispatch.management', 'dispatch.verify'));
 router.post('/generate/:soId', requireAnyPermission('sales.order.approve', 'picking.management'));
 router.patch(
   ['/:id/assign', '/:id/start', '/:id/complete-picking', '/:id/verify'],
@@ -221,6 +222,24 @@ router.get('/assignable-staff', async (req, res) => {
   } catch (e) { res.status(500).json({ success: false, message: e.message }); }
 });
 
+// Delivery executives for loading verification — active users with delivery_executive role.
+// Kept on pickListRoutes so it is reachable by warehouse staff (the /users API is gated
+// behind users.manage, which warehouse staff do not hold).
+router.get('/delivery-executives', async (req, res) => {
+  try {
+    const users = await User.find({
+      status: 'Active',
+      role: 'delivery_executive',
+      assignedBranches: req.branchId,
+    })
+      .select('name phone email')
+      .sort({ name: 1 })
+      .lean();
+
+    res.json({ success: true, data: users });
+  } catch (e) { res.status(500).json({ success: false, message: e.message }); }
+});
+
 router.get('/:id', async (req, res) => {
   try {
     const pickList = await PickList.findOne({ _id: req.params.id, branch: req.branchId })
@@ -229,6 +248,7 @@ router.get('/:id', async (req, res) => {
       .populate('packedBy', 'name')
       .populate('verifiedBy', 'name')
       .populate('loadingVerifiedBy', 'name')
+      .populate('deliveryExecutive', 'name phone')
       .populate('salesOrder', 'orderNumber dealerName dealerCode orderDate')
       .populate('items.product', 'productCode itemName images')
       .lean();
@@ -693,6 +713,14 @@ router.patch('/:id/verify-loading', async (req, res) => {
       claimed.loadingVerifiedBy = req.user._id;
       claimed.loadingEndTime = verifiedAt;
       claimed.remarks = req.body.remarks ?? claimed.remarks;
+      
+      // Save driver & vehicle details if provided
+      if (req.body.deliveryExecutive) claimed.deliveryExecutive = req.body.deliveryExecutive;
+      if (req.body.vehicleNumber) claimed.vehicleNumber = req.body.vehicleNumber;
+      if (req.body.vehicleType) claimed.vehicleType = req.body.vehicleType;
+      if (req.body.driverName) claimed.driverName = req.body.driverName;
+      if (req.body.driverPhone) claimed.driverPhone = req.body.driverPhone;
+      
       claimed.loadingVerificationProcessing = false;
       await claimed.save({ session });
       loaded = claimed;
