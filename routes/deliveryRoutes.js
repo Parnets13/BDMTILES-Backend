@@ -97,7 +97,10 @@ router.get('/', async (req, res) => {
       const regex = new RegExp(search, 'i');
       filter.$or = [{ deliveryNumber: regex }, { orderNumber: regex }, { dealerName: regex }, { tripNumber: regex }];
     }
-    if (status) filter.status = status;
+    if (status) {
+      const statuses = String(status).split(',').map(s => s.trim()).filter(Boolean);
+      filter.status = statuses.length === 1 ? statuses[0] : { $in: statuses };
+    }
     if (deliveryExecutive && req.user.role !== 'delivery_executive') filter.deliveryExecutive = deliveryExecutive;
 
     const [deliveries, total] = await Promise.all([
