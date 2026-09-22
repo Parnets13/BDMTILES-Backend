@@ -79,7 +79,7 @@ const setSalesOrderDeliveryStatus = async (salesOrderId, branch, _hasDeliverySho
 
 const isPodEvidenceReference = value => {
   if (!value) return false;
-  return /^(https?:\/\/|data:image\/(?:png|jpeg|jpg|webp);base64,|\/?uploads\/)/i.test(value);
+  return /^(https?:\/\/|data:image\/(?:png|jpeg|jpg|webp);base64,|data:text\/plain;base64,|\/?uploads\/)/i.test(value);
 };
 
 const stateConflict = (res, delivery, expected, action) => res.status(409).json({
