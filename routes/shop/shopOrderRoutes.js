@@ -29,7 +29,14 @@ const toTracking = (order, delivery) => ({
   deliveryAddress: order.deliveryAddress || '',
   grandTotal: order.grandTotal,
   subtotal: order.subtotal,
+  totalDiscount: order.totalDiscount,
+  totalSchemeDiscount: order.totalSchemeDiscount,
   totalTax: order.totalTax,
+  freightCharges: order.freightCharges,
+  loadingCharges: order.loadingCharges,
+  installationCharges: order.installationCharges,
+  otherCharges: order.otherCharges,
+  roundOff: order.roundOff,
   items: (order.items || []).map((it) => ({
     productId: it.product,
     name: it.productName,
@@ -50,6 +57,7 @@ const toTracking = (order, delivery) => ({
         deliveryDate: delivery.deliveryDate || null,
       }
     : null,
+  cancellationReason: order.cancellationReason,
 });
 
 // A website customer can only order stock that is actually available. The reservation in

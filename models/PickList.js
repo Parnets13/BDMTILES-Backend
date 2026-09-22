@@ -107,6 +107,13 @@ const pickListSchema = new mongoose.Schema(
     deliveryRoute: { type: String, default: '' },
     deliveryAddress: { type: String, default: '' },
 
+    // Driver & Vehicle details (captured at loading verification)
+    deliveryExecutive: { type: mongoose.Schema.Types.ObjectId, ref: 'User' },
+    vehicleNumber: { type: String, default: '' },
+    vehicleType: { type: String, default: '' },
+    driverName: { type: String, default: '' },
+    driverPhone: { type: String, default: '' },
+
     // Notes
     remarks: { type: String, default: '' },
     supervisorRemarks: { type: String, default: '' },

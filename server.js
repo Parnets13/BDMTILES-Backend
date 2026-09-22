@@ -65,6 +65,7 @@ import supportChatRoutes from './routes/supportChatRoutes.js';
 import branchRoutes from './routes/branchRoutes.js';
 import salesExecutiveRoutes from './routes/salesExecutiveRoutes.js';
 import dealerOrderRequestRoutes from './routes/dealerOrderRequestRoutes.js';
+import attendanceRoutes from './routes/attendanceRoutes.js';
 import { startReservationExpiryScheduler } from './services/reservationExpiryScheduler.js';
 import { startQuotationHoldExpiryScheduler } from './services/quotationHoldExpiryScheduler.js';
 
@@ -179,6 +180,7 @@ app.use('/api/v1/incentives', incentiveRoutes);
 app.use('/api/v1/targets', targetRoutes); // SE target authoring (facade over target incentive rules)
 app.use('/api/v1/support-chat', supportChatRoutes); // admin view of the dealer<->executive thread
 app.use('/api/v1/sales-executive', salesExecutiveRoutes);
+app.use('/api/v1/attendance', attendanceRoutes);
 
 // Static uploads (supplier financial evidence is never public)
 app.use('/uploads/supplier-credit-notes', (_req, res) => res.status(404).json({ success: false, message: 'Not found.' }));
