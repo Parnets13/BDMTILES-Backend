@@ -1,11 +1,13 @@
 import { Router } from 'express';
 import mongoose from 'mongoose';
 import PickList from '../models/PickList.js';
+import DispatchTrip from '../models/DispatchTrip.js';
 import SalesOrder from '../models/SalesOrder.js';
 import { applyStockMovement, stockOperationKey } from '../services/stockMovementService.js';
 import { stableUomSnapshot } from '../services/stockUomService.js';
 import User from '../models/User.js';
 import Vehicle from '../models/Vehicle.js';
+import Delivery from '../models/Delivery.js';
 import { ROLE_DEFAULT_PERMISSIONS } from '../config/permissions.js';
 import { protect, requirePermission, requireAnyPermission } from '../middleware/auth.js';
 import { requireBranch } from '../utils/branchScope.js';
@@ -741,6 +743,58 @@ router.patch('/:id/verify-loading', async (req, res) => {
       
       claimed.loadingVerificationProcessing = false;
       await claimed.save({ session });
+
+      // Propagate driver/vehicle selection to the linked DispatchTrip so that
+      // when the trip is dispatched the Delivery document inherits the correct
+      // deliveryExecutive. This is the source that deliveryRoutes reads for
+      // role-based filtering — without this the driver cannot see their deliveries.
+      if (claimed.dispatchTrip && (req.body.deliveryExecutive || req.body.vehicleNumber)) {
+        const tripUpdate = {};
+        if (req.body.deliveryExecutive) {
+          tripUpdate.deliveryExecutive = req.body.deliveryExecutive;
+          // Resolve the name so the denormalised field stays consistent
+          const deUser = await User.findById(req.body.deliveryExecutive)
+            .select('name')
+            .session(session)
+            .lean();
+          tripUpdate.deliveryExecutiveName = deUser?.name || req.body.driverName || '';
+        }
+        if (req.body.vehicleNumber) tripUpdate.vehicleNumber = req.body.vehicleNumber;
+        if (req.body.vehicleType)   tripUpdate.vehicleType   = req.body.vehicleType;
+        if (req.body.driverName)    tripUpdate.driverName    = req.body.driverName;
+        if (req.body.driverPhone)   tripUpdate.driverPhone   = req.body.driverPhone;
+        await DispatchTrip.updateOne(
+          { _id: claimed.dispatchTrip, branch: req.branchId },
+          { $set: tripUpdate },
+          { session }
+        );
+
+        // If the trip was already dispatched before loading verification ran
+        // (edge case: re-entry after partial dispatch), update the Delivery
+        // document directly so the driver's role-based filter works immediately
+        // without waiting for a re-dispatch.
+        if (tripUpdate.deliveryExecutive) {
+          const deliveryUpdate = {
+            deliveryExecutive: tripUpdate.deliveryExecutive,
+            deliveryExecutiveName: tripUpdate.deliveryExecutiveName || '',
+          };
+          if (tripUpdate.vehicleNumber) deliveryUpdate.vehicleNumber = tripUpdate.vehicleNumber;
+          if (tripUpdate.vehicleType)   deliveryUpdate.vehicleType   = tripUpdate.vehicleType;
+          if (tripUpdate.driverName)    deliveryUpdate.driverName    = tripUpdate.driverName;
+          if (tripUpdate.driverPhone)   deliveryUpdate.driverPhone   = tripUpdate.driverPhone;
+          await Delivery.updateMany(
+            {
+              branch: req.branchId,
+              dispatchTrip: claimed.dispatchTrip,
+              // Only update deliveries that haven't been completed yet
+              status: { $nin: ['delivered', 'partially_delivered', 'failed'] },
+            },
+            { $set: deliveryUpdate },
+            { session }
+          );
+        }
+      }
+
       loaded = claimed;
     });
     return res.json({
