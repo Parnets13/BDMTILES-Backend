@@ -812,6 +812,72 @@ router.patch('/:id/verify-loading', async (req, res) => {
         }
       }
 
+      // Auto-create a Delivery document immediately when:
+      //  • the PickList has a deliveryExecutive assigned, AND
+      //  • it has no dispatchTrip (no web trip was created yet)
+      // This lets the driver see the order in the Delivery tab right away
+      // without waiting for the web admin to create and dispatch a trip.
+      if (claimed.deliveryExecutive && !claimed.dispatchTrip) {
+        const existingDel = await Delivery.findOne({
+          salesOrder: claimed.salesOrder,
+          branch: claimed.branch,
+        }).session(session).lean();
+
+        if (!existingDel && claimed.salesOrder) {
+          const so = await SalesOrder.findById(claimed.salesOrder)
+            .select('orderNumber dealer dealerName dealerCode customerName customerPhone deliveryAddress')
+            .session(session)
+            .lean();
+
+          if (so) {
+            // Resolve driver name for the denormalised field
+            let deUser = null;
+            if (claimed.deliveryExecutive) {
+              deUser = await User.findById(claimed.deliveryExecutive)
+                .select('name')
+                .session(session)
+                .lean();
+            }
+
+            const deliveryNumber = await generateBranchNumber(
+              claimed.branch,
+              'delivery',
+              new Date(),
+              { session },
+            );
+
+            await Delivery.create([{
+              deliveryNumber,
+              branch: claimed.branch,
+              salesOrder: claimed.salesOrder,
+              orderNumber: so.orderNumber,
+              dealer: so.dealer || undefined,
+              dealerName: so.dealerName || so.customerName || '',
+              dealerCode: so.dealerCode || '',
+              contactPhone: so.customerPhone || '',
+              deliveryAddress: so.deliveryAddress || '',
+              deliveryExecutive: claimed.deliveryExecutive,
+              deliveryExecutiveName: deUser?.name || claimed.driverName || '',
+              vehicleNumber: claimed.vehicleNumber || '',
+              vehicleType: claimed.vehicleType || '',
+              driverName: claimed.driverName || '',
+              driverPhone: claimed.driverPhone || '',
+              totalBoxes: claimed.totalBoxes || 0,
+              unfulfilledQty: 0,
+              hasFulfillmentShortage: false,
+              items: [],
+              itemReconciliationState: 'legacy',
+              otp: String(Math.floor(100000 + Math.random() * 900000)),
+              status: 'assigned',
+              startTime: new Date(),
+              createdBy: req.user._id,
+            }], { session });
+
+            console.log(`[verify-loading] Auto-created Delivery ${deliveryNumber} for ${claimed.pickListNumber} → ${deUser?.name}`);
+          }
+        }
+      }
+
       loaded = claimed;
     });
     return res.json({
