@@ -246,8 +246,9 @@ router.patch('/:id/reached', async (req, res) => {
     if (delivery.status !== 'in_transit') return stateConflict(res, delivery, 'in_transit', 'mark reached');
     delivery.status = 'reached';
     delivery.reachTime = new Date();
-    const lat = Number(req.body.lat);
-    const lng = Number(req.body.lng);
+    const body = req.body || {};
+    const lat = Number(body.lat);
+    const lng = Number(body.lng);
     if (Number.isFinite(lat) && Number.isFinite(lng)) delivery.deliveryLocation = { lat, lng };
     await delivery.save();
     await syncDispatchTrip(delivery);
