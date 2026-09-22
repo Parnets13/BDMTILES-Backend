@@ -38,8 +38,20 @@ const validityHistorySchema = new mongoose.Schema({
   requeued: { type: Boolean, default: false },
 }, { _id: true });
 
+const holdExtensionSchema = new mongoose.Schema({
+  version: { type: Number, required: true },
+  previousExpiresAt: Date,
+  extendedTo: { type: Date, required: true },
+  reason: { type: String, required: true, trim: true, maxlength: 1000 },
+  extendedBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User' },
+  extendedAt: { type: Date, default: Date.now },
+}, { _id: true });
+
 const quotationItemSchema = new mongoose.Schema({
   product: { type: mongoose.Schema.Types.ObjectId, ref: 'Product', required: true },
+  // Set on a split child, pointing at the parent quotation line it came from, so
+  // the original request stays traceable after the split.
+  parentQuotationItem: { type: mongoose.Schema.Types.ObjectId },
   productCode: String,
   productName: String,
   productImage: { type: String, default: '' },
@@ -55,6 +67,22 @@ const quotationItemSchema = new mongoose.Schema({
       message: 'convertedQuantity cannot exceed quotation item quantity.',
     },
   },
+  // Quantity of this line currently held in Stock.quotedQty, in entered units.
+  // A hold is a real claim on stock, placed at approval and consumed by
+  // conversion, so a held line can never fail to become a Sales Order.
+  holdQuantity: {
+    type: Number,
+    default: 0,
+    min: 0,
+    validate: {
+      validator(value) { return Number(value || 0) <= Number(this.quantity || 0) + 0.0001; },
+      message: 'holdQuantity cannot exceed quotation item quantity.',
+    },
+  },
+  // Monotonic counters that make each hold/release stock movement idempotent.
+  // Mirrors SalesOrder.items[].reservationVersion.
+  holdVersion: { type: Number, default: 0, min: 0 },
+  holdReleaseVersion: { type: Number, default: 0, min: 0 },
   unit: { type: String, default: 'Box' },
   // Immutable inventory-UOM snapshot captured whenever this quotation version
   // is saved. Live FIFO allocation consumes Stock quantities in base units.
@@ -124,7 +152,16 @@ const quotationSchema = new mongoose.Schema(
     grandTotal: { type: Number, default: 0 },
     status: {
       type: String,
-      enum: ['draft', 'pending_approval', 'approved', 'sent', 'accepted', 'converted', 'expired', 'cancelled'],
+      enum: [
+        'draft', 'pending_approval', 'approved', 'sent', 'accepted', 'converted', 'expired', 'cancelled',
+        // Terminal parent record of a stock split. Preserves exactly what the
+        // dealer asked for; never convertible and never in the FIFO queue.
+        'split',
+        // Shortfall child of a split: quantity we have no stock for. Holds a FIFO
+        // position so it is served fairly when a GRN lands, but is deliberately
+        // not a firm offer and cannot be sent until stock is confirmed.
+        'pending_stock',
+      ],
       default: 'draft',
     },
     approvalRequired: { type: Boolean, default: false },
@@ -145,6 +182,43 @@ const quotationSchema = new mongoose.Schema(
     fullyConvertedAt: Date,
     sourceDealerOrderRequest: { type: mongoose.Schema.Types.ObjectId, ref: 'DealerOrderRequest' },
     convertedAt: Date,
+
+    // ── Stock hold ────────────────────────────────────────────────────────────
+    // A hold moves Stock.availableQty into Stock.quotedQty, so the quantity is
+    // genuinely unavailable to anyone else. Conversion moves quotedQty straight
+    // to reservedQty without touching availableQty, which is why converting a
+    // held quotation cannot fail on stock.
+    holdStatus: {
+      type: String,
+      enum: ['none', 'held', 'partial', 'consumed', 'released', 'expired'],
+      default: 'none',
+    },
+    heldAt: Date,
+    heldBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User' },
+    // A hold with no expiry would let anyone freeze the warehouse by raising
+    // quotations. Set from QUOTATION_HOLD_TTL_HOURS when the hold is placed.
+    holdExpiresAt: Date,
+    holdExpiryState: { type: String, enum: ['none', 'active', 'extended', 'expired', 'released'], default: 'none' },
+    holdExpiryVersion: { type: Number, min: 0, default: 0 },
+    holdExpiredAt: Date,
+    holdReleasedAt: Date,
+    holdConsumedAt: Date,
+    holdExpiryReason: { type: String, default: '' },
+    holdExtensions: { type: [holdExtensionSchema], default: [] },
+
+    // ── Stock split lineage ───────────────────────────────────────────────────
+    // One splitGroupId ties the parent and both children together.
+    splitGroupId: { type: mongoose.Schema.Types.ObjectId },
+    splitRole: { type: String, enum: ['none', 'parent', 'available', 'shortfall'], default: 'none' },
+    // Children point back at the immutable parent.
+    splitFromQuotation: { type: mongoose.Schema.Types.ObjectId, ref: 'Quotation' },
+    // Parent points at its children.
+    splitQuotations: [{ type: mongoose.Schema.Types.ObjectId, ref: 'Quotation' }],
+    splitAt: Date,
+    splitBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User' },
+    // Fingerprint of the allocation plan that was actually executed, so a split
+    // can be audited against what the approver confirmed.
+    splitPlanHash: { type: String, default: '' },
     remarks: { type: String, default: '' },
     termsAndConditions: { type: String, default: '' },
     tallySyncStatus: { type: String, enum: ['not_synced', 'pending', 'synced', 'failed'], default: 'not_synced' },
@@ -157,6 +231,17 @@ quotationSchema.index({ branch: 1, status: 1, quotationDate: -1 });
 quotationSchema.index({ branch: 1, validUntil: 1, status: 1 });
 quotationSchema.index({ branch: 1, conversionState: 1, quotationDate: -1 });
 quotationSchema.index({ branch: 1, status: 1, stockQueuedAt: 1, createdAt: 1 });
+// Drives the hold expiry sweeper.
+quotationSchema.index({ branch: 1, holdStatus: 1, holdExpiryState: 1, holdExpiresAt: 1 });
+// Enumerates a split family from any member.
+quotationSchema.index(
+  { branch: 1, splitGroupId: 1, splitRole: 1 },
+  { partialFilterExpression: { splitGroupId: { $type: 'objectId' } } },
+);
+quotationSchema.index(
+  { branch: 1, splitFromQuotation: 1 },
+  { partialFilterExpression: { splitFromQuotation: { $type: 'objectId' } } },
+);
 quotationSchema.index({ branch: 1, dealer: 1, status: 1 });
 quotationSchema.index({ branch: 1, quotationNumber: 1 }, { unique: true });
 quotationSchema.index({ dealer: 1, status: 1 });

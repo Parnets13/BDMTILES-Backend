@@ -48,7 +48,10 @@ router.get('/', async (req, res) => {
     if (status) filter.status = status;
     const [data, total] = await Promise.all([
       Dispatch.find(filter).sort({ createdAt: -1 }).skip((p-1)*l).limit(l)
-        .populate('route', 'name').populate('warehouse', 'name').lean(),
+        .populate('route', 'name')
+        .populate('warehouse', 'name')
+        .populate('deliveryExecutive', 'name phone email status')
+        .lean(),
       Dispatch.countDocuments(filter),
     ]);
     res.json({ success: true, data, pagination: { currentPage: p, totalPages: Math.ceil(total/l), totalItems: total } });
@@ -86,7 +89,10 @@ router.get('/pending-orders', async (req, res) => {
 router.get('/:id', async (req, res) => {
   try {
     const d = await Dispatch.findOne({ _id: req.params.id, branch: req.branchId })
-      .populate('route', 'name').populate('warehouse', 'name').lean();
+      .populate('route', 'name')
+      .populate('warehouse', 'name')
+      .populate('deliveryExecutive', 'name phone email status')
+      .lean();
     if (!d) return res.status(404).json({ success: false, message: 'Not found.' });
     res.json({ success: true, data: d });
   } catch (e) { res.status(500).json({ success: false, message: e.message }); }
@@ -95,11 +101,39 @@ router.get('/:id', async (req, res) => {
 // POST /api/v1/dispatch — compatibility endpoint; new workflows should use dispatch-trips
 router.post('/', async (req, res) => {
   try {
-    const data = { ...req.body, branch: req.branchId, createdBy: req.user._id };
+    // Compatibility dispatches always begin in planning. Identity fields are
+    // allow-listed here so callers cannot forge an executive or bypass status.
+    const data = {
+      branch: req.branchId,
+      dispatchDate: req.body.dispatchDate,
+      route: req.body.route,
+      routeName: req.body.routeName,
+      warehouse: req.body.warehouse,
+      orders: Array.isArray(req.body.orders) ? req.body.orders : [],
+      estimatedArrival: req.body.estimatedArrival,
+      remarks: req.body.remarks,
+      status: 'planned',
+      createdBy: req.user._id,
+    };
+    if (req.body.vehicle || req.body.vehicleRef) {
+      const { vehicle } = await resolveVehicleForAssignment({
+        vehicleId: req.body.vehicleRef || undefined,
+        vehicleNumber: req.body.vehicleRef ? undefined : req.body.vehicle,
+        allowBusy: true,
+        branchId: req.branchId,
+      });
+      data.vehicleRef = vehicle._id;
+      data.vehicle = vehicle.vehicleNumber;
+      data.vehicleType = vehicle.vehicleType || '';
+      data.driverName = String(req.body.driverName || '').trim() || vehicle.driverName || '';
+      data.driverPhone = String(req.body.driverPhone || '').trim() || vehicle.driverPhone || '';
+      data.deliveryExecutive = vehicle.deliveryExecutive?._id || vehicle.deliveryExecutive || null;
+      data.deliveryExecutiveName = vehicle.deliveryExecutive?.name || '';
+    }
     const salesOrderIds = await assertSalesOrdersInBranch(data.orders, req.branchId);
     if (data.warehouse) await assertWarehousesInBranch([data.warehouse], req.branchId);
     data.dispatchNumber = await generateBranchNumber(req.branchId, 'dispatch', data.dispatchDate || new Date());
-    data.totalOrders = data.orders?.length || 0;
+    data.totalOrders = data.orders.length;
     const dispatch = await Dispatch.create(data);
     if (salesOrderIds.length) {
       await SalesOrder.updateMany(
@@ -107,6 +141,7 @@ router.post('/', async (req, res) => {
         { $set: { status: 'partial_dispatch' } }
       );
     }
+    await dispatch.populate('deliveryExecutive', 'name phone email status');
     res.status(201).json({ success: true, message: `Dispatch ${dispatch.dispatchNumber} planned.`, data: dispatch });
   } catch (e) { res.status(e.status || (['CastError', 'ValidationError'].includes(e.name) ? 422 : 500)).json({ success: false, message: e.message }); }
 });
@@ -132,15 +167,19 @@ router.patch('/:id/status', async (req, res) => {
         vehicleNumber: req.body.vehicleRef ? undefined : req.body.vehicle,
         // A Dispatch is not a DispatchTrip, so it does not hold a trip slot.
         allowBusy: true,
+        branchId: req.branchId,
       });
       updates.vehicleRef = vehicle._id;
       updates.vehicle = vehicle.vehicleNumber;
       updates.vehicleType = vehicle.vehicleType || '';
-      if (!String(req.body.driverName || '').trim() && vehicle.driverName) updates.driverName = vehicle.driverName;
-      if (!String(req.body.driverPhone || '').trim() && vehicle.driverPhone) updates.driverPhone = vehicle.driverPhone;
-    }
-    for (const field of ['driverName', 'driverPhone']) {
-      if (String(req.body[field] || '').trim()) updates[field] = String(req.body[field]).trim();
+      updates.deliveryExecutive = vehicle.deliveryExecutive?._id || vehicle.deliveryExecutive || null;
+      updates.deliveryExecutiveName = vehicle.deliveryExecutive?.name || '';
+      updates.driverName = String(req.body.driverName || '').trim() || vehicle.driverName || '';
+      updates.driverPhone = String(req.body.driverPhone || '').trim() || vehicle.driverPhone || '';
+    } else {
+      for (const field of ['driverName', 'driverPhone']) {
+        if (Object.prototype.hasOwnProperty.call(req.body, field)) updates[field] = String(req.body[field] || '').trim();
+      }
     }
     if (req.body.departureTime) {
       const when = new Date(req.body.departureTime);
@@ -151,7 +190,7 @@ router.patch('/:id/status', async (req, res) => {
       { _id: current._id, branch: req.branchId },
       updates,
       { new: true, runValidators: true }
-    );
+    ).populate('deliveryExecutive', 'name phone email status');
     // If completed, mark all linked SOs as dispatched
     if ((status === 'completed' || status === 'in_transit') && salesOrderIds.length) {
       await SalesOrder.updateMany(

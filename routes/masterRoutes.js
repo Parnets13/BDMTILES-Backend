@@ -597,6 +597,65 @@ router.use('/suppliers', supplierRouter);
 // ═══════════════════════════════════════
 const vehicleRouter = Router();
 vehicleRouter.use(requirePermission('vehicle.master'));
+vehicleRouter.use(requireBranch);
+
+const populateVehicleExecutive = query => query.populate(
+  'deliveryExecutive',
+  'name phone email role status'
+);
+
+const normalizeVehicleExecutive = async (body) => {
+  const data = { ...body };
+  if (!Object.prototype.hasOwnProperty.call(data, 'deliveryExecutive')) return data;
+
+  const selectedId = data.deliveryExecutive?._id || data.deliveryExecutive;
+  if (selectedId === null || selectedId === '') {
+    data.deliveryExecutive = null;
+    return data;
+  }
+  if (!mongoose.isValidObjectId(selectedId)) {
+    throw Object.assign(new Error('Select a valid Delivery Executive account.'), { status: 422 });
+  }
+  const executive = await User.findOne({
+    _id: selectedId,
+    role: 'delivery_executive',
+    status: 'Active',
+  }).select('_id').lean();
+  if (!executive) {
+    throw Object.assign(new Error('The selected account must be an active Delivery Executive.'), { status: 422 });
+  }
+  data.deliveryExecutive = executive._id;
+  return data;
+};
+
+const sendVehicleError = (res, error) => {
+  if (error.code === 11000) return res.status(400).json({ success: false, message: 'Vehicle number already exists.' });
+  const status = error.status || (['CastError', 'ValidationError'].includes(error.name) ? 422 : 500);
+  return res.status(status).json({ success: false, message: error.message });
+};
+
+// Narrow User Management lookup for Vehicle Master. This avoids requiring the
+// broader users.manage permission merely to choose a Delivery Executive.
+vehicleRouter.get('/delivery-executives', async (req, res) => {
+  try {
+    const filter = {
+      role: 'delivery_executive',
+      status: 'Active',
+    };
+    if (req.query.search) {
+      const escaped = String(req.query.search).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+      const regex = new RegExp(escaped, 'i');
+      filter.$or = [{ name: regex }, { phone: regex }, { email: regex }];
+    }
+    const users = await User.find(filter)
+      .select('_id name phone email role status assignedBranches')
+      .populate('assignedBranches', 'branchCode name')
+      .sort({ name: 1 })
+      .limit(200)
+      .lean();
+    return res.json({ success: true, data: users });
+  } catch (error) { return sendVehicleError(res, error); }
+});
 
 vehicleRouter.get('/', async (req, res) => {
   try {
@@ -612,29 +671,29 @@ vehicleRouter.get('/', async (req, res) => {
     if (isActive !== undefined) filter.isActive = isActive === 'true';
     if (status !== undefined) filter.isActive = status === 'active';
     const [vehicles, total] = await Promise.all([
-      Vehicle.find(filter).sort({ vehicleNumber: 1 }).skip((p-1)*l).limit(l).lean(),
+      populateVehicleExecutive(Vehicle.find(filter).sort({ vehicleNumber: 1 }).skip((p-1)*l).limit(l)).lean(),
       Vehicle.countDocuments(filter),
     ]);
     res.json({ success: true, data: vehicles, pagination: { currentPage: p, totalPages: Math.ceil(total/l), totalItems: total } });
-  } catch (e) { res.status(500).json({ success: false, message: e.message }); }
+  } catch (e) { sendVehicleError(res, e); }
 });
 
 vehicleRouter.post('/', async (req, res) => {
   try {
-    const vehicle = await Vehicle.create({ ...req.body, createdBy: req.user._id });
+    const data = await normalizeVehicleExecutive(req.body);
+    const vehicle = await Vehicle.create({ ...data, createdBy: req.user._id });
+    await vehicle.populate('deliveryExecutive', 'name phone email role status');
     res.status(201).json({ success: true, message: 'Vehicle added.', data: vehicle });
-  } catch (e) {
-    if (e.code === 11000) return res.status(400).json({ success: false, message: 'Vehicle number already exists.' });
-    res.status(500).json({ success: false, message: e.message });
-  }
+  } catch (e) { sendVehicleError(res, e); }
 });
 
 vehicleRouter.put('/:id', async (req, res) => {
   try {
-    const vehicle = await Vehicle.findByIdAndUpdate(req.params.id, req.body, { new: true, runValidators: true });
+    const data = await normalizeVehicleExecutive(req.body);
+    const vehicle = await populateVehicleExecutive(Vehicle.findByIdAndUpdate(req.params.id, data, { new: true, runValidators: true }));
     if (!vehicle) return res.status(404).json({ success: false, message: 'Not found.' });
     res.json({ success: true, message: 'Vehicle updated.', data: vehicle });
-  } catch (e) { res.status(500).json({ success: false, message: e.message }); }
+  } catch (e) { sendVehicleError(res, e); }
 });
 
 vehicleRouter.delete('/:id', async (req, res) => {

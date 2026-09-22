@@ -346,6 +346,7 @@ export async function listStocks(branchId, query = {}) {
     low_stock: { $and: [{ $gt: ['$availableQty', 0] }, { $lte: ['$availableQty', { $ifNull: ['$product.reorderLevel', 0] }] }] },
     out_of_stock: { $lte: ['$availableQty', 0] },
     reserved: { $gt: ['$reservedQty', 0] },
+    quoted: { $gt: ['$quotedQty', 0] },
     damaged: { $gt: ['$damagedQty', 0] },
     blocked: { $gt: ['$blockedQty', 0] },
     in_transit: { $gt: ['$transitQty', 0] },
@@ -355,7 +356,7 @@ export async function listStocks(branchId, query = {}) {
   if (statuses.some(status => !statusExpressions[status])) throw serviceError(422, 'Unsupported stock status filter.');
   if (statuses.length) pipeline.push({ $match: { $expr: statuses.length === 1 ? statusExpressions[statuses[0]] : { $or: statuses.map(status => statusExpressions[status]) } } });
 
-  const sortFields = { updatedAt: 'updatedAt', createdAt: 'createdAt', totalQty: 'totalQty', availableQty: 'availableQty', reservedQty: 'reservedQty', damagedQty: 'damagedQty', transitQty: 'transitQty', shortQty: 'shortQty', stockValue: 'stockValue', productName: 'product.itemName', warehouseName: 'warehouse.name' };
+  const sortFields = { updatedAt: 'updatedAt', createdAt: 'createdAt', totalQty: 'totalQty', availableQty: 'availableQty', reservedQty: 'reservedQty', quotedQty: 'quotedQty', damagedQty: 'damagedQty', transitQty: 'transitQty', shortQty: 'shortQty', stockValue: 'stockValue', productName: 'product.itemName', warehouseName: 'warehouse.name' };
   const sortBy = query.sortBy || 'updatedAt';
   if (!sortFields[sortBy]) throw serviceError(422, 'Unsupported sortBy value.');
   const sortOrder = query.sortOrder === 'asc' ? 1 : query.sortOrder === 'desc' || !query.sortOrder ? -1 : null;
@@ -385,13 +386,14 @@ export async function getStockSummary(branchId) {
       lowStockCount: { $sum: { $cond: [{ $and: [{ $gt: ['$availableQty', 0] }, { $lte: ['$availableQty', { $ifNull: ['$product.reorderLevel', 0] }] }] }, 1, 0] } },
       outOfStockCount: { $sum: { $cond: [{ $lte: ['$availableQty', 0] }, 1, 0] } },
       reservedCount: { $sum: { $cond: [{ $gt: ['$reservedQty', 0] }, 1, 0] } },
+      quotedCount: { $sum: { $cond: [{ $gt: ['$quotedQty', 0] }, 1, 0] } },
       damagedCount: { $sum: { $cond: [{ $gt: ['$damagedQty', 0] }, 1, 0] } },
       transitCount: { $sum: { $cond: [{ $gt: ['$transitQty', 0] }, 1, 0] } },
       shortCount: { $sum: { $cond: [{ $gt: ['$shortQty', 0] }, 1, 0] } },
     } },
-    { $project: { _id: 0, ...Object.fromEntries(STOCK_BUCKET_FIELDS.map(field => [field, 1])), totalValue: 1, availableValue: 1, skuBuckets: 1, uniqueProducts: { $size: '$products' }, warehouseCount: { $size: '$warehouses' }, inStockCount: 1, lowStockCount: 1, outOfStockCount: 1, reservedCount: 1, damagedCount: 1, transitCount: 1, shortCount: 1 } },
+    { $project: { _id: 0, ...Object.fromEntries(STOCK_BUCKET_FIELDS.map(field => [field, 1])), totalValue: 1, availableValue: 1, skuBuckets: 1, uniqueProducts: { $size: '$products' }, warehouseCount: { $size: '$warehouses' }, inStockCount: 1, lowStockCount: 1, outOfStockCount: 1, reservedCount: 1, quotedCount: 1, damagedCount: 1, transitCount: 1, shortCount: 1 } },
   ]);
-  return summary || { ...Object.fromEntries(STOCK_BUCKET_FIELDS.map(field => [field, 0])), totalValue: 0, availableValue: 0, skuBuckets: 0, uniqueProducts: 0, warehouseCount: 0, inStockCount: 0, lowStockCount: 0, outOfStockCount: 0, reservedCount: 0, damagedCount: 0, transitCount: 0, shortCount: 0 };
+  return summary || { ...Object.fromEntries(STOCK_BUCKET_FIELDS.map(field => [field, 0])), totalValue: 0, availableValue: 0, skuBuckets: 0, uniqueProducts: 0, warehouseCount: 0, inStockCount: 0, lowStockCount: 0, outOfStockCount: 0, reservedCount: 0, quotedCount: 0, damagedCount: 0, transitCount: 0, shortCount: 0 };
 }
 
 async function buildMovementFilter(branchId, query = {}, exactStockId = null) {
@@ -465,6 +467,9 @@ export async function movementSummary(branchId, query = {}) {
       outboundPhysical: { $sum: { $cond: [{ $lt: ['$deltas.totalQty', 0] }, { $abs: '$deltas.totalQty' }, 0] } },
       netPhysical: { $sum: '$deltas.totalQty' }, reservations: { $sum: { $cond: [{ $eq: ['$movementType', 'sales_reservation'] }, '$deltas.reservedQty', 0] } },
       releases: { $sum: { $cond: [{ $in: ['$movementType', ['sales_reservation_release', 'pick_short_release']] }, '$deltas.availableQty', 0] } },
+      quotationHolds: { $sum: { $cond: [{ $eq: ['$movementType', 'quotation_hold'] }, '$deltas.quotedQty', 0] } },
+      quotationHoldReleases: { $sum: { $cond: [{ $eq: ['$movementType', 'quotation_hold_release'] }, '$deltas.availableQty', 0] } },
+      quotationHoldConsumed: { $sum: { $cond: [{ $eq: ['$movementType', 'quotation_hold_consume'] }, '$deltas.reservedQty', 0] } },
       damage: { $sum: '$deltas.damagedQty' },
       damageAdded: { $sum: { $cond: [{ $gt: ['$deltas.damagedQty', 0] }, '$deltas.damagedQty', 0] } },
       damageRemoved: { $sum: { $cond: [{ $lt: ['$deltas.damagedQty', 0] }, { $abs: '$deltas.damagedQty' }, 0] } },
@@ -475,7 +480,7 @@ export async function movementSummary(branchId, query = {}) {
     StockMovement.aggregate([{ $match: filter }, { $group: { _id: { $dateTrunc: { date: '$occurredAt', unit: bucket } }, inbound: { $sum: { $cond: [{ $gt: ['$deltas.totalQty', 0] }, '$deltas.totalQty', 0] } }, outbound: { $sum: { $cond: [{ $lt: ['$deltas.totalQty', 0] }, { $abs: '$deltas.totalQty' }, 0] } }, net: { $sum: '$deltas.totalQty' } } }, { $sort: { _id: 1 } }]),
     StockMovement.aggregate([{ $match: filter }, { $group: { _id: '$sourceType', count: { $sum: 1 }, netPhysical: { $sum: '$deltas.totalQty' } } }, { $sort: { count: -1, _id: 1 } }]),
   ]);
-  return { ...(totals[0] || { inboundPhysical: 0, outboundPhysical: 0, netPhysical: 0, reservations: 0, releases: 0, damage: 0, damageAdded: 0, damageRemoved: 0, transit: 0, returns: 0, adjustments: 0, counts: 0, movements: 0 }), sourceCounts: sources, trend };
+  return { ...(totals[0] || { inboundPhysical: 0, outboundPhysical: 0, netPhysical: 0, reservations: 0, releases: 0, quotationHolds: 0, quotationHoldReleases: 0, quotationHoldConsumed: 0, damage: 0, damageAdded: 0, damageRemoved: 0, transit: 0, returns: 0, adjustments: 0, counts: 0, movements: 0 }), sourceCounts: sources, trend };
 }
 
 export async function reconcileStockBucket(stock) {

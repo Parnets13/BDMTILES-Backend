@@ -22,6 +22,9 @@ const dispatchSchema = new mongoose.Schema(
     vehicleType: { type: String, default: '' },
     driverName: { type: String, default: '' },
     driverPhone: { type: String, default: '' },
+    // User Management account linked through Vehicle Master at assignment time.
+    deliveryExecutive: { type: mongoose.Schema.Types.ObjectId, ref: 'User', default: null },
+    deliveryExecutiveName: { type: String, default: '' },
     route: { type: mongoose.Schema.Types.ObjectId, ref: 'Route' },
     routeName: String,
     warehouse: { type: mongoose.Schema.Types.ObjectId, ref: 'Warehouse' },
@@ -42,5 +45,6 @@ const dispatchSchema = new mongoose.Schema(
 
 dispatchSchema.index({ branch: 1, dispatchNumber: 1 });
 dispatchSchema.index({ branch: 1, status: 1, dispatchDate: -1 });
+dispatchSchema.index({ branch: 1, deliveryExecutive: 1, status: 1 });
 
 export default mongoose.model('Dispatch', dispatchSchema);

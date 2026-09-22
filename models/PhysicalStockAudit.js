@@ -1,7 +1,9 @@
 import mongoose from 'mongoose';
+import { STOCK_BUCKET_FIELDS } from './StockMovement.js';
 
-const STOCK_FIELDS = ['totalQty', 'availableQty', 'reservedQty', 'blockedQty', 'damagedQty', 'sampleQty', 'transitQty', 'shortQty'];
-const quantityShape = () => Object.fromEntries(STOCK_FIELDS.map((field) => [field, { type: Number, default: 0, required: true }]));
+// Derived from the canonical bucket list so a new stock bucket cannot be added
+// without appearing in audit before/after snapshots.
+const quantityShape = () => Object.fromEntries(STOCK_BUCKET_FIELDS.map((field) => [field, { type: Number, default: 0, required: true }]));
 const snapshotSchema = new mongoose.Schema(quantityShape(), { _id: false, id: false });
 const evidenceSchema = new mongoose.Schema({
   documentId: { type: mongoose.Schema.Types.ObjectId, ref: 'Document' },

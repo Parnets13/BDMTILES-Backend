@@ -12,6 +12,7 @@ import {
   createRefreshCredential,
   maxRefreshSessions,
   randomToken,
+  refreshRotationGraceMs,
   setRefreshCookie,
   sha256,
   validateStrongPassword,
@@ -266,8 +267,13 @@ router.post('/refresh-token', async (req, res) => {
         _id: decoded.userId,
         status: 'Active',
         tokenVersion: decoded.tokenVersion,
+        // replacedByHash must still be null: a session that was already rotated
+        // away by an earlier call is never rotated a second time, or the same
+        // dead token could be replayed indefinitely, each time minting a new
+        // "current" session. It is still allowed to satisfy the RACE-LOSER lookup
+        // below during its grace window — it simply can't win the primary match.
         refreshSessions: {
-          $elemMatch: { tokenHash, jtiHash, expiresAt: { $gt: now } },
+          $elemMatch: { tokenHash, jtiHash, expiresAt: { $gt: now }, replacedByHash: null },
         },
       },
       [{
@@ -277,16 +283,31 @@ router.post('/refresh-token', async (req, res) => {
               {
                 $concatArrays: [
                   {
-                    $filter: {
+                    $map: {
                       input: { $ifNull: ['$refreshSessions', []] },
                       as: 'session',
-                      cond: { $ne: ['$$session.tokenHash', tokenHash] },
+                      // The rotated-away session is kept, not dropped, with a
+                      // breadcrumb pointing at its replacement. A second request
+                      // racing in with the same now-dead token can then be handed
+                      // the replacement below instead of being rejected outright.
+                      in: {
+                        $cond: [
+                          { $eq: ['$$session.tokenHash', tokenHash] },
+                          {
+                            $mergeObjects: ['$$session', {
+                              replacedByHash: nextCredential.session.tokenHash,
+                              replacedAt: now,
+                            }],
+                          },
+                          '$$session',
+                        ],
+                      },
                     },
                   },
                   [nextCredential.session],
                 ],
               },
-              -maxRefreshSessions(),
+              -(maxRefreshSessions() + 1),
             ],
           },
         },
@@ -294,12 +315,44 @@ router.post('/refresh-token', async (req, res) => {
       { new: true }
     ).select('role tokenVersion');
 
-    if (!user) throw new Error('Refresh session was already used or revoked');
+    if (user) {
+      const token = generateToken(user._id, user.role, user.tokenVersion || 0);
+      const userObj = await buildAuthUser(user._id);
+      setRefreshCookie(res, nextCredential.token);
+      return res.json({ success: true, token, user: userObj });
+    }
 
-    const token = generateToken(user._id, user.role, user.tokenVersion || 0);
-    const userObj = await buildAuthUser(user._id);
-    setRefreshCookie(res, nextCredential.token);
-    return res.json({ success: true, token, user: userObj });
+    // No live session matched this token outright. Before treating it as reuse of
+    // a dead token, check whether this exact token was the one JUST rotated away
+    // by a concurrent request, within a short grace window. Two browser tabs
+    // waking from idle together — or a burst of requests that all 401 at once and
+    // each independently call refresh — is the common case, not an attack, and
+    // should not force a full logout when the rotation actually succeeded.
+    const graceCutoff = new Date(now.getTime() - refreshRotationGraceMs());
+    const raceLoser = await User.findOne({
+      _id: decoded.userId,
+      status: 'Active',
+      tokenVersion: decoded.tokenVersion,
+      refreshSessions: {
+        $elemMatch: { tokenHash, replacedByHash: { $ne: null }, replacedAt: { $gt: graceCutoff } },
+      },
+    }).select('role tokenVersion refreshSessions').lean();
+    const replacedEntry = raceLoser?.refreshSessions?.find((session) => session.tokenHash === tokenHash);
+    const currentSession = replacedEntry
+      && raceLoser.refreshSessions.find((session) => session.tokenHash === replacedEntry.replacedByHash);
+
+    if (raceLoser && currentSession) {
+      // The winning concurrent request already rotated the cookie via its own
+      // Set-Cookie header, and cookies are shared per-origin across tabs — so this
+      // response does not need to (and cannot) reissue one. It only needs to hand
+      // this losing request a valid access token so the page it came from does
+      // not treat "refresh failed" as "session is dead" and log the user out.
+      const token = generateToken(raceLoser._id, raceLoser.role, raceLoser.tokenVersion || 0);
+      const userObj = await buildAuthUser(raceLoser._id);
+      return res.json({ success: true, token, user: userObj, rotationRace: true });
+    }
+
+    throw new Error('Refresh session was already used or revoked');
   } catch {
     // A valid-but-consumed token may be a losing cross-tab rotation request. Do not
     // clear the replacement cookie another concurrent request may already have set.

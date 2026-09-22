@@ -6,20 +6,25 @@ import DealerOrderRequest from '../models/DealerOrderRequest.js';
 import SalesOrder from '../models/SalesOrder.js';
 import Dealer from '../models/Dealer.js';
 import DealerType from '../models/DealerType.js';
-import DealerLedger from '../models/DealerLedger.js';
 import Product from '../models/Product.js';
 import Stock from '../models/Stock.js';
 import Brand from '../models/Brand.js';
 import Category from '../models/Category.js';
 import Subcategory from '../models/Subcategory.js';
 import { resolvePricing } from '../services/pricingResolver.js';
-import { deriveOrderPricing, addCreditApproval } from '../services/orderPricingService.js';
-import { getDealerCreditExposure } from '../services/dealerCreditService.js';
+import { findActiveDealer, priceQuotation } from '../services/quotationPricingService.js';
+import { convertQuotationCore, conversionFingerprint, conversionSourceKey, findConversionReplay } from '../services/quotationConversionService.js';
 import { assertQuotationMatchesRequest, refreshAndFingerprintRequest } from '../services/dealerOrderRequestService.js';
 import { syncAutomaticApprovalRequest } from '../services/approvalRequestService.js';
 import { protect, requireAnyPermission, requirePermission, userHasPermission } from '../middleware/auth.js';
 import { assertWarehousesInBranch, requireBranch } from '../utils/branchScope.js';
-import { reserveSalesOrderInventory } from '../utils/salesOrderInventory.js';
+import { computeSplitPlan, executeSplit, loadSplitFamily } from '../services/quotationSplitService.js';
+import {
+  holdTtlHours,
+  placeQuotationHold,
+  releaseQuotationHold,
+  totalHeldQuantity,
+} from '../services/quotationHoldService.js';
 import {
   applyQuotationStockSnapshot,
   applyQuotationUomSnapshots,
@@ -29,7 +34,6 @@ import {
   withQuotationReadiness,
 } from '../services/quotationStockService.js';
 import { generateBranchNumber } from '../utils/branchSequence.js';
-import { postSubledgerEntry } from '../utils/subledgerPosting.js';
 import { effectiveValidUntil, parseValidityDate, quotationValidity, withQuotationValidity } from '../utils/quotationValidity.js';
 import { resolveStockUom } from '../services/stockUomService.js';
 
@@ -62,6 +66,11 @@ const SERVER_MANAGED_FIELDS = new Set([
   'convertedToSO', 'convertedAt', 'convertedSalesOrders', 'conversionState', 'conversionVersion',
   'firstConvertedAt', 'lastConvertedAt', 'fullyConvertedAt', 'sourceDealerOrderRequest', 'dealerOrderRequestId', 'version', 'previousVersion',
   'stockSnapshotAt', 'snapshotCaptured', 'stockQueuedAt', 'validityVersion', 'validityHistory', 'tallySyncStatus', 'createdAt', 'updatedAt', '_id', '__v',
+  // Stock holds and split lineage are server-owned: a client must never be able
+  // to claim held stock or forge a split relationship through the edit endpoint.
+  'holdStatus', 'heldAt', 'heldBy', 'holdExpiresAt', 'holdExpiryState', 'holdExpiryVersion',
+  'holdExpiredAt', 'holdReleasedAt', 'holdConsumedAt', 'holdExpiryReason', 'holdExtensions',
+  'splitGroupId', 'splitRole', 'splitFromQuotation', 'splitQuotations', 'splitAt', 'splitBy', 'splitPlanHash',
 ]);
 const STATUS_TRANSITIONS = {
   draft: new Set(['sent', 'cancelled']),
@@ -69,8 +78,16 @@ const STATUS_TRANSITIONS = {
   approved: new Set(['sent', 'accepted', 'cancelled']),
   sent: new Set(['accepted', 'cancelled']),
   accepted: new Set(['cancelled']),
+  // A shortfall child is not a firm offer. It cannot be sent or accepted while it
+  // has no stock; POST /:id/confirm-stock is the only way out of pending_stock,
+  // and it requires stock to actually be available.
+  pending_stock: new Set(['cancelled']),
+  // A split parent is an immutable record of the original request.
+  split: new Set([]),
   converted: new Set([]), expired: new Set([]), cancelled: new Set([]),
 };
+// Statuses that represent stock the business has genuinely committed to hold.
+const HOLD_ELIGIBLE_STATUSES = new Set(['approved', 'accepted']);
 const routeError = (status, message, code, details) => Object.assign(
   new Error(message),
   { status, ...(code ? { code } : {}), ...(details ? { details } : {}) },
@@ -96,61 +113,6 @@ function normalizeQuotationValidity(data) {
   data.quotationDate = quotationDate;
   data.validUntil = validUntil;
   return data;
-}
-async function findActiveDealer(id, session = null) {
-  if (!id || !mongoose.isValidObjectId(id)) return null;
-  let query = Dealer.findById(id).populate('dealerType', 'name pricingTier status');
-  if (session) query = query.session(session);
-  const dealer = await query.lean();
-  if (dealer && dealer.status !== 'active') throw routeError(422, 'Dealer is not active.');
-  if (dealer?.dealerType && dealer.dealerType.status !== 'active') throw routeError(422, 'DealerType is not active.');
-  return dealer;
-}
-async function getBranchOutstanding(branchId, dealerId, session = null) {
-  let aggregate = DealerLedger.aggregate([
-    { $match: { branch: branchId, dealer: dealerId } },
-    { $group: { _id: null, debit: { $sum: '$debit' }, credit: { $sum: '$credit' } } },
-  ]);
-  if (session) aggregate = aggregate.session(session);
-  const [branchLedger] = await aggregate;
-  return Number((branchLedger?.debit || 0) - (branchLedger?.credit || 0));
-}
-function quotationContext(data, dealer) {
-  if (dealer) return { dealerId: dealer._id, dealerTypeId: dealer.dealerType?._id, scope: 'dealer', orderType: data.customerType || 'dealer' };
-  if (data.dealerType) return { dealerTypeId: data.dealerType, scope: 'dealer_type', orderType: data.customerType || 'retail' };
-  return { scope: 'walk_in', orderType: 'retail' };
-}
-function quotationPricingFields(priced, dealer) {
-  return {
-    items: priced.items,
-    subtotal: priced.subtotal,
-    totalDiscount: priced.totalDiscount,
-    totalSchemeDiscount: priced.totalSchemeDiscount,
-    totalTax: priced.totalTax,
-    freightCharges: priced.freightCharges,
-    loadingCharges: priced.loadingCharges,
-    installationCharges: priced.installationCharges,
-    otherCharges: priced.otherCharges,
-    roundOff: priced.roundOff,
-    grandTotal: priced.grandTotal,
-    dealerType: dealer?.dealerType?._id || priced.dealerType,
-    dealerTypeSnapshot: dealer?.dealerType
-      ? { name: dealer.dealerType.name, pricingTier: dealer.dealerType.pricingTier }
-      : priced.dealerTypeSnapshot,
-    approvalReasons: priced.approvalReasons,
-    approvalRequired: priced.approvalReasons.length > 0,
-    approvalStatus: priced.approvalStatus,
-  };
-}
-async function priceQuotation(data, dealer, branchId, session = null, existingReasons = [], options = {}) {
-  const priced = await deriveOrderPricing({
-    branchId, ...quotationContext(data, dealer), pricingDate: data.quotationDate || new Date(),
-    items: data.items, freightCharges: data.freightCharges, loadingCharges: data.loadingCharges,
-    installationCharges: data.installationCharges, otherCharges: data.otherCharges,
-    existingApprovalReasons: existingReasons, preserveSnapshots: Boolean(options.preserveSnapshots),
-    preserveBelowMinimumApprovals: Boolean(options.preserveBelowMinimumApprovals), requireItemUnit: true, session,
-  });
-  return { priced, fields: quotationPricingFields(priced, dealer) };
 }
 async function findLinkedConvertedOrder(quotation, branchId, session = null) {
   if (!quotation?.convertedToSO) return null;
@@ -499,6 +461,9 @@ router.get('/product-browser', requireAnyPermission('sales.order.create', 'quota
       { $group: {
         _id: '$product', totalQty: { $sum: '$totalQty' }, availableQty: { $sum: '$availableQty' },
         reservedQty: { $sum: '$reservedQty' }, blockedQty: { $sum: '$blockedQty' },
+        // Held for an approved quotation. availableQty is already net of this, so
+        // it is surfaced only to explain why free stock is lower than total.
+        quotedQty: { $sum: '$quotedQty' },
         damagedQty: { $sum: '$damagedQty' },
       } },
     ]) : [];
@@ -511,7 +476,7 @@ router.get('/product-browser', requireAnyPermission('sales.order.create', 'quota
         orderType: scope === 'walk_in' ? 'retail' : 'dealer',
       });
       const baseStock = stockByProduct.get(String(product._id)) || {
-        totalQty: 0, availableQty: 0, reservedQty: 0, blockedQty: 0, damagedQty: 0,
+        totalQty: 0, availableQty: 0, reservedQty: 0, quotedQty: 0, blockedQty: 0, damagedQty: 0,
       };
       const displayUom = await resolveStockUom({
         product,
@@ -524,6 +489,7 @@ router.get('/product-browser', requireAnyPermission('sales.order.create', 'quota
         totalQty: display(baseStock.totalQty),
         availableQty: display(baseStock.availableQty),
         reservedQty: display(baseStock.reservedQty),
+        quotedQty: display(baseStock.quotedQty),
         blockedQty: display(baseStock.blockedQty),
         damagedQty: display(baseStock.damagedQty),
       };
@@ -535,6 +501,7 @@ router.get('/product-browser', requireAnyPermission('sales.order.create', 'quota
           baseTotalQty: Number(baseStock.totalQty || 0),
           baseAvailableQty: Number(baseStock.availableQty || 0),
           baseReservedQty: Number(baseStock.reservedQty || 0),
+          baseQuotedQty: Number(baseStock.quotedQty || 0),
           baseBlockedQty: Number(baseStock.blockedQty || 0),
           baseDamagedQty: Number(baseStock.damagedQty || 0),
           displayUnit: displayUom.enteredUnit,
@@ -919,6 +886,16 @@ router.patch('/:id/status', requirePermission('quotation.management'), async (re
       );
       if (!quotation) throw routeError(409, 'Quotation changed before the status update could be applied.');
       if (status === 'cancelled') {
+        // A cancelled quotation must not keep holding stock, or the quantity stays
+        // unsellable until the TTL sweeper happens to notice it.
+        if (['held', 'partial'].includes(quotation.holdStatus)) {
+          await releaseQuotationHold(quotation, {
+            session,
+            actor: req.user._id,
+            reason: `Quotation ${quotation.quotationNumber} cancelled`,
+            expiryState: 'released',
+          });
+        }
         await syncAutomaticApprovalRequest({
           branchId: req.branchId,
           type: 'quotation',
@@ -949,9 +926,9 @@ router.post('/:id/convert', requirePermission('quotation.management'), requirePe
     return res.status(422).json({ success: false, message: 'A valid Idempotency-Key header is required.' });
   }
 
-  const { requestFingerprint, assertIdempotentReplay } = await import('../utils/idempotency.js');
-  const sourceKey = `quotation:${req.params.id}:${rawIdempotencyKey}`;
-  const fingerprint = requestFingerprint({ mode, includePartialLines });
+  const sourceKey = conversionSourceKey(req.params.id, rawIdempotencyKey);
+  const fingerprint = conversionFingerprint({ mode, includePartialLines });
+  const actorScope = quotationActorScope(req);
   const conversionResponse = async (quotation, salesOrder, conversion, idempotent = false) => ({
     success: true,
     idempotent,
@@ -962,36 +939,14 @@ router.post('/:id/convert', requirePermission('quotation.management'), requirePe
         : `Remaining quotation converted to ${salesOrder.orderNumber}.`,
     data: { quotation: await quotationDto(quotation), salesOrder, conversion },
   });
-  const findReplay = async (session = null) => {
-    let conversionQuery = QuotationConversion.findOne({
-      branch: req.branchId,
-      quotation: req.params.id,
-      sourceKey,
-    });
-    if (session) conversionQuery = conversionQuery.session(session);
-    const conversion = await conversionQuery.lean();
-    if (!conversion) return null;
-    assertIdempotentReplay(conversion, fingerprint);
-    let orderQuery = SalesOrder.findOne({
-      _id: conversion.salesOrder,
-      branch: req.branchId,
-      sourceQuotation: req.params.id,
-      sourceKey,
-    });
-    let quotationQuery = Quotation.findOne({
-      _id: req.params.id,
-      branch: req.branchId,
-      ...quotationActorScope(req),
-    });
-    if (session) {
-      orderQuery = orderQuery.session(session);
-      quotationQuery = quotationQuery.session(session);
-    }
-    const salesOrder = await orderQuery;
-    const quotation = await quotationQuery;
-    if (!salesOrder || !quotation) throw routeError(409, 'Idempotent conversion history is inconsistent.');
-    return { conversion, salesOrder, quotation };
-  };
+  const findReplay = (session = null) => findConversionReplay({
+    quotationId: req.params.id,
+    branchId: req.branchId,
+    sourceKey,
+    fingerprint,
+    actorScope,
+    session,
+  });
 
   try {
     const replay = await findReplay();
@@ -1002,315 +957,28 @@ router.post('/:id/convert', requirePermission('quotation.management'), requirePe
 
   const session = await mongoose.startSession();
   try {
-    let quotation;
-    let salesOrder;
-    let conversion;
+    let result;
     let idempotent = false;
     await session.withTransaction(async () => {
       const replay = await findReplay(session);
       if (replay) {
-        ({ quotation, salesOrder, conversion } = replay);
+        result = replay;
         idempotent = true;
         return;
       }
-
-      const current = await Quotation.findOne({
-        _id: req.params.id,
-        branch: req.branchId,
-        ...quotationActorScope(req),
-      }).session(session).lean();
-      if (!current) throw routeError(404, 'Quotation not found.');
-      if (current.status === 'converted' || current.conversionState === 'full') {
-        throw routeError(409, 'Quotation has no remaining quantity to convert.', 'QUOTATION_FULLY_CONVERTED');
-      }
-      const eligibility = quotationStockEligibility(current);
-      if (!eligibility.conversionEligible) {
-        const message = eligibility.reason === 'expired'
-          ? 'Expired quotation cannot be converted.'
-          : eligibility.reason === 'pricing_approval_not_satisfied'
-            ? 'Quotation pricing approval is required before conversion.'
-            : ['missing_queue_timestamp', 'invalid_queue_timestamp'].includes(eligibility.reason)
-              ? 'Quotation has no trustworthy FIFO queue timestamp. Run and review the readiness migration before conversion.'
-              : 'Only accepted or approved quotations can be converted.';
-        const stockReadiness = await getQuotationReadiness(current, { session });
-        throw routeError(409, message, 'QUOTATION_NOT_ELIGIBLE', stockReadiness);
-      }
-      for (const item of current.items || []) {
-        const quoted = Number(item.quantity || 0);
-        const converted = Number(item.convertedQuantity || 0);
-        if (converted < 0 || converted > quoted + 0.0001) {
-          throw routeError(409, 'Quotation converted quantities are inconsistent. Run the conversion migration before retrying.');
-        }
-      }
-
-      const stockReadiness = await getQuotationReadiness(current, { session });
-      if (stockReadiness.fullyConverted || stockReadiness.totalRemainingQty <= 0.0001) {
-        throw routeError(409, 'Quotation has no remaining quantity to convert.', 'QUOTATION_FULLY_CONVERTED');
-      }
-      if (mode === 'full' && !stockReadiness.allStockAvailable) {
-        throw routeError(
-          409,
-          'All remaining quotation stock is not currently available.',
-          'INSUFFICIENT_STOCK',
-          stockReadiness,
-        );
-      }
-      if (mode === 'available' && !stockReadiness.anyStockAvailable) {
-        throw routeError(
-          409,
-          'No FIFO-allocated stock is currently available for this quotation.',
-          'INSUFFICIENT_STOCK',
-          stockReadiness,
-        );
-      }
-      const partialLines = stockReadiness.items.filter(item =>
-        item.status === 'partial' && item.allocatedQty > 0.0001
-      );
-      if (mode === 'available' && partialLines.length && !includePartialLines) {
-        throw routeError(
-          409,
-          'Available conversion includes partial line quantities. Confirm that later stock may use a different shade or batch.',
-          'PARTIAL_LINE_CONFIRMATION_REQUIRED',
-          { ...stockReadiness, partialLines },
-        );
-      }
-
-      const selectedReadiness = stockReadiness.items.filter(item =>
-        item.remainingQty > 0.0001
-        && (mode === 'full' ? item.status === 'available' : item.allocatedQty > 0.0001)
-      );
-      if (!selectedReadiness.length) throw routeError(409, 'No quotation quantity is currently convertible.');
-      const selectedOriginalIndexes = new Map();
-      const conversionItems = selectedReadiness.map((ready, childIndex) => {
-        const source = current.items[ready.itemIndex];
-        const quantity = mode === 'full' ? ready.remainingQty : ready.allocatedQty;
-        const ratio = quantity / Number(source.quantity || 1);
-        selectedOriginalIndexes.set(ready.itemIndex, childIndex);
-        return {
-          ...source,
-          _id: undefined,
-          sourceQuotationItem: source._id,
-          quantity,
-          boxes: quantity,
-          pieces: Number(source.pieces || 0) > 0 ? Number(source.pieces) * ratio : undefined,
-          sqft: Number(source.sqft || 0) > 0 ? Number(source.sqft) * ratio : undefined,
-          warehouse: ready.allocation?.warehouse,
-          shade: ready.allocation?.shade || '',
-          batch: ready.allocation?.batch || '',
-        };
-      });
-      await assertWarehousesInBranch(conversionItems.map(item => item.warehouse), req.branchId, { session });
-
-      const selectedByIndex = new Map(selectedReadiness.map((ready) => [ready.itemIndex, mode === 'full' ? ready.remainingQty : ready.allocatedQty]));
-      const willBeFull = (current.items || []).every((item, index) =>
-        Number(item.convertedQuantity || 0) + Number(selectedByIndex.get(index) || 0) >= Number(item.quantity || 0) - 0.0001
-      );
-      const priorConversions = await QuotationConversion.find({
-        branch: req.branchId,
-        quotation: current._id,
-        status: { $ne: 'voided' },
-      })
-        .select('charges').session(session).lean();
-      const chargeFields = ['freightCharges', 'loadingCharges', 'installationCharges', 'otherCharges'];
-      const money = value => Math.round((Number(value || 0) + Number.EPSILON) * 100) / 100;
-      const originalWeight = (current.items || []).reduce((sum, item) => sum + Math.max(
-        Number(item.taxableAmount || 0), Number(item.totalAmount || 0), Number(item.quantity || 0)
-      ), 0);
-      const selectedWeight = selectedReadiness.reduce((sum, ready) => {
-        const item = current.items[ready.itemIndex];
-        const lineWeight = Math.max(Number(item.taxableAmount || 0), Number(item.totalAmount || 0), Number(item.quantity || 0));
-        const quantity = mode === 'full' ? ready.remainingQty : ready.allocatedQty;
-        return sum + lineWeight * quantity / Number(item.quantity || 1);
-      }, 0);
-      const charges = Object.fromEntries(chargeFields.map((field) => {
-        const total = money(current[field]);
-        const allocated = money(priorConversions.reduce((sum, entry) => sum + Number(entry.charges?.[field] || 0), 0));
-        const remainingCharge = money(Math.max(0, total - allocated));
-        const proportional = originalWeight > 0 ? money(total * selectedWeight / originalWeight) : 0;
-        return [field, willBeFull ? remainingCharge : Math.min(remainingCharge, proportional)];
-      }));
-      const selectedApprovalReasons = (current.approvalReasons || []).flatMap((reason) => {
-        if (reason.type !== 'below_minimum_price') return [reason];
-        const childIndex = selectedOriginalIndexes.get(reason.itemIndex);
-        return childIndex === undefined ? [] : [{ ...reason, itemIndex: childIndex }];
-      });
-      const dealer = current.dealer ? await findActiveDealer(current.dealer, session) : null;
-      if (current.dealer && !dealer) throw routeError(404, 'Dealer not found.');
-      const { priced } = await priceQuotation(
-        { ...current, ...charges, items: conversionItems },
-        dealer,
-        req.branchId,
-        session,
-        selectedApprovalReasons,
-        { preserveSnapshots: true, preserveBelowMinimumApprovals: true },
-      );
-      priced.items = priced.items.map((item, index) => {
-        const source = conversionItems[index];
-        const conversionFactor = Number(source.conversionFactor);
-        if (!Number.isFinite(conversionFactor) || conversionFactor <= 0
-            || !source.baseUnit || !Number.isInteger(Number(source.uomVersion))) {
-          throw routeError(409, 'Quotation item UOM snapshot is missing or invalid. Re-save an editable quotation or review legacy readiness migration output.');
-        }
-        return {
-          ...item,
-          unit: source.unit,
-          sourceQuotationItem: source.sourceQuotationItem,
-          baseQuantity: Math.round((Number(item.quantity) * conversionFactor + Number.EPSILON) * 1e6) / 1e6,
-          baseUnit: source.baseUnit,
-          conversionFactor,
-          uomVersion: Number(source.uomVersion),
-        };
-      });
-      const outstanding = dealer ? await getBranchOutstanding(req.branchId, dealer._id, session) : 0;
-      const creditExposure = dealer ? await getDealerCreditExposure({ branchId: req.branchId, dealer, asOf: new Date(), session }) : null;
-      const approval = addCreditApproval(priced, dealer, outstanding, selectedApprovalReasons, {
-        preserveBelowMinimum: true,
-        creditExposure,
-      });
-      const now = new Date();
-      const salesOrderId = new mongoose.Types.ObjectId();
-      const soNumber = await generateBranchNumber(current.branch, 'salesOrder', now, { session });
-      const orderStatus = ['pending', 'rejected'].includes(approval.approvalStatus) ? 'draft' : 'confirmed';
-      [salesOrder] = await SalesOrder.create([{
-        _id: salesOrderId,
-        orderNumber: soNumber,
-        branch: current.branch,
-        orderDate: now,
-        dealer: current.dealer || undefined,
-        dealerType: dealer?.dealerType?._id || priced.dealerType,
-        dealerTypeSnapshot: dealer?.dealerType
-          ? { name: dealer.dealerType.name, pricingTier: dealer.dealerType.pricingTier }
-          : priced.dealerTypeSnapshot,
-        dealerName: dealer?.businessName || current.customerName || '',
-        dealerCode: dealer?.dealerCode || '',
-        customerName: current.customerName || '',
-        customerPhone: current.customerPhone || '',
-        deliveryAddress: current.customerAddress || '',
-        orderType: dealer ? (current.customerType || 'dealer') : 'retail',
-        items: priced.items,
-        subtotal: priced.subtotal,
-        totalDiscount: priced.totalDiscount,
-        totalSchemeDiscount: priced.totalSchemeDiscount,
-        totalTax: priced.totalTax,
-        freightCharges: priced.freightCharges,
-        loadingCharges: priced.loadingCharges,
-        installationCharges: priced.installationCharges,
-        otherCharges: priced.otherCharges,
-        roundOff: priced.roundOff,
-        grandTotal: priced.grandTotal,
-        balanceAmount: priced.grandTotal,
-        paymentStatus: 'pending',
-        status: orderStatus,
-        confirmationRequested: true,
-        sourceQuotation: current._id,
-        sourceKey,
-        requestFingerprint: fingerprint,
-        remarks: `Converted ${mode === 'available' ? 'available stock' : 'remaining quantity'} from ${current.quotationNumber}. ${current.remarks || ''}`.trim(),
-        tallySyncStatus: 'not_synced',
-        ...approval,
-        salesExecutive: req.user.role === 'sales_executive' ? req.user._id : undefined,
-        createdBy: req.user._id,
-      }], { session });
-      await reserveSalesOrderInventory(salesOrder, { session, actor: req.user._id, reason: 'Quotation conversion reservation' });
-
-      const version = Number(current.conversionVersion || 0);
-      const versionScope = version === 0
-        ? { $or: [{ conversionVersion: 0 }, { conversionVersion: { $exists: false } }] }
-        : { conversionVersion: version };
-      const quantityIncrements = Object.fromEntries(selectedReadiness.map((ready) => [
-        `items.${ready.itemIndex}.convertedQuantity`,
-        mode === 'full' ? ready.remainingQty : ready.allocatedQty,
-      ]));
-      const setFields = {
-        conversionState: willBeFull ? 'full' : 'partial',
-        status: willBeFull ? 'converted' : current.status,
-        lastConvertedAt: now,
-        ...(willBeFull ? { fullyConvertedAt: now } : {}),
-        ...(!current.convertedToSO ? { convertedToSO: salesOrderId } : {}),
-        ...(!current.convertedAt ? { convertedAt: now } : {}),
-        ...(!current.firstConvertedAt ? { firstConvertedAt: now } : {}),
-      };
-      quotation = await Quotation.findOneAndUpdate(
-        {
-          _id: current._id,
-          branch: req.branchId,
-          status: current.status,
-          ...quotationActorScope(req),
-          ...versionScope,
-        },
-        {
-          $set: setFields,
-          $inc: { conversionVersion: 1, ...quantityIncrements },
-          $addToSet: { convertedSalesOrders: salesOrderId },
-        },
-        { new: true, session },
-      );
-      if (!quotation) throw routeError(409, 'Quotation changed before conversion; refresh and retry.');
-
-      [conversion] = await QuotationConversion.create([{
-        branch: req.branchId,
-        quotation: current._id,
-        salesOrder: salesOrderId,
-        sourceKey,
-        requestFingerprint: fingerprint,
-        mode,
-        sourceQuotationStatus: current.status,
-        status: 'active',
-        includePartialLines,
-        charges,
-        lines: selectedReadiness.map((ready) => ({
-          quotationItem: current.items[ready.itemIndex]._id,
-          product: current.items[ready.itemIndex].product,
-          quantity: mode === 'full' ? ready.remainingQty : ready.allocatedQty,
-          warehouse: ready.allocation.warehouse,
-          shade: ready.allocation.shade || '',
-          batch: ready.allocation.batch || '',
-        })),
-        createdBy: req.user._id,
-      }], { session });
-
-      // Close the loop back to the dealer's original request. Without this the
-      // request stays at "quotation created" forever and the dealer never learns
-      // that their demand actually became an order. Only stamp the first
-      // conversion: a partially converted quotation can produce several orders,
-      // and the request should point at the one that started it.
-      if (current.sourceDealerOrderRequest) {
-        await DealerOrderRequest.updateOne(
-          {
-            _id: current.sourceDealerOrderRequest,
-            branch: req.branchId,
-            sourceSalesOrder: { $exists: false },
-          },
-          { $set: { sourceSalesOrder: salesOrder._id, convertedAt: now } },
-          { session },
-        );
-      }
-
-      await syncAutomaticApprovalRequest({
+      result = await convertQuotationCore({
+        quotationId: req.params.id,
         branchId: req.branchId,
-        type: 'sales_order',
-        referenceModel: 'SalesOrder',
-        referenceId: salesOrder._id,
-        referenceNumber: salesOrder.orderNumber,
-        title: `Sales Order ${salesOrder.orderNumber} requires approval`,
-        reasons: salesOrder.approvalReasons || [],
-        requestedBy: req.user._id,
-        requestedByName: req.user.name || '',
-        requestedValue: salesOrder.grandTotal,
-        document: salesOrder,
+        actor: req.user,
+        actorScope,
+        mode,
+        includePartialLines,
+        sourceKey,
+        fingerprint,
         session,
       });
-      if (salesOrder.status === 'confirmed' && salesOrder.dealer && salesOrder.grandTotal > 0) {
-        await postSubledgerEntry({
-          session, branch: req.branchId, partyType: 'dealer', partyId: salesOrder.dealer,
-          amount: salesOrder.grandTotal, side: 'debit', postingKey: `sales-order:${salesOrder._id}:confirmed`,
-          entryType: 'invoice', entryDate: salesOrder.orderDate,
-          description: `Receivable for Sales Order ${salesOrder.orderNumber}`,
-          referenceNumber: salesOrder.orderNumber, referenceModel: 'SalesOrder', referenceId: salesOrder._id, createdBy: req.user._id,
-        });
-      }
     });
-    return res.json(await conversionResponse(quotation, salesOrder, conversion, idempotent));
+    return res.json(await conversionResponse(result.quotation, result.salesOrder, result.conversion, idempotent));
   } catch (error) {
     if (error.code === 11000) {
       try {
@@ -1515,6 +1183,361 @@ router.get('/:id/check-stock', requirePermission('quotation.management'), async 
         conversion: dto.conversion,
         quotation: dto,
         stockReadiness,
+      },
+    });
+  } catch (error) {
+    return res.status(error.status || (['CastError', 'ValidationError'].includes(error.name) ? 422 : 500))
+      .json({ success: false, message: error.message });
+  }
+});
+
+// ── Stock hold and split (SOW: quotation stock commitment) ────────────────────
+//
+// A quotation normally holds nothing, so "available" is only a prediction and can
+// be wrong by the time a Sales Order is created. These endpoints turn it into a
+// fact: an approved quotation takes a real hold on Stock (availableQty ->
+// quotedQty), and if part of the demand has no stock the quotation splits into an
+// available child that holds stock and a pending-stock child that waits for a GRN.
+//
+// The commit step re-derives the plan and refuses a stale one, so an approver can
+// never unknowingly approve quantities they did not see.
+
+/** Serialise a plan for the client without the bulky nested readiness twice over. */
+const splitPlanDto = plan => ({
+  planHash: plan.planHash,
+  willSplit: plan.willSplit,
+  canHold: plan.canHold,
+  quotation: plan.quotation,
+  quotationNumber: plan.quotationNumber,
+  conversionVersion: plan.conversionVersion,
+  available: plan.available,
+  shortfall: plan.shortfall,
+  totals: plan.totals,
+  checkedAt: plan.checkedAt,
+  holdTtlHours: holdTtlHours(),
+  stockReadiness: plan.readiness,
+});
+
+async function loadHoldTarget(req, session = null) {
+  let query = Quotation.findOne({
+    _id: req.params.id,
+    branch: req.branchId,
+    ...quotationActorScope(req),
+  });
+  if (session) query = query.session(session);
+  const quotation = await query;
+  if (!quotation) throw routeError(404, 'Quotation not found.');
+  return quotation;
+}
+
+// GET /api/v1/quotations/:id/split-preview
+// What would happen if this quotation were approved for stock right now. Returns
+// a planHash the caller must echo back, which is how drift is detected.
+router.get('/:id/split-preview', requirePermission('quotation.management'), async (req, res) => {
+  try {
+    const quotation = await Quotation.findOne({
+      _id: req.params.id,
+      branch: req.branchId,
+      ...quotationActorScope(req),
+    }).lean();
+    if (!quotation) throw routeError(404, 'Quotation not found.');
+    // pending_stock is allowed so a shortfall child can be previewed before it is
+    // confirmed. Readiness is evaluated as if it were approved, because a
+    // pending-stock quotation is not conversion-eligible by design and would
+    // otherwise report nothing allocatable.
+    const previewable = HOLD_ELIGIBLE_STATUSES.has(quotation.status) || quotation.status === 'pending_stock';
+    if (!previewable) {
+      throw routeError(
+        409,
+        `A stock hold can only be taken on an approved, accepted or pending-stock quotation; this one is "${quotation.status}".`,
+        'QUOTATION_NOT_HOLD_ELIGIBLE',
+      );
+    }
+    if (quotation.holdStatus === 'held') {
+      throw routeError(409, 'This quotation already holds stock.', 'QUOTATION_ALREADY_HELD');
+    }
+    const plan = await computeSplitPlan(
+      quotation.status === 'pending_stock' ? { ...quotation, status: 'approved' } : quotation,
+    );
+    return res.json({ success: true, data: { ...splitPlanDto(plan), intent: quotation.status === 'pending_stock' ? 'confirm' : 'split' } });
+  } catch (error) {
+    return res.status(error.status || (['CastError', 'ValidationError'].includes(error.name) ? 422 : 500))
+      .json({ success: false, message: error.message, code: error.code, data: error.details });
+  }
+});
+
+// POST /api/v1/quotations/:id/split-approve   { planHash }
+// Commits the plan: holds stock and, when part of the demand is short, splits the
+// quotation into available + pending-stock children.
+//
+// Requires sales.order.approve as well as quotation.management: committing stock
+// to a dealer is an approval decision, not an editing one.
+router.post(
+  '/:id/split-approve',
+  requirePermission('quotation.management'),
+  requirePermission('sales.order.approve'),
+  async (req, res) => {
+    const submittedHash = String(req.body?.planHash || '').trim();
+    if (!submittedHash) {
+      return res.status(422).json({ success: false, message: 'planHash is required. Fetch the split preview first.' });
+    }
+    const session = await mongoose.startSession();
+    try {
+      let result;
+      let plan;
+      await session.withTransaction(async () => {
+        const quotation = await loadHoldTarget(req, session);
+        if (!HOLD_ELIGIBLE_STATUSES.has(quotation.status)) {
+          throw routeError(
+            409,
+            `A stock hold can only be taken on an approved or accepted quotation; this one is "${quotation.status}".`,
+            'QUOTATION_NOT_HOLD_ELIGIBLE',
+          );
+        }
+        if (quotation.holdStatus === 'held') {
+          throw routeError(409, 'This quotation already holds stock.', 'QUOTATION_ALREADY_HELD');
+        }
+
+        // Recalculate from live stock and refuse a stale decision. This catches
+        // drift in both directions: less stock than the approver saw, and more.
+        plan = await computeSplitPlan(quotation, { session });
+        if (plan.planHash !== submittedHash) {
+          throw routeError(
+            409,
+            'Stock changed while this was being approved. Review the updated split and confirm again.',
+            'SPLIT_PLAN_CHANGED',
+            splitPlanDto(plan),
+          );
+        }
+        if (!plan.canHold) {
+          throw routeError(
+            409,
+            'No stock is currently available to hold for this quotation.',
+            'INSUFFICIENT_STOCK',
+            splitPlanDto(plan),
+          );
+        }
+
+        if (!plan.willSplit) {
+          // Everything is available, so there is nothing to split. Hold and stop.
+          await placeQuotationHold(quotation, {
+            plan: plan.available.map(entry => ({
+              itemId: entry.itemId,
+              quantity: entry.quantity,
+              warehouse: entry.warehouse,
+              shade: entry.shade,
+              batch: entry.batch,
+            })),
+            session,
+            actor: req.user._id,
+            reason: `Quotation ${quotation.quotationNumber} stock hold`,
+          });
+          result = { parent: null, available: quotation, shortfall: null, splitGroupId: null };
+          return;
+        }
+
+        result = await executeSplit(quotation, plan, {
+          session,
+          actor: req.user._id,
+          reason: `Quotation ${quotation.quotationNumber} stock split`,
+        });
+      });
+
+      const [parentDto, availableDto, shortfallDto] = await Promise.all([
+        result.parent ? quotationDto(result.parent) : null,
+        result.available ? quotationDto(result.available) : null,
+        result.shortfall ? quotationDto(result.shortfall) : null,
+      ]);
+      return res.status(201).json({
+        success: true,
+        split: Boolean(result.parent),
+        message: result.parent
+          ? `Stock held on ${result.available?.quotationNumber}. ${result.shortfall?.quotationNumber} is pending stock.`
+          : `Stock held on ${result.available?.quotationNumber}. No split was needed.`,
+        data: {
+          splitGroupId: result.splitGroupId,
+          parent: parentDto,
+          available: availableDto,
+          shortfall: shortfallDto,
+          heldQuantity: result.available ? totalHeldQuantity(result.available) : 0,
+        },
+      });
+    } catch (error) {
+      return res.status(error.status || (error.code === 11000 ? 409 : ['CastError', 'ValidationError'].includes(error.name) ? 422 : 500))
+        .json({ success: false, message: error.message, code: error.code, data: error.details });
+    } finally { await session.endSession(); }
+  },
+);
+
+// POST /api/v1/quotations/:id/confirm-stock   { planHash }
+// Promotes a pending-stock shortfall child once a GRN has landed: re-checks stock,
+// takes a hold, and moves it to approved so it can be sent and converted.
+// A shortfall child is never a firm offer until this succeeds.
+router.post(
+  '/:id/confirm-stock',
+  requirePermission('quotation.management'),
+  requirePermission('sales.order.approve'),
+  async (req, res) => {
+    const submittedHash = String(req.body?.planHash || '').trim();
+    if (!submittedHash) {
+      return res.status(422).json({ success: false, message: 'planHash is required. Fetch the split preview first.' });
+    }
+    const session = await mongoose.startSession();
+    try {
+      let quotation;
+      let plan;
+      await session.withTransaction(async () => {
+        quotation = await loadHoldTarget(req, session);
+        if (quotation.status !== 'pending_stock') {
+          throw routeError(
+            409,
+            `Only a pending-stock quotation can be confirmed; this one is "${quotation.status}".`,
+            'QUOTATION_NOT_PENDING_STOCK',
+          );
+        }
+        // Temporarily evaluate as approved so readiness treats it as convertible
+        // demand; the real status change happens below only if the hold succeeds.
+        const asApproved = { ...quotation.toObject(), status: 'approved' };
+        plan = await computeSplitPlan(asApproved, { session });
+        if (plan.planHash !== submittedHash) {
+          throw routeError(
+            409,
+            'Stock changed while this was being confirmed. Review the updated figures and confirm again.',
+            'SPLIT_PLAN_CHANGED',
+            splitPlanDto(plan),
+          );
+        }
+        if (plan.willSplit) {
+          throw routeError(
+            409,
+            'Stock is still short for this quotation. Split it again or wait for the remaining stock.',
+            'INSUFFICIENT_STOCK',
+            splitPlanDto(plan),
+          );
+        }
+        if (!plan.canHold) {
+          throw routeError(409, 'No stock is available for this quotation yet.', 'INSUFFICIENT_STOCK', splitPlanDto(plan));
+        }
+        await placeQuotationHold(quotation, {
+          plan: plan.available.map(entry => ({
+            itemId: entry.itemId,
+            quantity: entry.quantity,
+            warehouse: entry.warehouse,
+            shade: entry.shade,
+            batch: entry.batch,
+          })),
+          session,
+          actor: req.user._id,
+          reason: `Quotation ${quotation.quotationNumber} stock confirmed`,
+        });
+        quotation.status = 'approved';
+        quotation.stockQueuedAt = quotation.stockQueuedAt || new Date();
+        await quotation.save({ session });
+      });
+      return res.json({
+        success: true,
+        message: `Stock confirmed and held. ${quotation.quotationNumber} can now be sent and converted.`,
+        data: await quotationDto(quotation),
+      });
+    } catch (error) {
+      return res.status(error.status || (['CastError', 'ValidationError'].includes(error.name) ? 422 : 500))
+        .json({ success: false, message: error.message, code: error.code, data: error.details });
+    } finally { await session.endSession(); }
+  },
+);
+
+// POST /api/v1/quotations/:id/hold/release   { reason }
+// Gives held stock back without cancelling the quotation. The quotation keeps its
+// FIFO position; it simply stops guaranteeing the quantity.
+router.post('/:id/hold/release', requirePermission('quotation.management'), async (req, res) => {
+  const reason = String(req.body?.reason || '').trim();
+  if (!reason) return res.status(422).json({ success: false, message: 'A reason is required to release a stock hold.' });
+  if (reason.length > 1000) return res.status(422).json({ success: false, message: 'Reason cannot exceed 1000 characters.' });
+  const session = await mongoose.startSession();
+  try {
+    let quotation;
+    await session.withTransaction(async () => {
+      quotation = await loadHoldTarget(req, session);
+      if (!['held', 'partial'].includes(quotation.holdStatus)) {
+        throw routeError(409, 'This quotation is not holding any stock.', 'NO_ACTIVE_HOLD');
+      }
+      await releaseQuotationHold(quotation, {
+        session,
+        actor: req.user._id,
+        reason,
+        expiryState: 'released',
+      });
+    });
+    return res.json({ success: true, message: 'Stock hold released.', data: await quotationDto(quotation) });
+  } catch (error) {
+    return res.status(error.status || (['CastError', 'ValidationError'].includes(error.name) ? 422 : 500))
+      .json({ success: false, message: error.message, code: error.code });
+  } finally { await session.endSession(); }
+});
+
+// PATCH /api/v1/quotations/:id/hold/extend   { expiresAt, reason }
+// Pushes the hold expiry out. Only ever extends, never shortens.
+router.patch('/:id/hold/extend', requirePermission('quotation.management'), async (req, res) => {
+  try {
+    const reason = String(req.body?.reason || '').trim();
+    const requested = new Date(req.body?.expiresAt);
+    if (!reason) throw routeError(422, 'A reason is required to extend a stock hold.');
+    if (reason.length > 1000) throw routeError(422, 'Reason cannot exceed 1000 characters.');
+    if (Number.isNaN(requested.getTime())) throw routeError(422, 'expiresAt must be a valid date.');
+
+    const current = await loadHoldTarget(req);
+    if (!['held', 'partial'].includes(current.holdStatus)) {
+      throw routeError(409, 'This quotation is not holding any stock.', 'NO_ACTIVE_HOLD');
+    }
+    if (current.holdExpiresAt && requested.getTime() <= new Date(current.holdExpiresAt).getTime()) {
+      throw routeError(422, 'A hold expiry can only be extended, never shortened.', 'HOLD_EXPIRY_NOT_EXTENDED');
+    }
+    const version = Math.max(1, Number(current.holdExpiryVersion || 0)) + 1;
+    const quotation = await Quotation.findOneAndUpdate(
+      { _id: current._id, branch: req.branchId, holdExpiryVersion: current.holdExpiryVersion, ...quotationActorScope(req) },
+      {
+        $set: {
+          holdExpiresAt: requested,
+          holdExpiryState: 'extended',
+          holdExpiryVersion: version,
+        },
+        $push: {
+          holdExtensions: {
+            version,
+            previousExpiresAt: current.holdExpiresAt,
+            extendedTo: requested,
+            reason,
+            extendedBy: req.user._id,
+            extendedAt: new Date(),
+          },
+        },
+      },
+      { new: true, runValidators: true },
+    );
+    if (!quotation) throw routeError(409, 'The hold changed before it could be extended. Refresh and retry.');
+    return res.json({ success: true, message: 'Stock hold extended.', data: await quotationDto(quotation) });
+  } catch (error) {
+    return res.status(error.status || (['CastError', 'ValidationError'].includes(error.name) ? 422 : 500))
+      .json({ success: false, message: error.message, code: error.code });
+  }
+});
+
+// GET /api/v1/quotations/:id/split-family
+// Every member of a split: the immutable parent and both children.
+router.get('/:id/split-family', requirePermission('quotation.management'), async (req, res) => {
+  try {
+    const quotation = await Quotation.findOne({
+      _id: req.params.id,
+      branch: req.branchId,
+      ...quotationActorScope(req),
+    }).select('branch splitGroupId splitRole splitFromQuotation splitQuotations').lean();
+    if (!quotation) throw routeError(404, 'Quotation not found.');
+    return res.json({
+      success: true,
+      data: {
+        splitGroupId: quotation.splitGroupId || null,
+        splitRole: quotation.splitRole || 'none',
+        members: await loadSplitFamily(quotation),
       },
     });
   } catch (error) {

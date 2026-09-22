@@ -4,6 +4,12 @@ export const STOCK_BUCKET_FIELDS = Object.freeze([
   'totalQty',
   'availableQty',
   'reservedQty',
+  // Stock promised to an approved quotation but not yet on a Sales Order. Like
+  // blockedQty for transfers, it is a slice of totalQty carved out of
+  // availableQty, so a quotation hold cannot be sold twice. Conversion moves it
+  // straight to reservedQty and never touches availableQty, which is what makes
+  // a held quotation impossible to fail on stock.
+  'quotedQty',
   'blockedQty',
   'damagedQty',
   'sampleQty',
@@ -21,6 +27,10 @@ export const STOCK_MOVEMENT_TYPES = Object.freeze([
   'physical_audit_reversal',
   'sales_reservation',
   'sales_reservation_release',
+  // Quotation stock holds (see services/quotationHoldService.js).
+  'quotation_hold',
+  'quotation_hold_consume',
+  'quotation_hold_release',
   'pick_short_release',
   'pick_damage',
   'sorting_short',
@@ -59,6 +69,7 @@ export const STOCK_SOURCE_TYPES = Object.freeze([
   'StockAdjustment',
   'LegacyStockTransfer',
   'PhysicalStockAudit',
+  'Quotation',
   'SalesOrder',
   'PickList',
   'DispatchTrip',

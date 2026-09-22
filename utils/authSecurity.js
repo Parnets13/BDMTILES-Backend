@@ -11,6 +11,12 @@ const positiveInteger = (value, fallback) => {
 
 export const maxRefreshSessions = () => positiveInteger(process.env.MAX_REFRESH_SESSIONS, 5);
 
+// How long a just-rotated refresh session is kept around (marked via
+// replacedByHash) so a near-simultaneous second request presenting the same old
+// token — two tabs waking from idle together, a burst of parallel 401s — is
+// recognized as a rotation race rather than rejected as reuse of a dead token.
+export const refreshRotationGraceMs = () => positiveInteger(process.env.REFRESH_ROTATION_GRACE_SECONDS, 10) * 1000;
+
 export const sha256 = (value) => crypto.createHash('sha256').update(String(value)).digest('hex');
 
 export const randomToken = (bytes = 32) => crypto.randomBytes(bytes).toString('hex');

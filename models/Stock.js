@@ -16,6 +16,10 @@ const stockSchema = new mongoose.Schema(
     totalQty: { type: Number, default: 0 },
     availableQty: { type: Number, default: 0 },
     reservedQty: { type: Number, default: 0 },
+    // Held for an approved quotation that has not become a Sales Order yet.
+    // Carved out of availableQty so the same stock cannot be promised twice, and
+    // released automatically when the hold TTL lapses.
+    quotedQty: { type: Number, default: 0 },
     blockedQty: { type: Number, default: 0 },
     damagedQty: { type: Number, default: 0 },
     sampleQty: { type: Number, default: 0 },

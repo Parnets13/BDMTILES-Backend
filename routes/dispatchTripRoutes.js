@@ -190,6 +190,7 @@ router.post('/', async (req, res) => {
       vehicleNumber: req.body.vehicleNumber,
       totalBoxes: tripBoxes,
       totalWeight: tripWeight,
+      branchId: req.branchId,
     });
 
     tripId = new mongoose.Types.ObjectId();
@@ -214,11 +215,10 @@ router.post('/', async (req, res) => {
       // Vehicle fields come from the master record, not the request body, so the
       // trip can never disagree with Vehicle Master.
       ...vehicleSnapshot(assignedVehicle),
-      // The driver on the vehicle is the default; a trip may still override it.
+      // The driver may be overridden per trip. The authenticated Delivery
+      // Executive always comes from the selected Vehicle Master record.
       driverName: String(req.body.driverName || '').trim() || assignedVehicle.driverName || '',
       driverPhone: String(req.body.driverPhone || '').trim() || assignedVehicle.driverPhone || '',
-      deliveryExecutive: req.body.deliveryExecutive || undefined,
-      deliveryExecutiveName: req.body.deliveryExecutiveName || '',
       routeName: req.body.routeName || '',
       estimatedDistance: Number(req.body.estimatedDistance || 0),
       estimatedTime: req.body.estimatedTime || '',
@@ -414,6 +414,16 @@ router.patch('/:id/dispatch', async (req, res) => {
         return;
       }
 
+      // Re-read Vehicle Master at the final handoff. A linked account may have
+      // been deactivated, re-roled, moved to another branch, or replaced since
+      // planning; no executable deliveries should be created with stale access.
+      const { vehicle: dispatchVehicle } = await resolveVehicleForAssignment({
+        vehicleId: current.vehicle,
+        excludeTripId: current._id,
+        branchId: req.branchId,
+        session,
+      });
+
       const lockedTrip = await DispatchTrip.findOneAndUpdate(
         { _id: current._id, branch: req.branchId, status: 'loaded', loadingVerified: true, 'finalDispatchVerification.completed': true, dispatchProcessing: { $ne: true }, stockDeductedAt: null },
         { $set: { dispatchProcessing: true } },
@@ -423,6 +433,8 @@ router.patch('/:id/dispatch', async (req, res) => {
         response = { status: 409, body: { success: false, message: 'Dispatch is already being processed. Refresh before retrying.' } };
         return;
       }
+      lockedTrip.deliveryExecutive = dispatchVehicle.deliveryExecutive?._id || dispatchVehicle.deliveryExecutive || null;
+      lockedTrip.deliveryExecutiveName = dispatchVehicle.deliveryExecutive?.name || '';
 
       // Controlled compatibility path for trips created before PickList references were persisted.
       for (const order of lockedTrip.orders) {
@@ -627,7 +639,7 @@ router.patch('/:id/dispatch', async (req, res) => {
 
     res.status(response.status).json(response.body);
   } catch (e) {
-    const status = e.message.startsWith('Insufficient') || e.message.includes('ready for dispatch') || e.message.includes('authoritative') ? 409 : 500;
+    const status = e.status || (e.message.startsWith('Insufficient') || e.message.includes('ready for dispatch') || e.message.includes('authoritative') ? 409 : 500);
     res.status(status).json({ success: false, message: e.message });
   } finally {
     await session.endSession();

@@ -25,6 +25,13 @@ const refreshSessionSchema = new mongoose.Schema(
     lastUsedAt: { type: Date, required: true, default: Date.now },
     userAgent: { type: String, default: '', maxlength: 500 },
     ip: { type: String, default: '', maxlength: 100 },
+    // Set on the OLD session when a refresh rotates it into a new one, so a second
+    // request presenting that same now-superseded token within a short grace
+    // window (two tabs waking up together, a burst of parallel 401s) can be
+    // recognized as a rotation race and handed the new session instead of being
+    // treated as a stolen/replayed token.
+    replacedByHash: { type: String, default: null },
+    replacedAt: { type: Date, default: null },
   },
   { _id: false }
 );

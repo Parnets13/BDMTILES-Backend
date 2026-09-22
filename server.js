@@ -66,6 +66,7 @@ import branchRoutes from './routes/branchRoutes.js';
 import salesExecutiveRoutes from './routes/salesExecutiveRoutes.js';
 import dealerOrderRequestRoutes from './routes/dealerOrderRequestRoutes.js';
 import { startReservationExpiryScheduler } from './services/reservationExpiryScheduler.js';
+import { startQuotationHoldExpiryScheduler } from './services/quotationHoldExpiryScheduler.js';
 
 const app = express();
 const allowedOrigins = String(process.env.FRONTEND_URL || 'http://localhost:5173')
@@ -196,11 +197,13 @@ const HOST = process.env.HOST || '0.0.0.0';
 
 let httpServer;
 let reservationExpiryScheduler;
+let quotationHoldExpiryScheduler;
 let shuttingDown = false;
 
 const start = async () => {
   await connectDB();
   reservationExpiryScheduler = startReservationExpiryScheduler();
+  quotationHoldExpiryScheduler = startQuotationHoldExpiryScheduler();
   httpServer = app.listen(PORT, HOST, () => {
     console.log(`\n🚀 BDMTILES Backend | http://${HOST}:${PORT} | ${process.env.NODE_ENV || 'development'}\n`);
   });
@@ -211,7 +214,10 @@ const shutdown = async signal => {
   if (shuttingDown) return;
   shuttingDown = true;
   console.log(`[server] ${signal} received; stopping scheduled work and HTTP listener`);
-  await reservationExpiryScheduler?.stop();
+  await Promise.all([
+    reservationExpiryScheduler?.stop(),
+    quotationHoldExpiryScheduler?.stop(),
+  ]);
   if (httpServer?.listening) await new Promise(resolve => httpServer.close(resolve));
   await mongoose.disconnect();
 };

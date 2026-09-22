@@ -20,6 +20,7 @@ import { releaseSalesOrderReservation } from '../utils/releaseSalesOrderReservat
 import { postSubledgerEntry } from '../utils/subledgerPosting.js';
 import { actionPhysicalAuditApproval, actionStockAdjustmentApproval } from '../services/stockWorkflowService.js';
 import { actionSalesOrderRemainingCancellation } from '../services/salesOrderRemainingCancellationService.js';
+import { getDealerCreditExposure } from '../services/dealerCreditService.js';
 
 const APPROVAL_TYPE_PERMISSIONS = Object.freeze({
   sales_order: 'sales.order.approve',
@@ -51,6 +52,51 @@ const APPROVAL_REFERENCE_TYPES = Object.freeze({
   credit_note: { referenceModel: 'SalesReturn', Model: SalesReturn, displayField: 'returnNumber' },
   discount: { referenceModel: 'SalesOrder', Model: SalesOrder, displayField: 'orderNumber' },
 });
+
+// Fields pulled onto the reference document for the detail view. Kept explicit
+// rather than `.lean()` with no select: an approver reviewing a rate override or a
+// credit limit request should see the money and the lines, not the whole document.
+const REFERENCE_DETAIL_SELECT = Object.freeze({
+  SalesOrder: 'orderNumber orderDate status dealer dealerName dealerCode customerName customerPhone deliveryAddress orderType items subtotal totalDiscount totalSchemeDiscount totalTax freightCharges loadingCharges installationCharges otherCharges roundOff grandTotal balanceAmount paymentStatus creditLimitExceeded approvalStatus approvalReasons remarks sourceQuotation',
+  Quotation: 'quotationNumber quotationDate validUntil status dealer dealerName dealerCode customerName customerPhone customerAddress customerType items subtotal totalDiscount totalSchemeDiscount totalTax freightCharges loadingCharges installationCharges otherCharges roundOff grandTotal approvalStatus approvalReasons remarks sourceDealerOrderRequest',
+  PurchaseOrder: 'poNumber poDate status supplier items subtotal totalTax grandTotal remarks',
+  PurchaseReturn: 'debitNoteNumber returnDate status supplier items grandTotal remarks',
+  SalesReturn: 'returnNumber returnDate status dealer customerName items grandTotal remarks',
+  StockAdjustment: 'adjustmentNumber adjustmentDate status product warehouse quantity reason remarks',
+  PhysicalStockAudit: 'auditNumber auditDate status warehouse remarks',
+});
+
+/**
+ * Everything an approver needs to see about the document behind a request: its
+ * full line items, the dealer it belongs to, and — for the two money-driven
+ * reasons a rate or credit approval actually exists — the dealer's live credit
+ * exposure. `approvalReasons` already carries the exact threshold that was
+ * crossed, so it is returned as-is rather than re-derived.
+ */
+async function loadApprovalReferenceDetail(branchId, approval) {
+  const config = APPROVAL_REFERENCE_TYPES[approval.type];
+  if (!config || !approval.referenceId) return null;
+  const select = REFERENCE_DETAIL_SELECT[config.referenceModel] || '';
+  let query = config.Model.findOne({ _id: approval.referenceId, branch: branchId });
+  if (select) query = query.select(select);
+  if ('dealer' in (config.Model.schema.paths || {})) {
+    query = query.populate('dealer', 'businessName dealerCode ownerName mobile address city creditLimit creditDays status');
+  }
+  const reference = await query.lean();
+  if (!reference) return null;
+
+  let creditExposure = null;
+  if (reference.dealer && reference.dealer._id) {
+    try {
+      creditExposure = await getDealerCreditExposure({
+        branchId,
+        dealer: reference.dealer,
+        asOf: new Date(),
+      });
+    } catch { /* advisory only; the approval still opens without it */ }
+  }
+  return { model: config.referenceModel, document: reference, creditExposure };
+}
 
 const CREATE_FIELDS = [
   'type',
@@ -163,7 +209,7 @@ router.get('/', readApprovalPermissions, async (req, res) => {
   }
 });
 
-// GET /api/v1/approvals/stats
+// GET /api/v1/approvals/stats — declared before /:id so "stats" is never read as an id.
 router.get('/stats', readApprovalPermissions, async (req, res) => {
   try {
     const visible = { branch: req.branchId, type: { $in: allowedApprovalTypes(req.user) } };
@@ -178,6 +224,28 @@ router.get('/stats', readApprovalPermissions, async (req, res) => {
       ]),
     ]);
     return res.json({ success: true, data: { total, pending, approved, rejected, byType } });
+  } catch (error) {
+    return sendRouteError(res, error);
+  }
+});
+
+// GET /api/v1/approvals/:id — full detail for the review screen: the request
+// itself plus the underlying document (line items, dealer, credit exposure) so an
+// approver can see exactly what they are being asked to approve without leaving
+// the page.
+router.get('/:id', readApprovalPermissions, async (req, res) => {
+  try {
+    if (!mongoose.isValidObjectId(req.params.id)) throw routeError(422, 'Approval id is invalid.');
+    const approval = await ApprovalRequest.findOne({ _id: req.params.id, branch: req.branchId })
+      .populate('requestedBy', 'name email')
+      .populate('approvedBy', 'name email')
+      .lean();
+    if (!approval) throw routeError(404, 'Approval request not found.');
+    if (!allowedApprovalTypes(req.user).includes(approval.type)) {
+      throw routeError(403, 'Access denied for this approval type.');
+    }
+    const reference = await loadApprovalReferenceDetail(req.branchId, approval);
+    return res.json({ success: true, data: { ...approval, reference } });
   } catch (error) {
     return sendRouteError(res, error);
   }

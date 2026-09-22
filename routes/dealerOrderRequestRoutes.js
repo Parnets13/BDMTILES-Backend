@@ -1,4 +1,5 @@
 import { Router } from 'express';
+import mongoose from 'mongoose';
 import DealerOrderRequest from '../models/DealerOrderRequest.js';
 import Dealer from '../models/Dealer.js';
 import Product from '../models/Product.js';
@@ -13,12 +14,29 @@ import {
   orderRequestFingerprint,
   refreshAndFingerprintRequest,
 } from '../services/dealerOrderRequestService.js';
+import {
+  dealerOrderStockPlan,
+  planLines,
+  processDealerOrderRequest,
+  processPendingStock,
+} from '../services/dealerOrderProcessingService.js';
+import { openNextRound, shortfallDto } from '../services/dealerOrderShortfallService.js';
 
 const router = Router();
 router.use(protect);
 router.use(requireBranch);
 
-const VALID_STATUSES = new Set(['submitted', 'approved', 'rejected', 'quotation_linked', 'cancelled']);
+// Keep in sync with the `status` enum on models/DealerOrderRequest.js.
+const VALID_STATUSES = new Set([
+  'submitted',
+  'approved',
+  'rejected',
+  'partially_processed',
+  'awaiting_dealer',
+  'awaiting_stock',
+  'quotation_linked',
+  'cancelled',
+]);
 const routeError = (status, message) => Object.assign(new Error(message), { status });
 const escapeRegex = value => String(value).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 const errorStatus = error => error.status || (error.code === 11000 ? 409 : ['CastError', 'ValidationError'].includes(error.name) ? 422 : 500);
@@ -33,8 +51,31 @@ function populateRequest(query) {
   return query
     .populate('dealer', 'businessName dealerCode ownerName mobile city status dealerType')
     .populate('salesExecutive', 'name mobile email')
-    .populate('approvedBy rejectedBy linkedBy', 'name')
-    .populate('sourceQuotation', 'quotationNumber status grandTotal');
+    .populate('approvedBy rejectedBy linkedBy processedBy', 'name')
+    .populate('sourceQuotation', 'quotationNumber status grandTotal splitRole splitGroupId')
+    .populate('availableQuotation pendingStockQuotation', 'quotationNumber status grandTotal holdStatus holdExpiresAt splitRole')
+    .populate('sourceSalesOrder', 'orderNumber status approvalStatus reservationStatus grandTotal')
+    .populate('outcomes.quotation', 'quotationNumber status grandTotal splitRole')
+    .populate('outcomes.salesOrder', 'orderNumber status approvalStatus reservationStatus grandTotal');
+}
+
+// Trims the plan down to what a reviewer needs. The raw readiness payload carries
+// a full FIFO allocation for every queued quotation in the branch and has no
+// business crossing the wire.
+const stockPlanDto = (plan, lines) => ({
+  planHash: plan.planHash,
+  willSplit: plan.willSplit,
+  canHold: plan.canHold,
+  checkedAt: plan.checkedAt,
+  totals: plan.totals,
+  lines,
+});
+
+function shortfallAnswers(body) {
+  const answers = body?.shortfall ?? body?.shortfallInput ?? [];
+  if (!Array.isArray(answers)) throw routeError(422, 'shortfall must be an array of per-product answers.');
+  if (answers.length > 100) throw routeError(422, 'A maximum of 100 shortfall answers is allowed.');
+  return answers;
 }
 
 async function listRequests(req, res, ownerOnly) {
@@ -475,11 +516,224 @@ router.get('/:id/quotation-prefill', requirePermission('dealer.order_request.rev
   }
 });
 
+// POST /:id/stock-plan
+// How much of this approved request can actually be committed right now.
+//
+// A POST, not a GET, because producing a trustworthy answer means creating the
+// request's quotation first: the split plan is computed by the FIFO allocator,
+// which only considers quotations that are really in the queue. A read-only guess
+// built from raw Stock rows would ignore every quotation ahead of this one and
+// promise stock that processing could not deliver.
+//
+// Safe to call repeatedly — the quotation is created once and re-found after that.
+router.post(
+  '/:id/stock-plan',
+  requirePermission('dealer.order_request.review'),
+  requirePermission('quotation.management'),
+  async (req, res) => {
+    const session = await mongoose.startSession();
+    try {
+      let payload;
+      await session.withTransaction(async () => {
+        const { request, quotation, plan } = await dealerOrderStockPlan({
+          requestId: req.params.id,
+          branchId: req.branchId,
+          actor: req.user,
+          session,
+        });
+        const lines = planLines(plan, request.items);
+        payload = {
+          request: {
+            _id: request._id,
+            requestNumber: request.requestNumber,
+            revision: request.revision,
+            status: request.status,
+          },
+          quotation: {
+            _id: quotation._id,
+            quotationNumber: quotation.quotationNumber,
+            status: quotation.status,
+            grandTotal: quotation.grandTotal,
+          },
+          plan: stockPlanDto(plan, lines),
+        };
+      });
+      return res.json({
+        success: true,
+        message: payload.plan.willSplit
+          ? 'Part of this request can be reserved now. Give an expected date for the short lines to continue.'
+          : payload.plan.canHold
+            ? 'Everything requested is available and can be reserved now.'
+            : 'None of the requested quantity is available. Give the dealer an expected date or mark the lines unavailable.',
+        data: payload,
+      });
+    } catch (error) {
+      return res.status(errorStatus(error)).json({
+        success: false,
+        message: error.message,
+        ...(typeof error.code === 'string' ? { code: error.code } : {}),
+        ...(error.details ? { data: error.details } : {}),
+      });
+    } finally { await session.endSession(); }
+  },
+);
+
+// POST /:id/process   { planHash, shortfall: [{ product, expectedDate | noEta, staffRemark }], offerRemark }
+//
+// One action: reserve what is available into a Sales Order, and put the rest to the
+// dealer as a question. `planHash` must match a freshly recomputed plan, so a
+// decision taken against stock that has since moved is refused outright rather
+// than quietly downgraded. Nothing is ever ordered that was not first held.
+router.post(
+  '/:id/process',
+  requirePermission('dealer.order_request.review'),
+  requirePermission('quotation.management'),
+  requirePermission('sales.order.create'),
+  requirePermission('sales.order.approve'),
+  async (req, res) => {
+    const session = await mongoose.startSession();
+    try {
+      let result;
+      const answers = shortfallAnswers(req.body);
+      await session.withTransaction(async () => {
+        result = await processDealerOrderRequest({
+          requestId: req.params.id,
+          branchId: req.branchId,
+          actor: req.user,
+          planHash: req.body?.planHash,
+          shortfallInput: answers,
+          offerRemark: req.body?.offerRemark,
+          session,
+        });
+      });
+      const request = await populateRequest(DealerOrderRequest.findById(result.request._id)).lean();
+      const shortfallCount = result.shortfallLines.length;
+      return res.status(201).json({
+        success: true,
+        message: result.salesOrder
+          ? shortfallCount
+            ? `${result.salesOrder.orderNumber} created and reserved for the available quantity. ${shortfallCount} line${shortfallCount === 1 ? '' : 's'} sent to the dealer.`
+            : `${result.salesOrder.orderNumber} created and reserved for the full requested quantity.`
+          : `No stock could be reserved. ${shortfallCount} line${shortfallCount === 1 ? '' : 's'} sent to the dealer.`,
+        data: {
+          request,
+          shortfall: shortfallDto(result.request),
+          salesOrder: result.salesOrder || null,
+          availableQuotation: result.availableQuotation
+            ? { _id: result.availableQuotation._id, quotationNumber: result.availableQuotation.quotationNumber }
+            : null,
+          pendingStockQuotation: result.pendingStockQuotation
+            ? { _id: result.pendingStockQuotation._id, quotationNumber: result.pendingStockQuotation.quotationNumber }
+            : null,
+          plan: stockPlanDto(result.plan, result.lines),
+        },
+      });
+    } catch (error) {
+      return res.status(errorStatus(error)).json({
+        success: false,
+        message: error.message,
+        ...(typeof error.code === 'string' ? { code: error.code } : {}),
+        ...(error.details ? { data: error.details } : {}),
+      });
+    } finally { await session.endSession(); }
+  },
+);
+
+// POST /:id/process-pending   { planHash? }
+//
+// The second half of the story: the stock the dealer agreed to wait for has arrived.
+// Re-checks live stock, takes the atomic hold, and only then raises the Sales Order.
+// If stock is still short nothing is created — the pending quotation stays pending.
+router.post(
+  '/:id/process-pending',
+  requirePermission('dealer.order_request.review'),
+  requirePermission('quotation.management'),
+  requirePermission('sales.order.create'),
+  requirePermission('sales.order.approve'),
+  async (req, res) => {
+    const session = await mongoose.startSession();
+    try {
+      let result;
+      await session.withTransaction(async () => {
+        result = await processPendingStock({
+          requestId: req.params.id,
+          branchId: req.branchId,
+          actor: req.user,
+          planHash: req.body?.planHash,
+          session,
+        });
+      });
+      return res.status(201).json({
+        success: true,
+        message: `${result.salesOrder.orderNumber} created and reserved for the quantity that was pending stock.`,
+        data: {
+          request: await populateRequest(DealerOrderRequest.findById(result.request._id)).lean(),
+          salesOrder: result.salesOrder,
+          quotation: {
+            _id: result.quotation._id,
+            quotationNumber: result.quotation.quotationNumber,
+          },
+          plan: stockPlanDto(result.plan, result.lines),
+        },
+      });
+    } catch (error) {
+      return res.status(errorStatus(error)).json({
+        success: false,
+        message: error.message,
+        ...(typeof error.code === 'string' ? { code: error.code } : {}),
+        ...(error.details ? { data: error.details } : {}),
+      });
+    } finally { await session.endSession(); }
+  },
+);
+
+// POST /:id/shortfall-offer   { shortfall: [{ product, expectedDate | noEta, staffRemark }], offerRemark }
+//
+// Puts a revised offer to the dealer, superseding the one on the table. Needed
+// when the dealer changed a quantity — a bigger ask can change the availability
+// date, so the date has to be re-confirmed by a person before it counts as agreed.
+// Also used to correct a date on an offer the dealer has not answered yet.
+router.post(
+  '/:id/shortfall-offer',
+  requirePermission('dealer.order_request.review'),
+  async (req, res) => {
+    const session = await mongoose.startSession();
+    try {
+      let result;
+      const answers = shortfallAnswers(req.body);
+      await session.withTransaction(async () => {
+        result = await openNextRound({
+          requestId: req.params.id,
+          branchId: req.branchId,
+          actor: req.user,
+          shortfallInput: answers,
+          offerRemark: req.body?.offerRemark,
+          session,
+        });
+      });
+      return res.json({
+        success: true,
+        message: `Round ${result.round.round} sent to the dealer.`,
+        data: {
+          request: await populateRequest(DealerOrderRequest.findById(result.request._id)).lean(),
+          shortfall: shortfallDto(result.request),
+        },
+      });
+    } catch (error) {
+      return res.status(errorStatus(error)).json({
+        success: false,
+        message: error.message,
+        ...(typeof error.code === 'string' ? { code: error.code } : {}),
+      });
+    } finally { await session.endSession(); }
+  },
+);
+
 router.get('/:id', requirePermission('dealer.order_request.review'), async (req, res) => {
   try {
     const request = await populateRequest(DealerOrderRequest.findOne({ _id: req.params.id, branch: req.branchId })).lean();
     if (!request) throw routeError(404, 'Dealer order request not found.');
-    return res.json({ success: true, data: request });
+    return res.json({ success: true, data: { ...request, shortfall: shortfallDto(request) } });
   } catch (error) {
     return res.status(errorStatus(error)).json({ success: false, message: error.message });
   }

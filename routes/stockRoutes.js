@@ -1,7 +1,7 @@
 import { Router } from 'express';
 import mongoose from 'mongoose';
 import Stock from '../models/Stock.js';
-import StockMovement, { STOCK_MOVEMENT_TYPES, STOCK_SOURCE_TYPES } from '../models/StockMovement.js';
+import StockMovement, { STOCK_BUCKET_FIELDS, STOCK_MOVEMENT_TYPES, STOCK_SOURCE_TYPES } from '../models/StockMovement.js';
 import Warehouse from '../models/Warehouse.js';
 import SalesOrder from '../models/SalesOrder.js';
 import StockTransfer from '../models/StockTransfer.js';
@@ -85,8 +85,8 @@ router.get('/filter-options', async (req, res) => {
         batches: batches.sort((a, b) => a.localeCompare(b)),
         movementTypes: STOCK_MOVEMENT_TYPES,
         sourceTypes: STOCK_SOURCE_TYPES,
-        statuses: ['in_stock', 'low_stock', 'out_of_stock', 'reserved', 'damaged', 'blocked', 'in_transit', 'short'],
-        deltaFields: ['totalQty', 'availableQty', 'reservedQty', 'blockedQty', 'damagedQty', 'sampleQty', 'transitQty', 'shortQty'],
+        statuses: ['in_stock', 'low_stock', 'out_of_stock', 'reserved', 'quoted', 'damaged', 'blocked', 'in_transit', 'short'],
+        deltaFields: STOCK_BUCKET_FIELDS,
       },
     });
   } catch (error) { return handleError(res, error); }
@@ -142,6 +142,7 @@ router.get('/:id/detail', async (req, res) => {
     const statuses = {
       availability: available <= 0 ? 'out_of_stock' : available <= reorderLevel ? 'low_stock' : 'in_stock',
       reserved: Number(stock.reservedQty || 0) > 0,
+      quoted: Number(stock.quotedQty || 0) > 0,
       blocked: Number(stock.blockedQty || 0) > 0,
       damaged: Number(stock.damagedQty || 0) > 0,
       inTransit: Number(stock.transitQty || 0) > 0,

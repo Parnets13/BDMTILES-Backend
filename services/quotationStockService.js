@@ -4,7 +4,12 @@ import { quotationValidity, withQuotationValidity } from '../utils/quotationVali
 import { resolveStockUom } from './stockUomService.js';
 
 export const QUOTATION_STOCK_TOLERANCE = 0.0001;
-export const QUOTATION_QUEUE_STATUSES = ['approved', 'accepted', 'sent'];
+// 'pending_stock' is the shortfall child of a split. It is not a firm offer and
+// cannot be converted, but it must hold a FIFO position so it is served in turn
+// when a GRN lands rather than losing out to a quotation raised later.
+// 'split' parents are deliberately absent: a retired parent must not compete with
+// its own children for the same stock.
+export const QUOTATION_QUEUE_STATUSES = ['approved', 'accepted', 'sent', 'pending_stock'];
 
 const idOf = value => String(value?._id || value || '');
 const numberOf = value => Number(value || 0);
@@ -123,13 +128,16 @@ export function quotationStockEligibility(quotation, now = new Date()) {
     && (!quotation?.approvalRequired || approvalStatus === 'approved')
     && !unresolvedApprovalReason;
   const validity = quotationValidity({ ...quotation, conversionState }, now);
-  const terminal = ['converted', 'cancelled', 'expired'].includes(status) || conversionState === 'full';
+  // 'split' is terminal: the parent is an immutable record of the original
+  // request and its demand now lives on its children.
+  const terminal = ['converted', 'cancelled', 'expired', 'split'].includes(status) || conversionState === 'full';
   const uomSnapshotSatisfied = (quotation?.items || [])
     .filter(item => quantitiesForLine(item).remainingQty > QUOTATION_STOCK_TOLERANCE)
     .every(item => uomSnapshotForLine(item).valid);
   const hasQueueTimestamp = validQueueTimestamp(quotation?.stockQueuedAt);
   const approvedOrAccepted = ['approved', 'accepted'].includes(status);
   const approvedOriginSent = status === 'sent' && hasQueueTimestamp;
+  const awaitingStock = status === 'pending_stock';
 
   let queueEligible = false;
   let conversionEligible = false;
@@ -137,9 +145,15 @@ export function quotationStockEligibility(quotation, now = new Date()) {
   if (terminal) reason = 'terminal_or_fully_converted';
   else if (validity.isExpired) reason = 'expired';
   else if (!pricingApprovalSatisfied) reason = 'pricing_approval_not_satisfied';
-  else if ((approvedOrAccepted || status === 'sent') && !uomSnapshotSatisfied) reason = 'uom_snapshot_missing_or_invalid';
-  else if (approvedOrAccepted && !hasQueueTimestamp) reason = 'missing_queue_timestamp';
-  else if (approvedOrAccepted) {
+  else if ((approvedOrAccepted || status === 'sent' || awaitingStock) && !uomSnapshotSatisfied) reason = 'uom_snapshot_missing_or_invalid';
+  else if ((approvedOrAccepted || awaitingStock) && !hasQueueTimestamp) reason = 'missing_queue_timestamp';
+  else if (awaitingStock) {
+    // Queued so it is served in turn when stock arrives, but never convertible:
+    // POST /quotations/:id/confirm-stock must take a real hold and promote it to
+    // approved first, which is what stops a no-stock quantity being sold.
+    queueEligible = true;
+    reason = 'awaiting_stock';
+  } else if (approvedOrAccepted) {
     queueEligible = true;
     conversionEligible = true;
     reason = 'eligible_fifo';
@@ -280,9 +294,17 @@ export function calculateQuotationReadiness(quotation, stockRows, remainingBySto
   const items = lines.map((line, index) => {
     const quantities = quantitiesForLine(line);
     const uom = uomSnapshotForLine(line);
+    // Stock this quotation already holds in Stock.quotedQty. It is ring-fenced for
+    // this quotation, so it counts as available TO IT — and it must not be
+    // allocated from the shared pool again, or the quotation would compete for
+    // stock it already owns and starve everyone behind it in the queue.
+    const heldQty = rounded(Math.min(numberOf(line.holdQuantity), quantities.remainingQty));
+    const heldBaseQty = rounded(heldQty * uom.conversionFactor);
     return {
       itemId: idOf(line._id) || String(index),
       itemIndex: index,
+      heldQty,
+      heldBaseQty,
       productId: idOf(line.product),
       productName: line.productName || line.product?.itemName || '',
       productCode: line.productCode || line.product?.productCode || '',
@@ -300,23 +322,41 @@ export function calculateQuotationReadiness(quotation, stockRows, remainingBySto
       requiredQty: quantities.remainingQty,
       quantityRequired: quantities.remainingQty,
       requiredBaseQty: uom.remainingBaseQty,
-      allocatedQty: 0,
-      allocatedBaseQty: 0,
-      availableQty: 0,
-      shortfallQty: quantities.remainingQty,
-      shortfallBaseQty: uom.remainingBaseQty,
+      // Held quantity is already secured, so it starts out allocated.
+      allocatedQty: heldQty,
+      allocatedBaseQty: heldBaseQty,
+      availableQty: heldQty,
+      shortfallQty: rounded(quantities.remainingQty - heldQty),
+      shortfallBaseQty: rounded(Math.max(0, uom.remainingBaseQty - heldBaseQty)),
       status: quantities.remainingQty <= QUOTATION_STOCK_TOLERANCE
         ? 'converted'
-        : uom.valid ? 'out_of_stock' : 'unknown',
-      hasStock: false,
-      allocation: null,
+        : !uom.valid
+          ? 'unknown'
+          : heldQty >= quantities.remainingQty - QUOTATION_STOCK_TOLERANCE
+            ? 'available'
+            : heldQty > QUOTATION_STOCK_TOLERANCE ? 'partial' : 'out_of_stock',
+      hasStock: heldQty >= quantities.remainingQty - QUOTATION_STOCK_TOLERANCE,
+      // A fully held line reports the bucket the hold was pinned to.
+      allocation: heldQty > QUOTATION_STOCK_TOLERANCE ? {
+        stockId: null,
+        warehouse: line.warehouse,
+        shade: line.shade || '',
+        batch: line.batch || '',
+        bucketAvailableQty: heldQty,
+        bucketAvailableBaseQty: heldBaseQty,
+        baseUnit: uom.baseUnit,
+        fromHold: true,
+      } : null,
     };
   });
   const allocationOrder = lines.map((line, index) => ({
     line,
     index,
-    requiredQty: items[index].remainingQty,
-    requiredBaseQty: items[index].requiredBaseQty,
+    // Only the portion NOT already held needs allocating from the shared pool.
+    requiredQty: rounded(items[index].remainingQty - items[index].heldQty),
+    requiredBaseQty: rounded(Math.max(0, items[index].requiredBaseQty - items[index].heldBaseQty)),
+    heldQty: items[index].heldQty,
+    heldBaseQty: items[index].heldBaseQty,
     conversionFactor: items[index].conversionFactor,
     precision: items[index].uomPrecision,
     allowFraction: items[index].uomAllowFraction,
@@ -328,20 +368,25 @@ export function calculateQuotationReadiness(quotation, stockRows, remainingBySto
     || left.index - right.index
   );
 
-  for (const { line, index, requiredQty, requiredBaseQty, conversionFactor, precision, allowFraction } of allocationOrder) {
+  for (const { line, index, requiredQty, requiredBaseQty, heldQty, heldBaseQty, conversionFactor, precision, allowFraction } of allocationOrder) {
     const candidates = candidateRows(stockRows, line, remaining, requiredBaseQty);
     const selected = candidates[0];
     const selectedKey = selected ? stockId(selected) : null;
     const bucketAvailableBaseQty = selected ? rounded(remaining.get(selectedKey)) : 0;
     const maximumEnteredQty = Math.min(requiredQty, bucketAvailableBaseQty / conversionFactor);
     const precisionScale = 10 ** precision;
-    const allocatedQty = rounded(allowFraction
+    const poolAllocatedQty = rounded(allowFraction
       ? Math.floor((maximumEnteredQty + Number.EPSILON) * precisionScale) / precisionScale
       : Math.floor(maximumEnteredQty));
-    const allocatedBaseQty = rounded(allocatedQty * conversionFactor);
-    if (selectedKey) remaining.set(selectedKey, rounded(Math.max(0, bucketAvailableBaseQty - allocatedBaseQty)));
-    const shortfallQty = rounded(Math.max(0, requiredQty - allocatedQty));
-    const shortfallBaseQty = rounded(Math.max(0, requiredBaseQty - allocatedBaseQty));
+    const poolAllocatedBaseQty = rounded(poolAllocatedQty * conversionFactor);
+    if (selectedKey) remaining.set(selectedKey, rounded(Math.max(0, bucketAvailableBaseQty - poolAllocatedBaseQty)));
+    // Total allocation is what the hold already secured plus what the pool gave.
+    const allocatedQty = rounded(heldQty + poolAllocatedQty);
+    const allocatedBaseQty = rounded(heldBaseQty + poolAllocatedBaseQty);
+    const totalRequiredQty = rounded(requiredQty + heldQty);
+    const totalRequiredBaseQty = rounded(requiredBaseQty + heldBaseQty);
+    const shortfallQty = rounded(Math.max(0, totalRequiredQty - allocatedQty));
+    const shortfallBaseQty = rounded(Math.max(0, totalRequiredBaseQty - allocatedBaseQty));
     const status = shortfallBaseQty <= QUOTATION_STOCK_TOLERANCE
       ? 'available'
       : allocatedBaseQty > QUOTATION_STOCK_TOLERANCE
@@ -355,6 +400,9 @@ export function calculateQuotationReadiness(quotation, stockRows, remainingBySto
       shortfallBaseQty,
       status,
       hasStock: status === 'available',
+      // Prefer the pool bucket when one was allocated; otherwise keep whatever the
+      // hold already pinned, so a partially held line with no spare pool stock does
+      // not lose its bucket.
       allocation: selected ? {
         stockId: selected._id,
         warehouse: selected.warehouse,
@@ -363,7 +411,7 @@ export function calculateQuotationReadiness(quotation, stockRows, remainingBySto
         bucketAvailableQty: rounded(bucketAvailableBaseQty / conversionFactor),
         bucketAvailableBaseQty,
         baseUnit: items[index].baseUnit,
-      } : null,
+      } : items[index].allocation,
     });
   }
   return summarize(items, { queued: Boolean(options.queued), checkedAt, eligibility });

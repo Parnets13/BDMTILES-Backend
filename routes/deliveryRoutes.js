@@ -148,8 +148,10 @@ router.post('/', async (req, res) => {
 
     const existing = await Delivery.findOne({ branch: req.branchId, dispatchTrip: trip._id, salesOrder: salesOrder._id });
     if (existing) {
-      existing.deliveryExecutive = req.body.deliveryExecutive || existing.deliveryExecutive;
-      existing.deliveryExecutiveName = req.body.deliveryExecutiveName || existing.deliveryExecutiveName;
+      // Assignment identity is owned by the trip/vehicle relationship. Do not
+      // accept a client-supplied name that can disagree with User Management.
+      existing.deliveryExecutive = trip.deliveryExecutive || null;
+      existing.deliveryExecutiveName = trip.deliveryExecutiveName || '';
       await existing.save();
       return res.json({ success: true, message: `Delivery ${existing.deliveryNumber} assignment updated.`, data: safeDelivery(existing) });
     }
@@ -184,8 +186,8 @@ router.post('/', async (req, res) => {
       dealerCode: tripOrder.dealerCode || salesOrder.dealerCode || '',
       contactPhone: tripOrder.contactPhone || salesOrder.customerPhone || '',
       deliveryAddress: tripOrder.deliveryAddress || salesOrder.deliveryAddress || '',
-      deliveryExecutive: req.body.deliveryExecutive || trip.deliveryExecutive || undefined,
-      deliveryExecutiveName: req.body.deliveryExecutiveName || trip.deliveryExecutiveName || '',
+      deliveryExecutive: trip.deliveryExecutive || undefined,
+      deliveryExecutiveName: trip.deliveryExecutiveName || '',
       totalBoxes: tripOrder.totalBoxes,
       unfulfilledQty,
       hasFulfillmentShortage: unfulfilledQty > 0,

@@ -28,7 +28,8 @@ export function effectiveValidUntil(value) {
 
 export function quotationValidity(quotation, now = new Date()) {
   const expiresAt = effectiveValidUntil(quotation?.validUntil);
-  const terminal = ['converted', 'cancelled'].includes(quotation?.status)
+  // A split parent is a historical record; it must never be reported as expired.
+  const terminal = ['converted', 'cancelled', 'split'].includes(quotation?.status)
     || quotation?.conversionState === 'full';
   const isExpired = Boolean(expiresAt && expiresAt.getTime() < now.getTime() && !terminal);
   const expiresInDays = expiresAt

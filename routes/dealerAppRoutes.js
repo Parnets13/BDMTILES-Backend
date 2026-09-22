@@ -6,6 +6,7 @@ import Stock from '../models/Stock.js';
 import Invoice from '../models/Invoice.js';
 import DealerLedger from '../models/DealerLedger.js';
 import SalesOrder from '../models/SalesOrder.js';
+import Quotation from '../models/Quotation.js';
 import DealerOrderRequest from '../models/DealerOrderRequest.js';
 import DealerScheme from '../models/DealerScheme.js';
 import Delivery from '../models/Delivery.js';
@@ -26,6 +27,7 @@ import { generateDownloadToken } from '../utils/jwt.js';
 import { getDealerCreditExposure } from '../services/dealerCreditService.js';
 import { resolvePricing } from '../services/pricingResolver.js';
 import { buildTrustedRequestItems, orderRequestFingerprint } from '../services/dealerOrderRequestService.js';
+import { recordDealerResponse, shortfallDto } from '../services/dealerOrderShortfallService.js';
 import { requestFingerprint } from '../utils/idempotency.js';
 import { generateBranchNumber } from '../utils/branchSequence.js';
 
@@ -33,6 +35,28 @@ const router = Router();
 router.use(protectDealer);
 
 const money = (value) => Math.round((Number(value) + Number.EPSILON) * 100) / 100;
+
+/**
+ * What the dealer saves against MRP, worked out once on the server so the list, the
+ * detail screen and the related-products strip can never disagree with each other.
+ *
+ * Returns nulls rather than zeros when there is nothing honest to show: no MRP on the
+ * product, no resolved rate, or a rate at or above MRP. A struck-through price has to
+ * mean something, and "0% off" or a negative discount would be worse than silence.
+ */
+const mrpSaving = (mrp, rate) => {
+  const listPrice = money(mrp);
+  const yourPrice = rate === null || rate === undefined ? null : money(rate);
+  if (!(listPrice > 0) || yourPrice === null || !(yourPrice < listPrice)) {
+    return { mrp: listPrice > 0 ? listPrice : null, discountPercent: null, savingPerUnit: null };
+  }
+  return {
+    mrp: listPrice,
+    // Whole numbers only: "78% off" is the claim, not 78.34%.
+    discountPercent: Math.round(((listPrice - yourPrice) / listPrice) * 100),
+    savingPerUnit: money(listPrice - yourPrice),
+  };
+};
 const appError = (status, message) => Object.assign(new Error(message), { status });
 const sendError = (res, error) => res
   .status(error.status || 500)
@@ -274,7 +298,7 @@ router.get('/catalogue', async (req, res) => {
         sqftPerBox: product.sqftPerBox || 0,
         image: product.images?.[0] || '',
         dealerRate: rate?.effectiveRate ?? null,
-        mrp: money(product.mrp || 0),
+        ...mrpSaving(product.mrp, rate?.effectiveRate ?? null),
         availableQty: Number(stockByProduct.get(String(product._id)) || 0),
       };
     }));
@@ -339,7 +363,12 @@ router.get('/catalogue/:id', async (req, res) => {
     if (branch) {
       try {
         const priced = await resolvePricing({ branchId: branch, dealerId: dealer._id, product, quantity: 1, pricingDate: new Date() });
-        pricing = { effectiveRate: money(priced.effectiveRate), baseRate: money(priced.baseRate), rateField: priced.rateField, mrp: money(product.mrp || 0) };
+        pricing = {
+          effectiveRate: money(priced.effectiveRate),
+          baseRate: money(priced.baseRate),
+          rateField: priced.rateField,
+          ...mrpSaving(product.mrp, priced.effectiveRate),
+        };
       } catch { /* ignore */ }
       const stockRows = await Stock.aggregate([
         { $match: { branch: new mongoose.Types.ObjectId(String(branch)), product: new mongoose.Types.ObjectId(String(product._id)) } },
@@ -509,46 +538,116 @@ router.get('/order-requests/credit-check', async (req, res) => {
 });
 
 // A request only tells half the story on its own: the dealer wants to know what it
-// became. Resolve the linked quotation and, past that, the sales order it turned
-// into, so the app can show one continuous progress line instead of stopping at
-// "converted to a quotation". sourceSalesOrder is populated going forward; the
-// lookup by sourceQuotation covers requests linked before that field existed.
+// became. Resolve every quotation and sales order in its lineage so the app can
+// show one continuous progress line instead of stopping at "converted to a
+// quotation".
+//
+// A stock split means one request can produce more than one order, and the order
+// belongs to the split's available child rather than to the quotation the request
+// is linked to. So the lineage is read from the request's own `outcomes` list,
+// with the old lookup by sourceQuotation kept as a fallback for requests that were
+// linked before any of this existed.
 async function attachRequestOutcomes(requests, dealerId) {
-  const quotationIds = requests.map(r => r.sourceQuotation).filter(Boolean);
-  if (!quotationIds.length) return requests.map(r => ({ ...r, quotation: null, salesOrder: null }));
+  const quotationIds = [...new Set(requests.flatMap(request => [
+    request.sourceQuotation,
+    request.availableQuotation,
+    request.pendingStockQuotation,
+    ...(request.outcomes || []).map(outcome => outcome.quotation),
+  ]).filter(Boolean).map(String))];
+  const orderIds = [...new Set(requests.flatMap(request => [
+    request.sourceSalesOrder,
+    ...(request.outcomes || []).map(outcome => outcome.salesOrder),
+  ]).filter(Boolean).map(String))];
 
-  const Quotation = (await import('../models/Quotation.js')).default;
-  const [quotations, orders] = await Promise.all([
-    Quotation.find({ _id: { $in: quotationIds } })
-      .select('quotationNumber status grandTotal validUntil quotationDate').lean(),
-    SalesOrder.find({ dealer: dealerId, sourceQuotation: { $in: quotationIds } })
-      .select('orderNumber status paymentStatus grandTotal orderDate sourceQuotation').lean(),
+  const bare = request => ({
+    ...request,
+    shortfall: shortfallDto(request),
+    shortfallRounds: undefined,
+    quotation: null,
+    availableQuotation: null,
+    pendingStockQuotation: null,
+    salesOrder: null,
+    salesOrders: [],
+  });
+  if (!quotationIds.length && !orderIds.length) return requests.map(bare);
+
+  const [quotations, ordersById, legacyOrders] = await Promise.all([
+    quotationIds.length
+      ? Quotation.find({ _id: { $in: quotationIds } })
+        .select('quotationNumber status grandTotal validUntil quotationDate splitRole holdExpiresAt').lean()
+      : [],
+    orderIds.length
+      ? SalesOrder.find({ _id: { $in: orderIds }, dealer: dealerId })
+        .select('orderNumber status paymentStatus grandTotal orderDate sourceQuotation').lean()
+      : [],
+    // Requests processed before `outcomes` existed only know their quotation.
+    quotationIds.length
+      ? SalesOrder.find({ dealer: dealerId, sourceQuotation: { $in: quotationIds } })
+        .select('orderNumber status paymentStatus grandTotal orderDate sourceQuotation').lean()
+      : [],
   ]);
-  const quotationById = new Map(quotations.map(q => [String(q._id), q]));
-  const orderByQuotation = new Map(orders.map(o => [String(o.sourceQuotation), o]));
+
+  const quotationById = new Map(quotations.map(entry => [String(entry._id), entry]));
+  const orderById = new Map([...legacyOrders, ...ordersById].map(entry => [String(entry._id), entry]));
+  const ordersByQuotation = new Map();
+  for (const order of [...ordersById, ...legacyOrders]) {
+    const key = String(order.sourceQuotation || '');
+    if (!key || ordersByQuotation.has(key)) continue;
+    ordersByQuotation.set(key, order);
+  }
+
+  const quotationDto = (id) => {
+    const entry = id ? quotationById.get(String(id)) : null;
+    return entry ? {
+      _id: entry._id,
+      quotationNumber: entry.quotationNumber,
+      status: entry.status,
+      splitRole: entry.splitRole || 'none',
+      grandTotal: money(entry.grandTotal),
+      validUntil: entry.validUntil,
+      quotationDate: entry.quotationDate,
+      holdExpiresAt: entry.holdExpiresAt || null,
+    } : null;
+  };
+  const orderDto = (entry) => entry ? {
+    _id: entry._id,
+    orderNumber: entry.orderNumber,
+    status: entry.status,
+    paymentStatus: entry.paymentStatus,
+    grandTotal: money(entry.grandTotal),
+    orderDate: entry.orderDate,
+  } : null;
 
   return requests.map((request) => {
-    const key = request.sourceQuotation ? String(request.sourceQuotation) : '';
-    const quotation = key ? quotationById.get(key) || null : null;
-    const salesOrder = key ? orderByQuotation.get(key) || null : null;
+    const fromOutcomes = (request.outcomes || [])
+      .map(outcome => ({
+        kind: outcome.kind,
+        at: outcome.at,
+        quotation: quotationDto(outcome.quotation),
+        salesOrder: orderDto(orderById.get(String(outcome.salesOrder || ''))),
+      }))
+      .filter(entry => entry.salesOrder || entry.quotation);
+    const salesOrders = fromOutcomes.map(entry => entry.salesOrder).filter(Boolean);
+    // Fall back to the pre-split lineage when this request has no outcomes.
+    if (!salesOrders.length) {
+      const legacy = orderDto(
+        orderById.get(String(request.sourceSalesOrder || ''))
+        || ordersByQuotation.get(String(request.sourceQuotation || '')),
+      );
+      if (legacy) salesOrders.push(legacy);
+    }
     return {
       ...request,
-      quotation: quotation && {
-        _id: quotation._id,
-        quotationNumber: quotation.quotationNumber,
-        status: quotation.status,
-        grandTotal: money(quotation.grandTotal),
-        validUntil: quotation.validUntil,
-        quotationDate: quotation.quotationDate,
-      },
-      salesOrder: salesOrder && {
-        _id: salesOrder._id,
-        orderNumber: salesOrder.orderNumber,
-        status: salesOrder.status,
-        paymentStatus: salesOrder.paymentStatus,
-        grandTotal: money(salesOrder.grandTotal),
-        orderDate: salesOrder.orderDate,
-      },
+      shortfall: shortfallDto(request),
+      // The raw rounds carry internal bookkeeping; `shortfall` is the shaped view.
+      shortfallRounds: undefined,
+      quotation: quotationDto(request.sourceQuotation),
+      availableQuotation: quotationDto(request.availableQuotation),
+      pendingStockQuotation: quotationDto(request.pendingStockQuotation),
+      // Kept for older app builds that read a single order.
+      salesOrder: salesOrders[0] || null,
+      salesOrders,
+      outcomes: fromOutcomes,
     };
   });
 }
@@ -558,6 +657,10 @@ const REQUEST_FIELDS = [
   'submittedAt', 'createdAt', 'approvedAt', 'approvalRemarks', 'rejectionReason', 'rejectedAt',
   'cancelledAt', 'cancellationReason', 'sourceQuotation', 'linkedAt', 'revision',
   'editHistory', 'editedAt', 'salesExecutiveName',
+  // Stock-aware processing: what was reserved, what is still being negotiated.
+  'stockPlan', 'availableQuotation', 'pendingStockQuotation', 'sourceSalesOrder',
+  'processedAt', 'convertedAt', 'outcomes', 'pendingStockFulfilledAt',
+  'shortfallStatus', 'shortfallRounds', 'shortfallSettledAt',
 ].join(' ');
 
 // GET /api/v1/dealer-app/order-requests?status=&page=&limit=
@@ -587,6 +690,76 @@ router.get('/order-requests/:id', async (req, res) => {
     const [enriched] = await attachRequestOutcomes([request], req.dealer._id);
     res.json({ success: true, data: enriched });
   } catch (error) { sendError(res, error); }
+});
+
+// GET /api/v1/dealer-app/order-requests/:id/shortfall
+//
+// Just the part of the request that is waiting on the dealer. The detail endpoint
+// already carries this, but the app polls this one on its own so a pending answer
+// can be surfaced without re-fetching the whole request.
+router.get('/order-requests/:id/shortfall', async (req, res) => {
+  try {
+    const request = await DealerOrderRequest.findOne({ _id: req.params.id, dealer: req.dealer._id })
+      .select('requestNumber status shortfallStatus shortfallRounds shortfallSettledAt processedAt')
+      .lean();
+    if (!request) throw appError(404, 'Order request not found.');
+    res.json({
+      success: true,
+      data: {
+        requestNumber: request.requestNumber,
+        status: request.status,
+        awaitingResponse: request.shortfallStatus === 'awaiting_dealer',
+        ...shortfallDto(request),
+      },
+    });
+  } catch (error) { sendError(res, error); }
+});
+
+// POST /api/v1/dealer-app/order-requests/:id/shortfall/respond
+//   { round, lines: [{ product, response: 'accepted'|'changed'|'rejected', quantity?, remark? }], remark? }
+//
+// The dealer's answer covers the short quantity only. Whatever they say here, the
+// Sales Order already raised for the available quantity is untouched — it is
+// reserved stock and is not theirs or ours to reopen from this screen.
+//
+// `round` is required so an answer to an offer the branch has since revised is
+// rejected rather than applied to numbers the dealer never saw.
+router.post('/order-requests/:id/shortfall/respond', async (req, res) => {
+  const session = await mongoose.startSession();
+  try {
+    const round = Number(req.body?.round);
+    if (!Number.isInteger(round) || round < 1) {
+      throw appError(422, 'A valid round is required. Open the request again to see the current offer.');
+    }
+    const lines = req.body?.lines;
+    if (!Array.isArray(lines) || !lines.length) throw appError(422, 'Answer each item before submitting.');
+    if (lines.length > 100) throw appError(422, 'Too many items in one response.');
+
+    let result;
+    await session.withTransaction(async () => {
+      result = await recordDealerResponse({
+        requestId: req.params.id,
+        dealerId: req.dealer._id,
+        round,
+        responses: lines,
+        dealerRemark: req.body?.remark,
+        session,
+      });
+    });
+
+    const request = await DealerOrderRequest.findById(result.request._id).select(REQUEST_FIELDS).lean();
+    const [enriched] = await attachRequestOutcomes([request], req.dealer._id);
+    res.json({
+      success: true,
+      message: result.outcome === 'rejected'
+        ? 'Thanks — we have recorded that you do not want the pending quantity.'
+        : result.outcome === 'changed'
+          ? 'Thanks — the branch will confirm the new availability date for your updated quantity.'
+          : 'Thanks — your confirmation has been recorded and the branch will raise the pending order.',
+      data: enriched,
+    });
+  } catch (error) { sendError(res, error); }
+  finally { await session.endSession(); }
 });
 
 // POST /api/v1/dealer-app/order-requests/:id/cancel   { reason? }
@@ -1452,6 +1625,7 @@ router.get('/catalogue/:id/similar', async (req, res) => {
         unit: product.unit || 'Box',
         image: product.images?.[0] || '',
         dealerRate: rate,
+        ...mrpSaving(product.mrp, rate),
       };
     }));
 

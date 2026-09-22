@@ -16,6 +16,9 @@ const vehicleSchema = new mongoose.Schema(
     ownerName: { type: String, default: '' },
     driverName: { type: String, default: '' },
     driverPhone: { type: String, default: '' },
+    // Optional authenticated account used by assignment/tracking. Driver details
+    // remain separate because the person driving need not be the app account.
+    deliveryExecutive: { type: mongoose.Schema.Types.ObjectId, ref: 'User', default: null },
     insuranceExpiry: { type: Date },
     fitnessExpiry: { type: Date },
     isActive: { type: Boolean, default: true },
@@ -26,6 +29,7 @@ const vehicleSchema = new mongoose.Schema(
 );
 
 vehicleSchema.index({ isActive: 1 });
+vehicleSchema.index({ deliveryExecutive: 1, isActive: 1 });
 
 const Vehicle = mongoose.model('Vehicle', vehicleSchema);
 export default Vehicle;

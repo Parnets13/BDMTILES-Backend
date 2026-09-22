@@ -81,6 +81,9 @@ router.get('/', async (req, res) => {
         totalQty: { $sum: '$totalQty' },
         availableQty: { $sum: '$availableQty' },
         reservedQty: { $sum: '$reservedQty' },
+        // Held for an approved quotation. availableQty is already net of this, so
+        // it is surfaced only to explain why free stock is lower than total.
+        quotedQty: { $sum: '$quotedQty' },
         damagedQty: { $sum: '$damagedQty' },
       } },
     ]) : [];
@@ -92,6 +95,7 @@ router.get('/', async (req, res) => {
         stockAvailable: Number(stock?.availableQty || 0),
         stockTotal: Number(stock?.totalQty || 0),
         stockReserved: Number(stock?.reservedQty || 0),
+        stockQuoted: Number(stock?.quotedQty || 0),
         stockDamaged: Number(stock?.damagedQty || 0),
       };
     });

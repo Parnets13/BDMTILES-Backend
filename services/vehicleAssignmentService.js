@@ -71,6 +71,8 @@ const capacityWarning = (vehicle, { totalBoxes = 0, totalWeight = 0 }) => {
  *                                        clash, so editing a trip does not
  *                                        collide with itself.
  * @param {boolean} [input.allowBusy]     Skip the double-booking check.
+ * @param {string} [input.branchId]       Active branch; validates the optional
+ *                                        linked Delivery Executive account.
  * @returns {Promise<{vehicle: object, warnings: string[]}>}
  */
 export async function resolveVehicleForAssignment({
@@ -80,6 +82,7 @@ export async function resolveVehicleForAssignment({
   totalWeight = 0,
   excludeTripId = null,
   allowBusy = false,
+  branchId = null,
   session = null,
 } = {}) {
   const trimmedNumber = String(vehicleNumber || '').trim().toUpperCase();
@@ -90,7 +93,8 @@ export async function resolveVehicleForAssignment({
     throw conflict(422, 'vehicle must be a valid Vehicle Master id.', 'VEHICLE_INVALID');
   }
 
-  let query = Vehicle.findOne(vehicleId ? { _id: vehicleId } : { vehicleNumber: trimmedNumber });
+  let query = Vehicle.findOne(vehicleId ? { _id: vehicleId } : { vehicleNumber: trimmedNumber })
+    .populate('deliveryExecutive', 'name phone email role status assignedBranches defaultBranch');
   if (session) query = query.session(session);
   const vehicle = await query.lean();
 
@@ -105,6 +109,18 @@ export async function resolveVehicleForAssignment({
   }
   if (vehicle.isActive === false) {
     throw conflict(409, `${vehicle.vehicleNumber} is marked inactive in Vehicle Master.`, 'VEHICLE_INACTIVE');
+  }
+
+  if (vehicle.deliveryExecutive) {
+    const executive = vehicle.deliveryExecutive;
+    const belongsToBranch = !branchId || (executive.assignedBranches || []).some(id => String(id) === String(branchId));
+    if (executive.role !== 'delivery_executive' || executive.status !== 'Active' || !belongsToBranch) {
+      throw conflict(
+        409,
+        `${vehicle.vehicleNumber}'s linked Delivery Executive is inactive, has the wrong role, or is not assigned to the active branch. Update Vehicle Master before assigning it.`,
+        'VEHICLE_EXECUTIVE_UNAVAILABLE',
+      );
+    }
   }
 
   const expired = expiryProblems(vehicle);
@@ -140,4 +156,6 @@ export const vehicleSnapshot = vehicle => ({
   vehicleNumber: vehicle.vehicleNumber,
   vehicleType: vehicle.vehicleType || '',
   vehicleCapacity: vehicle.capacity ? `${vehicle.capacity} ${vehicle.capacityUnit || ''}`.trim() : '',
+  deliveryExecutive: vehicle.deliveryExecutive?._id || vehicle.deliveryExecutive || undefined,
+  deliveryExecutiveName: vehicle.deliveryExecutive?.name || '',
 });
