@@ -740,6 +740,23 @@ router.patch('/:id/verify-loading', async (req, res) => {
       if (req.body.vehicleType) claimed.vehicleType = req.body.vehicleType;
       if (req.body.driverName) claimed.driverName = req.body.driverName;
       if (req.body.driverPhone) claimed.driverPhone = req.body.driverPhone;
+
+      // If no deliveryExecutive ObjectId was sent (manual mode), try to resolve
+      // one by matching the typed driverPhone or driverName against User accounts
+      // in this branch that have the delivery_executive role.
+      if (!claimed.deliveryExecutive && (req.body.driverPhone || req.body.driverName)) {
+        const query = { role: 'delivery_executive' };
+        if (req.body.driverPhone) {
+          query.phone = req.body.driverPhone.trim();
+        } else {
+          query.name = new RegExp(`^${req.body.driverName.trim()}$`, 'i');
+        }
+        const matchedUser = await User.findOne(query).select('_id name').session(session).lean();
+        if (matchedUser) {
+          claimed.deliveryExecutive = matchedUser._id;
+          console.log(`[verify-loading] Resolved deliveryExecutive from driverPhone/Name: ${matchedUser.name}`);
+        }
+      }
       
       claimed.loadingVerificationProcessing = false;
       await claimed.save({ session });

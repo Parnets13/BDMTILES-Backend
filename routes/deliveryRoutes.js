@@ -186,7 +186,7 @@ router.post('/', async (req, res) => {
       dealerCode: tripOrder.dealerCode || salesOrder.dealerCode || '',
       contactPhone: tripOrder.contactPhone || salesOrder.customerPhone || '',
       deliveryAddress: tripOrder.deliveryAddress || salesOrder.deliveryAddress || '',
-      deliveryExecutive: trip.deliveryExecutive || undefined,
+      deliveryExecutive: trip.deliveryExecutive || pickList?.deliveryExecutive || undefined,
       deliveryExecutiveName: trip.deliveryExecutiveName || '',
       totalBoxes: tripOrder.totalBoxes,
       unfulfilledQty,
