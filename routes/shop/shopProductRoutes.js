@@ -32,35 +32,53 @@ const ONLY_ONLINE = { status: 'active', onlineVisible: true };
 /**
  * How much of each product the storefront may actually sell.
  *
- * A website customer never picks a shade or batch — they order the SKU and the
- * warehouse assigns whatever is on the shelf. So availability here is the SUM
- * of `availableQty` across every stock row (all shades + all batches) in the
- * online branch's default active warehouse. The old code queried only rows with
- * `shade: ''` AND `batch: ''`, which silently dropped stock recorded under any
- * real shade/batch and made the product look out of stock despite having inventory.
+ * Mirrors the AUTHORITATIVE admin `getStockSummary` / `listStocks` pattern
+ * (see services/stockMovementService.js lines 297-397): stock is scoped ONLY to
+ * the online branch, then summed across EVERY active warehouse, every shade, and
+ * every batch in that branch.  The old code restricted lookups to a single
+ * `Warehouse.findOne({...})` bucket, which silently dropped stock held in any
+ * non-default warehouse and made SKUs look out of stock despite the admin panel
+ * clearly showing them as available.
+ *
+ * Returns a Map<productId, availableQtyNumber>.  A missing key means zero.
+ * Availability is best-effort: a lookup failure must never hide the catalogue.
  */
 const onlineAvailability = async (productIds) => {
   const byProduct = new Map();
   if (!productIds?.length) return byProduct;
   try {
     const branchId = await getOnlineBranchId();
-    const warehouse = await Warehouse.findOne({ branch: branchId, status: 'active' })
-      .sort({ type: 1, createdAt: 1 })
+    // Collect active warehouses first, same scope as the admin panel would use
+    // for a user logged into this branch — any active warehouse ships online.
+    const warehouses = await Warehouse.find({ branch: branchId, status: 'active' })
       .select('_id')
       .lean();
-    if (!warehouse) return byProduct;
+    if (!warehouses.length) return byProduct;
+    const warehouseIds = warehouses.map((w) => w._id);
+    const normalizedIds = productIds.map((id) =>
+      (typeof id === 'string' && mongoose.isValidObjectId(id))
+        ? new mongoose.Types.ObjectId(id)
+        : id,
+    );
+    // Matches stockMovementService.getStockSummary aggregate verbatim:
+    //   { $match: { branch } } → group + sum the buckets.
+    // We additionally narrow to the active warehouses + requested productIds.
     const rows = await Stock.aggregate([
       {
         $match: {
           branch: branchId,
-          warehouse: warehouse._id,
-          product: { $in: productIds.map(id => (typeof id === 'string' && mongoose.isValidObjectId(id)) ? new mongoose.Types.ObjectId(id) : id) },
+          warehouse: { $in: warehouseIds },
+          product: { $in: normalizedIds },
         },
       },
       {
         $group: {
           _id: '$product',
-          availableQty: { $sum: { $max: [0, { $ifNull: ['$availableQty', 0] }] } },
+          availableQty: {
+            $sum: {
+              $max: [0, { $ifNull: ['$availableQty', 0] }],
+            },
+          },
         },
       },
     ]);
