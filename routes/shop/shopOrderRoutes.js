@@ -63,33 +63,44 @@ const toTracking = (order, delivery) => ({
 // A website customer can only order stock that is actually available. The reservation in
 // reserveSalesOrderInventory is the real authority (it moves availableQty -> reservedQty
 // under a guard), but its error names only the product. This pre-check reads the same
-// stock key the reservation will target — branch + warehouse + shade + batch — and reports
-// exactly how much is left, so the storefront can tell the customer what to do.
+// stock key the reservation will target AFTER we auto-assign a stock bucket — we SUM
+// across all shades + batches in the assigned warehouse, so the storefront and the
+// order endpoint now agree on the same numbers.
 const assertOnlineStockAvailable = async (items, { branchId, session }) => {
-  // Aggregate the cart by stock key first: two lines of the same product must be
-  // checked against their combined quantity, not individually.
+  // Aggregate the cart by (product, warehouse) first — two lines of the same
+  // product must be checked against their combined quantity.
   const required = new Map();
   for (const item of items) {
-    const key = [item.product, item.warehouse, item.shade || '', item.batch || ''].map(String).join('|');
+    const key = [item.product, item.warehouse].map(String).join('|');
     const current = required.get(key);
     if (current) current.quantity += Number(item.quantity || 0);
     else required.set(key, {
       product: item.product,
       warehouse: item.warehouse,
-      shade: item.shade || '',
-      batch: item.batch || '',
       productName: item.productName || item.productCode || 'item',
       quantity: Number(item.quantity || 0),
     });
   }
 
-  const rows = await Stock.find({
-    branch: branchId,
-    $or: [...required.values()].map(({ product, warehouse, shade, batch }) => ({ product, warehouse, shade, batch })),
-  }).select('product warehouse shade batch availableQty').session(session).lean();
+  // Sum availability across ALL shades + batches in the warehouse per product.
+  const queries = [...required.values()].map(({ product, warehouse }) => ({ product, warehouse }));
+  const rows = await Stock.aggregate([
+    {
+      $match: {
+        branch: branchId,
+        $or: queries,
+      },
+    },
+    {
+      $group: {
+        _id: { product: '$product', warehouse: '$warehouse' },
+        availableQty: { $sum: { $max: [0, { $ifNull: ['$availableQty', 0] }] } },
+      },
+    },
+  ]).session(session);
 
   const availableByKey = new Map(rows.map((row) => [
-    [row.product, row.warehouse, row.shade || '', row.batch || ''].map(String).join('|'),
+    [row._id.product, row._id.warehouse].map(String).join('|'),
     Number(row.availableQty || 0),
   ]));
 
@@ -170,6 +181,10 @@ router.post('/', async (req, res) => {
 
       // Auto-assign the default (first active) warehouse for the online branch to any
       // item that has no warehouse set — customers don't pick a warehouse.
+      // Also auto-assign a shade + batch from whatever stock buckets have availableQty.
+      // If stock is stored under real shade/batch names (e.g. Shade-A, Batch-2024-01)
+      // then `reserveSalesOrderInventory` would otherwise fail because it looks for
+      // rows with (product + warehouse + exact shade + exact batch).
       const defaultWarehouse = await Warehouse.findOne({ branch: branchId, status: 'active' })
         .sort({ type: 1, createdAt: 1 }) // prefer 'main' type first (alphabetically 'main' < 'transit')
         .select('_id')
@@ -178,9 +193,62 @@ router.post('/', async (req, res) => {
       if (!defaultWarehouse) {
         throw Object.assign(new Error('Online ordering is temporarily unavailable. Please try again later.'), { status: 503 });
       }
-      priced.items.forEach((item) => {
-        if (!item.warehouse) item.warehouse = defaultWarehouse._id;
-      });
+      const itemsNeedingBucket = priced.items.filter(i => !i.warehouse);
+      itemsNeedingBucket.forEach((item) => { item.warehouse = defaultWarehouse._id; });
+
+      // For every (product, warehouse) that has NO explicit shade AND batch, pick the
+      // first stock bucket that has the most availableQty in that warehouse. This lets
+      // website orders reserve from real Shade-A / Batch-X buckets — not just the
+      // empty-string shade/batch rows.
+      const pickBucketKeys = [...new Map(priced.items.map(i => [
+        [String(i.product) + '|' + String(i.warehouse),
+          { product: i.product, warehouse: i.warehouse, shade: i.shade, batch: i.batch }],
+      ])).values()].filter(({ shade, batch }) => !shade && !batch);
+
+      if (pickBucketKeys.length > 0) {
+        const productIds = pickBucketKeys.map(k => k.product);
+        const warehouseIds = pickBucketKeys.map(k => k.warehouse);
+        const buckets = await Stock.aggregate([
+          {
+            $match: {
+              branch: branchId,
+              product: { $in: productIds.map(id => (typeof id === 'string' && mongoose.isValidObjectId(id)) ? new mongoose.Types.ObjectId(id) : id) },
+              warehouse: { $in: warehouseIds.map(id => (typeof id === 'string' && mongoose.isValidObjectId(id)) ? new mongoose.Types.ObjectId(id) : id) },
+              availableQty: { $gt: 0 },
+            },
+          },
+          {
+            $sort: { availableQty: -1, updatedAt: -1 },
+          },
+          {
+            $group: {
+              _id: { product: '$product', warehouse: '$warehouse' },
+              shade: { $first: '$shade' },
+              batch: { $first: '$batch' },
+            },
+          },
+        ]).session(session);
+
+        const bucketByKey = new Map(
+          buckets.map(b => [
+            String(b._id.product) + '|' + String(b._id.warehouse),
+            { shade: b.shade || '', batch: b.batch || '' },
+          ]),
+        );
+
+        priced.items.forEach((item) => {
+          if (item.shade || item.batch) return;
+          const key = String(item.product) + '|' + String(item.warehouse);
+          const picked = bucketByKey.get(key);
+          if (picked) {
+            item.shade = picked.shade;
+            item.batch = picked.batch;
+          } else {
+            item.shade = '';
+            item.batch = '';
+          }
+        });
+      }
 
       // A website customer can only buy what is actually on the shelf. Check availability
       // up front so the shortfall can be named per item, instead of surfacing the generic

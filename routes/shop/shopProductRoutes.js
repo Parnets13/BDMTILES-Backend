@@ -32,14 +32,12 @@ const ONLY_ONLINE = { status: 'active', onlineVisible: true };
 /**
  * How much of each product the storefront may actually sell.
  *
- * Checkout reserves against exactly one stock key: the online branch's default
- * warehouse, with no shade or batch, because a customer never picks either.
- * Summing every stock row would advertise shade- or batch-held stock nobody can
- * buy, so the cart would accept a quantity the order endpoint then rejects.
- *
- * Returned for lists as well as the single product, so a listing page and the
- * cart can cap the quantity instead of discovering the limit at checkout.
- * Availability is best-effort: a lookup failure must never hide the catalogue.
+ * A website customer never picks a shade or batch — they order the SKU and the
+ * warehouse assigns whatever is on the shelf. So availability here is the SUM
+ * of `availableQty` across every stock row (all shades + all batches) in the
+ * online branch's default active warehouse. The old code queried only rows with
+ * `shade: ''` AND `batch: ''`, which silently dropped stock recorded under any
+ * real shade/batch and made the product look out of stock despite having inventory.
  */
 const onlineAvailability = async (productIds) => {
   const byProduct = new Map();
@@ -51,17 +49,26 @@ const onlineAvailability = async (productIds) => {
       .select('_id')
       .lean();
     if (!warehouse) return byProduct;
-    const rows = await Stock.find({
-      branch: branchId,
-      warehouse: warehouse._id,
-      shade: '',
-      batch: '',
-      product: { $in: productIds },
-    }).select('product availableQty').lean();
+    const rows = await Stock.aggregate([
+      {
+        $match: {
+          branch: branchId,
+          warehouse: warehouse._id,
+          product: { $in: productIds.map(id => (typeof id === 'string' && mongoose.isValidObjectId(id)) ? new mongoose.Types.ObjectId(id) : id) },
+        },
+      },
+      {
+        $group: {
+          _id: '$product',
+          availableQty: { $sum: { $max: [0, { $ifNull: ['$availableQty', 0] }] } },
+        },
+      },
+    ]);
     for (const row of rows) {
-      byProduct.set(String(row.product), Math.max(0, Number(row.availableQty || 0)));
+      byProduct.set(String(row._id), Math.max(0, Number(row.availableQty || 0)));
     }
-  } catch {
+  } catch (err) {
+    console.error('[shopProductRoutes] onlineAvailability failed:', err.message);
     // Leave the map empty; callers fall back to zero.
   }
   return byProduct;
