@@ -2,7 +2,6 @@ import { Router } from 'express';
 import mongoose from 'mongoose';
 import Product from '../../models/Product.js';
 import Stock from '../../models/Stock.js';
-import Warehouse from '../../models/Warehouse.js';
 import Category from '../../models/Category.js';
 import Brand from '../../models/Brand.js';
 import { getOnlineBranchId } from '../../utils/onlineBranch.js';
@@ -34,7 +33,7 @@ const ONLY_ONLINE = { status: 'active', onlineVisible: true };
  *
  * Mirrors the AUTHORITATIVE admin `getStockSummary` / `listStocks` pattern
  * (see services/stockMovementService.js lines 297-397): stock is scoped ONLY to
- * the online branch, then summed across EVERY active warehouse, every shade, and
+ * the online branch, then summed across EVERY warehouse, every shade, and
  * every batch in that branch.  The old code restricted lookups to a single
  * `Warehouse.findOne({...})` bucket, which silently dropped stock held in any
  * non-default warehouse and made SKUs look out of stock despite the admin panel
@@ -48,26 +47,18 @@ const onlineAvailability = async (productIds) => {
   if (!productIds?.length) return byProduct;
   try {
     const branchId = await getOnlineBranchId();
-    // Collect active warehouses first, same scope as the admin panel would use
-    // for a user logged into this branch — any active warehouse ships online.
-    const warehouses = await Warehouse.find({ branch: branchId, status: 'active' })
-      .select('_id')
-      .lean();
-    if (!warehouses.length) return byProduct;
-    const warehouseIds = warehouses.map((w) => w._id);
     const normalizedIds = productIds.map((id) =>
       (typeof id === 'string' && mongoose.isValidObjectId(id))
         ? new mongoose.Types.ObjectId(id)
         : id,
     );
-    // Matches stockMovementService.getStockSummary aggregate verbatim:
-    //   { $match: { branch } } → group + sum the buckets.
-    // We additionally narrow to the active warehouses + requested productIds.
+    // Match the admin stock summary: branch-scoped and summed across every
+    // warehouse/shade/batch bucket. `availableQty` already excludes reserved,
+    // quoted, blocked, damaged, and otherwise unavailable quantities.
     const rows = await Stock.aggregate([
       {
         $match: {
           branch: branchId,
-          warehouse: { $in: warehouseIds },
           product: { $in: normalizedIds },
         },
       },

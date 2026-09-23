@@ -64,7 +64,7 @@ const toTracking = (order, delivery) => ({
 // reserveSalesOrderInventory is the real authority (it moves availableQty -> reservedQty
 // under a guard), but its error names only the product. This pre-check mirrors the admin
 // stockMovementService#getStockSummary logic — stock is scoped to the online branch and
-// summed across ALL active warehouses, ALL shades, and ALL batches.  It must match
+// summed across ALL warehouses, ALL shades, and ALL batches.  It must match
 // onlineAvailability in shopProductRoutes exactly so the storefront, cart, and checkout
 // all agree on how much is left.
 const assertOnlineStockAvailable = async (items, { branchId, session }) => {
@@ -82,26 +82,16 @@ const assertOnlineStockAvailable = async (items, { branchId, session }) => {
     });
   }
 
-  // Any active warehouse in the online branch may ship the order — same scope the
-  // admin StockPage would show for this branch.
-  const warehouses = await Warehouse.find({ branch: branchId, status: 'active' })
-    .select('_id')
-    .session(session)
-    .lean();
-  const warehouseIds = warehouses.map((w) => w._id);
-
-  const productIds = [...required.values()].map((v) => v.product);
-  const normalizedIds = productIds.map((id) =>
+  const requiredProductIds = [...required.values()].map((v) => v.product);
+  const normalizedIds = requiredProductIds.map((id) =>
     (typeof id === 'string' && mongoose.isValidObjectId(id))
       ? new mongoose.Types.ObjectId(id)
       : id,
   );
-  const rows = warehouseIds.length
-    ? await Stock.aggregate([
+  const rows = await Stock.aggregate([
       {
         $match: {
           branch: branchId,
-          warehouse: { $in: warehouseIds },
           product: { $in: normalizedIds },
         },
       },
@@ -115,8 +105,7 @@ const assertOnlineStockAvailable = async (items, { branchId, session }) => {
           },
         },
       },
-    ]).session(session)
-    : [];
+    ]).session(session);
 
   const availableByProduct = new Map(rows.map((row) => [
     String(row._id),
@@ -163,8 +152,8 @@ router.post('/', async (req, res) => {
       const branchId = await getOnlineBranchId();
 
       // Validate products are online-visible; the server owns pricing (never trust client rates).
-      const productIds = rawItems.map((i) => i.productId).filter(mongoose.isValidObjectId);
-      const products = await Product.find({ _id: { $in: productIds }, status: 'active', onlineVisible: true })
+      const submittedProductIds = rawItems.map((i) => i.productId).filter(mongoose.isValidObjectId);
+      const products = await Product.find({ _id: { $in: submittedProductIds }, status: 'active', onlineVisible: true })
         .select('_id')
         .session(session)
         .lean();
@@ -203,7 +192,7 @@ router.post('/', async (req, res) => {
       // the reservation engine `reserveSalesOrderInventory` can move qty from
       // `availableQty` -> `reservedQty`.  Strategy mirrors admin StockPage:
       //
-      //   1. Consider every ACTIVE warehouse in the online branch (matches the
+      //   1. Consider every warehouse in the online branch (matches the
       //      aggregation used by `assertOnlineStockAvailable` above AND by the
       //      shopProductRoutes `onlineAvailability` helper — so numbers always
       //      agree between the list/detail/cart/checkout views).
@@ -212,22 +201,22 @@ router.post('/', async (req, res) => {
       //   3. If a product truly has no bucket with stock anywhere, fall back
       //      to the earliest-created warehouse with empty shade/batch so the
       //      final reservation guard still runs and errors properly.
-      const activeWarehouses = await Warehouse.find({ branch: branchId, status: 'active' })
+      const branchWarehouses = await Warehouse.find({ branch: branchId })
         .sort({ type: 1, createdAt: 1 })
         .select('_id')
         .session(session)
         .lean();
-      if (!activeWarehouses.length) {
+      if (!branchWarehouses.length) {
         throw Object.assign(new Error('Online ordering is temporarily unavailable. Please try again later.'), { status: 503 });
       }
-      const fallbackWarehouse = activeWarehouses[0]._id;
+      const fallbackWarehouse = branchWarehouses[0]._id;
       const productIds = priced.items.map((i) => i.product);
       const normalizedIds = productIds.map((id) =>
         (typeof id === 'string' && mongoose.isValidObjectId(id))
           ? new mongoose.Types.ObjectId(id)
           : id,
       );
-      const warehouseIds = activeWarehouses.map((w) => w._id);
+      const warehouseIds = branchWarehouses.map((w) => w._id);
 
       // Rank all buckets (warehouse + shade + batch) by availableQty for the
       // products in this order, then take the single best bucket per product.
