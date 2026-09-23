@@ -105,3 +105,10 @@ export const uploadSupplierCreditNote = multer({
   fileFilter: creditNoteFileFilter,
   limits: { fileSize: 8 * 1024 * 1024 },
 }).single('document');
+
+// Single image upload for visual search endpoint
+export const upload = multer({
+  storage: storageFor(productUploadDirectory),
+  fileFilter,
+  limits: { fileSize: 5 * 1024 * 1024 }, // 5MB
+});

@@ -6,6 +6,9 @@ import Warehouse from '../../models/Warehouse.js';
 import Category from '../../models/Category.js';
 import Brand from '../../models/Brand.js';
 import { getOnlineBranchId } from '../../utils/onlineBranch.js';
+import { upload } from '../../middleware/upload.js';
+import { generateEmbedding, findSimilarProducts } from '../../services/imageEmbedding.js';
+import fs from 'fs/promises';
 
 const router = Router();
 
@@ -309,6 +312,119 @@ router.get('/:id', async (req, res) => {
       data: { ...toPublic(product), availableQty, inStock: availableQty > 0 },
     });
   } catch (error) {
+    return res.status(500).json({ success: false, message: error.message });
+  }
+});
+
+// POST /api/v1/shop/products/search-by-image — visual product search
+// Accepts an uploaded image, generates embedding, finds similar products
+router.post('/search-by-image', upload.single('image'), async (req, res) => {
+  try {
+    // Validate image upload
+    if (!req.file) {
+      return res.status(400).json({ 
+        success: false, 
+        message: 'No image provided. Please upload an image file.' 
+      });
+    }
+
+    console.log('[ImageSearch] Processing image:', req.file.filename);
+
+    // Generate embedding from uploaded image
+    let queryEmbedding;
+    try {
+      queryEmbedding = await generateEmbedding(req.file.path);
+      console.log('[ImageSearch] Generated embedding with', queryEmbedding.length, 'dimensions');
+    } catch (embeddingError) {
+      console.error('[ImageSearch] Embedding generation failed:', embeddingError);
+      // Clean up uploaded file
+      try {
+        await fs.unlink(req.file.path);
+      } catch {}
+      return res.status(500).json({ 
+        success: false, 
+        message: 'Failed to process image. Please try a different image.' 
+      });
+    }
+
+    // Find products with embeddings (only online visible products)
+    const productsWithEmbeddings = await Product.find({
+      ...ONLY_ONLINE,
+      imageEmbedding: { $exists: true, $ne: null, $not: { $size: 0 } },
+    })
+      .select('_id imageEmbedding')
+      .lean();
+
+    console.log('[ImageSearch] Found', productsWithEmbeddings.length, 'products with embeddings');
+
+    if (productsWithEmbeddings.length === 0) {
+      // Clean up uploaded file
+      try {
+        await fs.unlink(req.file.path);
+      } catch {}
+      return res.json({
+        success: true,
+        data: [],
+        message: 'No indexed products available for visual search yet.',
+        pagination: { currentPage: 1, totalPages: 1, totalItems: 0, itemsPerPage: 20 },
+      });
+    }
+
+    // Calculate similarity scores
+    const similarProducts = findSimilarProducts(
+      queryEmbedding,
+      productsWithEmbeddings.map(p => ({
+        id: String(p._id),
+        embedding: p.imageEmbedding,
+      })),
+      20 // Top 20 results
+    );
+
+    console.log('[ImageSearch] Top match similarity:', similarProducts[0]?.similarity || 0);
+
+    // Fetch full product details for top matches
+    const productIds = similarProducts.map(p => new mongoose.Types.ObjectId(p.id));
+    const products = await Product.find({ _id: { $in: productIds } })
+      .select(PUBLIC_PRODUCT_FIELDS)
+      .populate('brand', 'name')
+      .populate('category', 'name')
+      .populate('subcategory', 'name')
+      .lean();
+
+    // Create a map for quick lookup and preserve similarity order
+    const productMap = new Map(products.map(p => [String(p._id), p]));
+    const orderedProducts = similarProducts
+      .map(sp => productMap.get(sp.id))
+      .filter(p => p); // Filter out any missing products
+
+    // Add availability info
+    const results = await withAvailability(orderedProducts.map(toPublic));
+
+    // Clean up uploaded file
+    try {
+      await fs.unlink(req.file.path);
+    } catch (cleanupError) {
+      console.warn('[ImageSearch] Failed to cleanup uploaded file:', cleanupError);
+    }
+
+    return res.json({
+      success: true,
+      data: results,
+      pagination: {
+        currentPage: 1,
+        totalPages: 1,
+        totalItems: results.length,
+        itemsPerPage: 20,
+      },
+    });
+  } catch (error) {
+    console.error('[ImageSearch] Search failed:', error);
+    // Clean up uploaded file on error
+    if (req.file?.path) {
+      try {
+        await fs.unlink(req.file.path);
+      } catch {}
+    }
     return res.status(500).json({ success: false, message: error.message });
   }
 });
