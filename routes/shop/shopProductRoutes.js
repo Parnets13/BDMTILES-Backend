@@ -318,17 +318,28 @@ router.get('/:id', async (req, res) => {
 
 // POST /api/v1/shop/products/search-by-image — visual product search
 // Accepts an uploaded image, generates embedding, finds similar products
-router.post('/search-by-image', upload.single('image'), async (req, res) => {
+router.post('/search-by-image', (req, res, next) => {
+  // Use multer as a callback so we can return proper JSON on upload errors
+  upload.single('image')(req, res, (err) => {
+    if (err) {
+      console.error('[ImageSearch] Upload error:', err.message);
+      return res.status(400).json({ success: false, message: err.message });
+    }
+    next();
+  });
+}, async (req, res) => {
   try {
     // Validate image upload
     if (!req.file) {
+      console.error('[ImageSearch] No file received. Content-Type:', req.headers['content-type']);
+      console.error('[ImageSearch] Body keys:', Object.keys(req.body || {}));
       return res.status(400).json({ 
         success: false, 
-        message: 'No image provided. Please upload an image file.' 
+        message: 'No image provided. Send a multipart/form-data request with field name "image".' 
       });
     }
 
-    console.log('[ImageSearch] Processing image:', req.file.filename);
+    console.log('[ImageSearch] File received:', req.file.originalname, req.file.size, 'bytes', req.file.mimetype);
 
     // Generate embedding from uploaded image
     let queryEmbedding;
