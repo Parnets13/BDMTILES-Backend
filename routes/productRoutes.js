@@ -6,16 +6,28 @@ import StockMovement from '../models/StockMovement.js';
 import Brand from '../models/Brand.js';
 import Category from '../models/Category.js';
 import Subcategory from '../models/Subcategory.js';
-import { protect, requirePermission } from '../middleware/auth.js';
+import { protect, requirePermission, requireAnyPermission } from '../middleware/auth.js';
 import { uploadProductImages } from '../middleware/upload.js';
 import { normalizeProductUomConfig } from '../services/stockUomService.js';
 
 const router = Router();
 router.use(protect);
-router.use(requirePermission('product.master'));
+// Reading the catalogue is allowed for anyone with the blanket grant or any single
+// write grant. Without this, an account given only `products.update` could not
+// reach the routes it is supposed to be able to use.
+router.use(requireAnyPermission('product.master', 'products.create', 'products.update', 'products.delete'));
+
+// `product.master` is an alias for all three write permissions (see
+// config/permissions.js), so existing accounts holding only the blanket grant keep
+// working while a granular-only account is now genuinely limited to its own verbs.
+const canCreateProduct = requirePermission('products.create');
+const canUpdateProduct = requirePermission('products.update');
+const canDeleteProduct = requirePermission('products.delete');
+// Uploading an image happens both when adding a product and when editing one.
+const canUploadProductImage = requireAnyPermission('products.create', 'products.update');
 
 // POST /api/v1/products/upload-images — upload product images
-router.post('/upload-images', (req, res) => {
+router.post('/upload-images', canUploadProductImage, (req, res) => {
   uploadProductImages(req, res, (err) => {
     if (err) {
       console.error('[upload-images] error:', err.message);
@@ -156,7 +168,7 @@ router.get('/:id', async (req, res) => {
 });
 
 // POST /api/v1/products
-router.post('/', async (req, res) => {
+router.post('/', canCreateProduct, async (req, res) => {
   try {
     const productData = { ...req.body, createdBy: req.user._id };
     Object.assign(productData, normalizeProductUomConfig(productData, productData.unit || 'Box'));
@@ -188,7 +200,7 @@ router.post('/', async (req, res) => {
 });
 
 // PUT /api/v1/products/:id
-router.put('/:id', async (req, res) => {
+router.put('/:id', canUpdateProduct, async (req, res) => {
   try {
     const existing = await Product.findById(req.params.id);
     if (!existing) return res.status(404).json({ success: false, message: 'Product not found.' });
@@ -221,7 +233,7 @@ router.put('/:id', async (req, res) => {
 });
 
 // DELETE /api/v1/products/:id
-router.delete('/:id', async (req, res) => {
+router.delete('/:id', canDeleteProduct, async (req, res) => {
   try {
     const { safeDelete } = await import('../middleware/safeDelete.js');
     const result = await safeDelete(Product, req.params.id, {
@@ -237,7 +249,7 @@ router.delete('/:id', async (req, res) => {
 });
 
 // POST /api/v1/products/bulk-price-update — increase/decrease prices in bulk
-router.post('/bulk-price-update', async (req, res) => {
+router.post('/bulk-price-update', canUpdateProduct, async (req, res) => {
   try {
     const { filterBy, filterId, priceField, changeType, changeValue, applyTo } = req.body;
     // filterBy: 'brand' | 'category' | 'subcategory' | 'all'

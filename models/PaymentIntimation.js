@@ -50,11 +50,18 @@ const paymentIntimationSchema = new mongoose.Schema(
     payment: { type: mongoose.Schema.Types.ObjectId, ref: 'Payment' },
 
     submittedVia: { type: String, default: 'dealer_app' },
+
+    // Which of the dealer's own employees submitted this, when signed in as one.
+    // Null for the dealer owner. Dealer-employee collection targets are measured
+    // against this, so it is recorded at submission time, never inferred.
+    createdByEmployee: { type: mongoose.Schema.Types.ObjectId, ref: 'DealerEmployee' },
   },
   { timestamps: true }
 );
 
 paymentIntimationSchema.index({ branch: 1, dealer: 1, status: 1, createdAt: -1 });
 paymentIntimationSchema.index({ dealer: 1, createdAt: -1 });
+// Drives dealer-employee collection achievement.
+paymentIntimationSchema.index({ dealer: 1, createdByEmployee: 1, createdAt: -1 });
 
 export default mongoose.model('PaymentIntimation', paymentIntimationSchema);

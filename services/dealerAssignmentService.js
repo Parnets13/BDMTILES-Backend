@@ -27,6 +27,25 @@ export async function findAssignableExecutive(id, session = null) {
 }
 
 /**
+ * The branch a dealer's activity belongs to, derived from their sales executive.
+ *
+ * A dealer has no branch of its own — the executive's default branch (falling
+ * back to their first assigned branch) is what order requests, stock, schemes and
+ * dealer-employee target rules are posted against. Returns null when the dealer
+ * has no executive yet, which callers must treat as "not linked to a branch"
+ * rather than defaulting to some other branch.
+ *
+ * Single source of truth: this used to live inline in routes/dealerAppRoutes.js,
+ * and target rules need the same answer.
+ */
+export async function resolveDealerBranch(dealer) {
+  const executiveId = dealer?.assignedSalesExecutive?._id || dealer?.assignedSalesExecutive;
+  if (!executiveId) return null;
+  const executive = await User.findById(executiveId).select('defaultBranch assignedBranches').lean();
+  return executive?.defaultBranch || executive?.assignedBranches?.[0] || null;
+}
+
+/**
  * Applies one assignment change and records it. Returns null when nothing moved,
  * so callers can avoid writing a history entry for a no-op save.
  */

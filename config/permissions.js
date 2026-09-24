@@ -16,6 +16,7 @@ export const AVAILABLE_PERMISSIONS = {
     { id: "notification.manage", name: "Notification Settings & Templates" },
     { id: "notification.audit", name: "Notification Delivery Audit" },
     { id: "access.policy.manage", name: "Historical Access Policy Management" },
+    { id: "dealer.app.manage", name: "Dealer Mobile App Access Control" },
   ],
   "Web Management": [
     { id: "webmanagement.manage", name: "Web Management (Storefront CMS)" },
@@ -29,6 +30,12 @@ export const AVAILABLE_PERMISSIONS = {
     { id: "category.setup", name: "Category Setup (Brand/Category/Subcategory)" },
     { id: "dealer.master", name: "Dealer Master" },
     { id: "dealer.assignment.manage", name: "Assign Sales Executives to Dealers" },
+    // Targets a dealer sets for its own employees. Viewing rides along with
+    // dealer.master on the routes so staff who can already see a dealer's
+    // employees are not locked out of the new page; overriding needs the
+    // explicit manage grant.
+    { id: "dealer.employee.targets.view", name: "View Dealer Employee Targets" },
+    { id: "dealer.employee.targets.manage", name: "Set / Override Dealer Employee Targets" },
     { id: "customer.master", name: "Customer Master" },
     { id: "dealer.type", name: "Dealer Type" },
     { id: "dealer.category", name: "Dealer Category" },
@@ -80,7 +87,10 @@ export const AVAILABLE_PERMISSIONS = {
     { id: "payment", name: "Payment Management" },
     { id: "credit.note", name: "Credit Note" },
     { id: "debit.note", name: "Debit Note" },
-    { id: "recycle.bin", name: "Recycle Bin Access" },
+    { id: "recycle.bin", name: "Recycle Bin (All)" },
+    { id: "recycle.bin.view", name: "View Recycle Bin" },
+    { id: "recycle.bin.restore", name: "Restore from Bin" },
+    { id: "recycle.bin.purge", name: "Permanently Delete from Bin" },
   ],
   "Inventory & Warehouse": [
     { id: "stock.view", name: "View Stock" },
@@ -127,6 +137,13 @@ export const AVAILABLE_PERMISSIONS = {
     { id: "leave.management", name: "Leave Management" },
     { id: "salary.management", name: "Salary Management" },
     { id: "employee.registration", name: "Employee Registration" },
+    { id: "job.opening.manage", name: "Job Opening Management" },
+    { id: "candidate.manage", name: "Candidate Recruitment Management" },
+    { id: "candidate.interview", name: "Schedule / Conduct Candidate Interviews" },
+    { id: "candidate.convert", name: "Convert Candidate to Employee" },
+    { id: "hr.template.manage", name: "HR Document Template Management" },
+    { id: "employee.exit", name: "Employee Exit & Full-and-Final Settlement" },
+    { id: "performance.appraisal", name: "Employee Performance Appraisal" },
   ],
   "Reports": [
     { id: "reports.sales", name: "Sales Reports" },
@@ -206,17 +223,19 @@ export const ROLE_DEFAULT_PERMISSIONS = {
   owner: ['*'],        // All access — bypasses permission check in middleware
   admin: [
     'dashboard.view', 'system.management', 'users.manage', 'document.management', 'task.management',
-    'notification.inbox', 'webmanagement.manage', 'wallet.manage',
+    'notification.inbox', 'webmanagement.manage', 'wallet.manage', 'dealer.app.manage',
     'product.master', 'products.create', 'products.update', 'products.delete',
     'category.setup', 'dealer.master', 'dealer.assignment.manage', 'customer.master', 'dealer.type', 'dealer.category',
+    'dealer.employee.targets.view', 'dealer.employee.targets.manage',
     'supplier.master', 'employee.master', 'branch.master', 'warehouse.master', 'vehicle.master',
     'region.master', 'route.master', 'expense.category', 'price.list',
     'lead.management', 'lead.view', 'lead.create', 'lead.update', 'lead.assign', 'lead.app',
     'lead.respond', 'lead.followup', 'lead.convert', 'lead.delete',
-    'followup.management', 'quotation.management', 'complaint.management',
-    'dealer.order_request.review', 'dealer.order_request.approve',
+    'quotation.management',
+    'quotation.dealer', 'quotation.wholesaler', 'quotation.retail', 'quotation.distributor', 'quotation.builder',
     'sales.order.dashboard', 'sales.order.create', 'sales.order.approve',
-    'dealer.discounts', 'po.management', 'po.approve', 'grn.entry', 'grn.approve', 'invoice', 'payment',
+    'sales.order.dealer', 'quotation.wholesaler', 'sales.order.retail', 'sales.order.distributor', 'sales.order.builder',
+    'po.management', 'po.approve', 'grn.entry', 'grn.approve', 'invoice', 'payment',
     'credit.note', 'debit.note', 'recycle.bin', 'dispatch.return',
     'stock.view', 'stock.transfer', 'stock.adjustment',
     'stock.adjustment.create', 'stock.adjustment.submit', 'stock.adjustment.approve', 'stock.adjustment.reverse',
@@ -228,6 +247,8 @@ export const ROLE_DEFAULT_PERMISSIONS = {
     'cheque.management', 'cheque.view', 'cheque.create', 'cheque.deposit', 'cheque.clear', 'cheque.bounce', 'cheque.return',
     'reconciliation', 'expense.management', 'expense.approve',
     'hrms.management', 'attendance.master', 'leave.management', 'salary.management', 'employee.registration',
+    'job.opening.manage', 'candidate.manage', 'candidate.interview', 'candidate.convert', 'hr.template.manage',
+    'employee.exit', 'performance.appraisal',
     'reports.sales', 'reports.purchase', 'reports.inventory', 'reports.finance',
     'reports.profit', 'reports.gst', 'reports.hr', 'activity.logs', 'audit.trail',
     'supplier.scheme', 'dealer.scheme', 'scheme.entry', 'scheme.analysis', 'claim.submission',
@@ -251,14 +272,18 @@ export const ROLE_DEFAULT_PERMISSIONS = {
     'dashboard.view', 'notification.inbox', 'task.management', 'complaint.management', 'product.master', 'dealer.master', 'dealer.assignment.manage', 'dealer.type', 'dealer.category',
     'lead.management', 'lead.view', 'lead.create', 'lead.update', 'lead.assign',
     'lead.followup', 'lead.convert', 'followup.management', 'quotation.management',
+    // Sales managers see what dealers have set their staff, but do not override
+    // it — that stays with admin/owner.
+    'dealer.employee.targets.view',
+    'quotation.dealer', 'quotation.wholesaler', 'quotation.retail', 'quotation.distributor', 'quotation.builder',
     'sales.order.dashboard', 'sales.order.create', 'sales.order.approve',
     'sales.order.dealer', 'sales.order.wholesaler', 'sales.order.retail',
     'sales.order.distributor', 'sales.order.builder',
-    'quotation.dealer', 'quotation.wholesaler', 'quotation.retail',
     'dealer.discounts', 'invoice', 'payment', 'credit.note', 'dispatch.return',
     'reports.sales', 'reports.profit',
     'sales.executive.app', 'dealer.order.requests',
     'dealer.order_request.review', 'dealer.order_request.approve',
+    'dealer.scheme', 'scheme.entry', 'scheme.analysis', 'claim.submission',
   ],
   purchase_manager: [
     'dashboard.view', 'notification.inbox', 'task.management', 'product.master', 'products.create', 'products.update',
@@ -293,6 +318,8 @@ export const ROLE_DEFAULT_PERMISSIONS = {
     'dashboard.view', 'notification.inbox', 'task.management', 'hrms.management',
     'attendance.master', 'leave.management', 'salary.management',
     'employee.registration', 'employee.master',
+    'job.opening.manage', 'candidate.manage', 'candidate.interview', 'candidate.convert', 'hr.template.manage',
+    'employee.exit', 'performance.appraisal',
     'expense.management', 'expense.approve',
     'reports.hr',
   ],
@@ -301,7 +328,9 @@ export const ROLE_DEFAULT_PERMISSIONS = {
     'lead.app', 'lead.view', 'lead.create', 'lead.respond', 'lead.followup', 'followup.management',
     'incentive.earnings.self',
     'sales.order.create', 'sales.order.dashboard',
+    'sales.order.dealer', 'sales.order.wholesaler', 'sales.order.retail', 'sales.order.distributor', 'sales.order.builder',
     'quotation.management',
+    'quotation.dealer', 'quotation.wholesaler', 'quotation.retail', 'quotation.distributor', 'quotation.builder',
     'sales.executive.app', 'se.attendance.view', 'se.route.plan', 'se.dealer.insights',
     'se.collections.view', 'se.targets.view', 'dealer.order_request.create',
   ],
@@ -350,10 +379,131 @@ export const ROLE_INFO = {
 };
 
 /**
+ * Aggregate permissions that stand in for a set of granular ones.
+ *
+ * Holding the aggregate satisfies a check for any of its children. This is what
+ * makes it safe to start enforcing a granular permission on a route that used to
+ * accept only the aggregate: every account that works today keeps working, because
+ * `ROLE_DEFAULT_PERMISSIONS` is only consulted for accounts in `role_default` mode
+ * and most accounts store an explicit permission array that will never gain the
+ * new id on its own.
+ *
+ * Resolution is one-directional: the aggregate implies the children, never the
+ * reverse. So a route that still demands the aggregate will reject an account that
+ * holds only a child — which is why route-level gates also have to accept the
+ * children explicitly (see requireAnyPermission use in productRoutes/quotationRoutes).
+ *
+ * This is the single source of truth. middleware/auth.js imports it, and it is
+ * served to the frontend through GET /users/permissions-config.
+ */
+export const PERMISSION_ALIASES = {
+  'lead.management': ['lead.view', 'lead.create', 'lead.update', 'lead.assign', 'lead.app', 'lead.respond', 'lead.followup', 'lead.convert', 'lead.delete'],
+  'cheque.management': ['cheque.view', 'cheque.create', 'cheque.deposit', 'cheque.clear', 'cheque.bounce', 'cheque.return'],
+  'delivery.management': ['delivery.view', 'delivery.execute', 'delivery.verify', 'delivery.complete', 'delivery.fail'],
+
+  // Product write access used to be one blanket grant; the granular ids existed but
+  // enforced nothing. Note the module prefix differs (`product.master` vs
+  // `products.create`), so the `product.*` wildcard does NOT cover these.
+  'product.master': ['products.create', 'products.update', 'products.delete'],
+
+  // Follow-ups are recorded through lead routes, which gate on `lead.followup`.
+  'followup.management': ['lead.followup'],
+
+  // A duplicate of employee.registration in everything but name.
+  'employee.master': ['employee.registration'],
+
+  // Scheme aggregates. Each also restricts *which party's* schemes you may manage —
+  // see the per-path gates in routes/schemeRoutes.js.
+  'supplier.scheme': ['scheme.entry', 'scheme.analysis', 'claim.submission'],
+  'dealer.scheme': ['scheme.entry', 'scheme.analysis', 'claim.submission'],
+
+  // Customer-type scoping for quotations and orders. Holding the aggregate lets you
+  // transact every type; holding only a granular one limits you to that type.
+  'quotation.management': ['quotation.dealer', 'quotation.wholesaler', 'quotation.retail', 'quotation.distributor', 'quotation.builder'],
+  'sales.order.create': ['sales.order.dealer', 'sales.order.wholesaler', 'sales.order.retail', 'sales.order.distributor', 'sales.order.builder'],
+
+  // Deliberately maps to `create` only. The `dealer` role holds this aggregate, and
+  // expanding it to review/approve would let dealers approve their own requests.
+  'dealer.order.requests': ['dealer.order_request.create'],
+
+  // Recycle-bin aggregates. The bin previously required users.manage, which is
+  // control over the user directory. Now grantable separately.
+  'recycle.bin': ['recycle.bin.view', 'recycle.bin.restore', 'recycle.bin.purge'],
+};
+
+/** Customer-type scoping for quotations and sales orders. */
+export const CUSTOMER_TYPES = ['dealer', 'wholesaler', 'retail', 'distributor', 'builder'];
+
+export const QUOTATION_TYPE_PERMISSIONS = CUSTOMER_TYPES.map((type) => `quotation.${type}`);
+export const SALES_ORDER_TYPE_PERMISSIONS = CUSTOMER_TYPES.map((type) => `sales.order.${type}`);
+
+/**
+ * DealerType has no stable code field — `name` is free text an admin can rename —
+ * so the only reliable discriminator is the `pricingTier` enum.
+ */
+export const PRICING_TIER_TO_CUSTOMER_TYPE = {
+  dealerRate: 'dealer',
+  wholesaleRate: 'wholesaler',
+  retailRate: 'retail',
+  distributorRate: 'distributor',
+  builderRate: 'builder',
+  // projectRate has no customerType counterpart on Quotation, so it stays unmapped
+  // and falls through to the aggregate check rather than being denied.
+};
+
+/**
+ * Permissions that grant approval authority, move money, or administer the system.
+ * Granting one of these does not just reveal a screen — it lets the holder sign off
+ * on their own work or change who else can do anything. The UI warns before
+ * granting them; nothing here changes how they are enforced.
+ */
+export const SENSITIVE_PERMISSIONS = {
+  // Administrative control
+  'system.management': 'Can change system-level settings.',
+  'users.manage': 'Can create users and change anyone\'s permissions, including their own team\'s.',
+  'access.policy.manage': 'Can change how far back other users may see historical data.',
+  'notification.manage': 'Can change who is notified about what.',
+  'dealer.app.manage': 'Can grant or revoke Dealer App sign-in for any dealer.',
+  'recycle.bin': 'Can permanently destroy deleted records.',
+
+  // Approval authority — the holder can sign off on work
+  'sales.order.approve': 'Can approve sales orders, including below-minimum prices.',
+  'po.approve': 'Can approve purchase orders.',
+  'grn.approve': 'Can approve goods receipts.',
+  'stock.adjustment.approve': 'Can approve stock adjustments, which change recorded quantities.',
+  'stock.adjustment.reverse': 'Can reverse posted stock adjustments.',
+  'stock.audit.approve': 'Can approve physical stock audits.',
+  'stock.audit.reverse': 'Can reverse posted physical audits.',
+  'expense.approve': 'Can approve expense claims.',
+  'incentive.earnings.approve': 'Can approve incentive payouts.',
+  'incentive.earnings.pay': 'Can mark incentive payouts as paid.',
+  'dealer.order_request.approve': 'Can approve dealer order requests.',
+  'dealer.employee.targets.manage': 'Can set or override the targets a dealer gives its own employees.',
+
+  // Money and pricing
+  'finance.management': 'Full access to ledgers, payments and financial records.',
+  'dealer.discounts': 'Can set dealer-specific prices and discounts.',
+  'credit.note': 'Can issue credit notes, which reduce what a dealer owes.',
+  'debit.note': 'Can issue debit notes.',
+  'reconciliation': 'Can reconcile bank and ledger balances.',
+  'wallet.manage': 'Can adjust customer wallet balances.',
+
+  // People and pay
+  'salary.management': 'Can see and change salary figures.',
+  'employee.exit': 'Can terminate employees and settle final dues.',
+  'performance.appraisal': 'Can record performance ratings that affect increments.',
+
+  // Deletion
+  'products.delete': 'Can delete products.',
+  'lead.delete': 'Can delete leads.',
+};
+
+/**
  * Get permissions config for frontend (User Management UI)
  */
 export const getPermissionsConfig = () => ({
   permissions: AVAILABLE_PERMISSIONS,
   rolePermissions: ROLE_DEFAULT_PERMISSIONS,
   roleInfo: ROLE_INFO,
+  sensitivePermissions: SENSITIVE_PERMISSIONS,
 });

@@ -31,12 +31,19 @@ const incentiveSchema = new mongoose.Schema(
     // Who is this for
     applicableTo: {
       type: String,
-      enum: ['sales_executive', 'dealer', 'delivery_executive', 'team'],
+      // 'dealer_employee' rules belong to a dealer, not to BDMTILES: the dealer
+      // authors them for its own staff and only that dealer can read them. They
+      // are scoped by `dealer` below, never by branch alone.
+      enum: ['sales_executive', 'dealer', 'delivery_executive', 'team', 'dealer_employee'],
       required: true,
     },
     // Specific users/dealers (empty = all)
     specificUsers: [{ type: mongoose.Schema.Types.ObjectId, ref: 'User' }],
     specificDealers: [{ type: mongoose.Schema.Types.ObjectId, ref: 'Dealer' }],
+    // Dealer-employee rules: which dealer owns the rule, and who it applies to.
+    // An empty specificDealerEmployees means "every employee of this dealer".
+    dealer: { type: mongoose.Schema.Types.ObjectId, ref: 'Dealer' },
+    specificDealerEmployees: [{ type: mongoose.Schema.Types.ObjectId, ref: 'DealerEmployee' }],
 
     // Incentive type
     incentiveType: {
@@ -81,10 +88,16 @@ const incentiveSchema = new mongoose.Schema(
     bonusOnTarget: { type: Number, default: 0 }, // bonus amount when target met
     // Which metric targetValue is measured in (SOW 18.7). Absent on rules created
     // before this field existed — those are read as 'sales'. See targetService.js.
+    // 'product' and 'category' are dealer-employee only: they measure quantity
+    // sold of specific products/categories, because a dealer order request
+    // carries no prices (see services/dealerTargetService.js).
     targetMetric: {
       type: String,
-      enum: ['sales', 'orders', 'visits', 'collections'],
+      enum: ['sales', 'orders', 'visits', 'collections', 'product', 'category'],
     },
+    // Scope for the 'product' / 'category' metrics.
+    scopeProducts: [{ type: mongoose.Schema.Types.ObjectId, ref: 'Product' }],
+    scopeCategories: [{ type: mongoose.Schema.Types.ObjectId, ref: 'Category' }],
 
     // For 'slab':
     slabs: [slabSchema],
@@ -119,6 +132,9 @@ const incentiveSchema = new mongoose.Schema(
 incentiveSchema.index({ branch: 1, incentiveCode: 1 }, { unique: true });
 incentiveSchema.index({ applicableTo: 1, status: 1 });
 incentiveSchema.index({ triggerEvent: 1, status: 1 });
+// Dealer-employee rules are read by dealer on every "my target" and team-target
+// request, so they get their own compound index.
+incentiveSchema.index({ dealer: 1, applicableTo: 1, status: 1 });
 
 /**
  * Calculate incentive amount for a given value/qty

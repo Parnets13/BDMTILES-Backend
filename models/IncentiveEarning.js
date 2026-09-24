@@ -18,6 +18,11 @@ const incentiveEarningSchema = new mongoose.Schema(
     earnedByRole: String,
     dealer: { type: mongoose.Schema.Types.ObjectId, ref: 'Dealer' },
     dealerName: String,
+    // Set when the earner is one of the dealer's own employees rather than a
+    // BDMTILES user. `earnedBy` stays empty in that case — the two identities are
+    // deliberately separate, so a dealer employee can never be confused with staff.
+    dealerEmployee: { type: mongoose.Schema.Types.ObjectId, ref: 'DealerEmployee' },
+    dealerEmployeeName: String,
 
     // What triggered it
     triggerEvent: String,
@@ -55,5 +60,7 @@ incentiveEarningSchema.index({ incentive: 1 });
 incentiveEarningSchema.index({ idempotencyKey: 1 }, { unique: true, sparse: true });
 incentiveEarningSchema.index({ branch: 1, referenceModel: 1, referenceId: 1 });
 incentiveEarningSchema.index({ triggerEvent: 1, createdAt: -1 });
+// "My incentive history" for a dealer employee.
+incentiveEarningSchema.index({ dealerEmployee: 1, createdAt: -1 });
 
 export default mongoose.model('IncentiveEarning', incentiveEarningSchema);

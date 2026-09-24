@@ -14,7 +14,12 @@ import {
   getAssignedBranchIds,
   hasGlobalBranchAccess,
 } from '../utils/branchScope.js';
-import { AVAILABLE_PERMISSIONS, ROLE_DEFAULT_PERMISSIONS, ROLE_INFO } from '../config/permissions.js';
+import {
+  AVAILABLE_PERMISSIONS,
+  ROLE_DEFAULT_PERMISSIONS,
+  ROLE_INFO,
+  SENSITIVE_PERMISSIONS,
+} from '../config/permissions.js';
 import { validateStrongPassword } from '../utils/authSecurity.js';
 import { canonicalPhone } from '../utils/phone.js';
 import { dealersHeldBy, reassignAllDealers } from '../services/dealerAssignmentService.js';
@@ -518,6 +523,9 @@ router.get('/permissions-config', (req, res) => {
     permissions: AVAILABLE_PERMISSIONS,
     rolePermissions: ROLE_DEFAULT_PERMISSIONS,
     roleInfo: ROLE_INFO,
+    // Flags the grants that carry approval authority or administrative control, so
+    // the editor can warn before one is handed to a junior account.
+    sensitivePermissions: SENSITIVE_PERMISSIONS,
   });
 });
 
@@ -699,6 +707,9 @@ router.put('/:id', async (req, res) => {
     const user = await User.findById(req.params.id).select('+refreshSessions');
     if (!user) return res.status(404).json({ success: false, message: 'User not found.' });
     assertCanManageTarget(req.user, user);
+    // Captured before any mutation so a role or permission change on this edit can
+    // be audited with a real diff rather than a generic "User updated." line.
+    const permissionsBefore = permissionSnapshot(user);
 
     const normalizedPhone = hasOwn(req.body, 'phone')
       ? await assertPhoneAvailable(req.body.phone, user._id)
@@ -755,6 +766,15 @@ router.put('/:id', async (req, res) => {
     await user.save();
 
     const responseUser = await getPopulatedUser(user._id, req.user);
+    await logPermissionChange({
+      req,
+      res,
+      target: user,
+      before: permissionsBefore,
+      description: permissionsBefore.role !== user.role
+        ? `Role changed for ${user.name}: ${permissionsBefore.role} → ${user.role}`
+        : `Permissions changed for ${user.name}`,
+    });
     if (isReactivation) {
       res.locals.skipAutoActivityLog = true;
       await logActivity({
@@ -985,9 +1005,11 @@ router.put('/:id/permissions/reset', async (req, res) => {
     const target = await User.findById(req.params.id);
     if (!target) return res.status(404).json({ success: false, message: 'User not found.' });
     assertCanManageTarget(req.user, target);
+    const before = permissionSnapshot(target);
     target.permissionMode = 'role_default';
     target.permissions = validatePermissionGrant(req.user, roleDefaultPermissions(target.role));
     await target.save();
+    await logPermissionChange({ req, res, target, before, description: `Reset ${target.name} to ${target.role} role defaults` });
     return res.json({
       success: true,
       message: 'Permissions reset to role defaults.',
@@ -1003,13 +1025,288 @@ router.put('/:id/permissions', async (req, res) => {
     const target = await User.findById(req.params.id);
     if (!target) return res.status(404).json({ success: false, message: 'User not found.' });
     assertCanManageTarget(req.user, target);
+    const before = permissionSnapshot(target);
     target.permissionMode = 'custom';
     target.permissions = validatePermissionGrant(req.user, req.body.permissions);
     await target.save();
+    await logPermissionChange({ req, res, target, before, description: `Custom permissions set for ${target.name}` });
     return res.json({
       success: true,
       message: 'Custom permissions updated.',
       user: await getPopulatedUser(target._id, req.user),
+    });
+  } catch (error) {
+    return res.status(error.status || 500).json({ success: false, message: error.message });
+  }
+});
+
+// ═══════════════════════════════════════
+// ROLE & PERMISSION INSIGHT
+// ═══════════════════════════════════════
+// Read-only analysis over the permission model. Roles are code constants, so none
+// of this edits a role — it explains what the constants currently mean and where
+// live accounts diverge from them.
+
+/**
+ * The permissions a stored user document actually resolves to.
+ *
+ * This has to mirror middleware/auth.js exactly or the answers here would be
+ * wrong in the one direction that matters: understating who can do something.
+ * `role_default` users do not store their permissions at all — they are recomputed
+ * per request — so querying `permissions: X` in Mongo silently misses them.
+ */
+const effectiveUserPermissions = (user) => (user.permissionMode === 'role_default'
+  ? [...(ROLE_DEFAULT_PERMISSIONS[user.role] || [])]
+  : [...(user.permissions || [])]);
+
+// Reuses the canonical check so the super_admin/owner bypass, the '*' wildcard and
+// the legacy aliases are all honoured identically.
+const userDocHoldsPermission = (user, permission) => userHasPermission(
+  { role: user.role, permissions: effectiveUserPermissions(user) },
+  permission
+);
+
+const permissionSnapshot = (user) => ({
+  role: user.role,
+  permissionMode: user.permissionMode,
+  permissions: [...(user.permissions || [])].sort(),
+});
+
+/**
+ * Write an explicit before/after diff. The generic auto-logger records permission
+ * changes with a null recordId and an empty `changes` array, so there was no way
+ * to tell who was modified or what was granted.
+ */
+const logPermissionChange = async ({ req, res, target, before, description }) => {
+  const after = permissionSnapshot(target);
+  const beforeSet = new Set(before.permissions);
+  const afterSet = new Set(after.permissions);
+  const granted = after.permissions.filter((permission) => !beforeSet.has(permission));
+  const revoked = before.permissions.filter((permission) => !afterSet.has(permission));
+
+  const changes = [];
+  if (before.permissionMode !== after.permissionMode) {
+    changes.push({ field: 'permissionMode', oldValue: before.permissionMode, newValue: after.permissionMode });
+  }
+  if (before.role !== after.role) {
+    changes.push({ field: 'role', oldValue: before.role, newValue: after.role });
+  }
+  if (granted.length) changes.push({ field: 'permissions.granted', oldValue: [], newValue: granted });
+  if (revoked.length) changes.push({ field: 'permissions.revoked', oldValue: revoked, newValue: [] });
+
+  // Nothing moved — do not pad the audit trail with no-ops.
+  if (!changes.length) return;
+
+  // Suppress the generic auto-logged entry; it records a null recordId and an
+  // empty changes array, so it would only add noise next to this one.
+  if (res) res.locals.skipAutoActivityLog = true;
+  await logActivity({
+    user: req.user,
+    action: 'update',
+    module: 'user',
+    recordId: target._id,
+    recordTitle: target.name,
+    recordModel: 'User',
+    description,
+    changes,
+    metadata: {
+      grantedCount: granted.length,
+      revokedCount: revoked.length,
+      effectiveCount: after.permissions.includes('*') ? 'all' : after.permissions.length,
+    },
+    branch: req.branchId,
+    req,
+  });
+};
+
+// Role catalogue: what every role grants, grouped the same way the UI shows it,
+// with live account counts so an empty role is visibly unused.
+router.get('/roles', async (req, res) => {
+  try {
+    const counts = await User.aggregate([
+      { $group: { _id: { role: '$role', mode: '$permissionMode' }, count: { $sum: 1 } } },
+    ]);
+    const byRole = new Map();
+    for (const row of counts) {
+      const entry = byRole.get(row._id.role) || { total: 0, roleDefault: 0, custom: 0 };
+      entry.total += row.count;
+      if (row._id.mode === 'role_default') entry.roleDefault += row.count;
+      else entry.custom += row.count;
+      byRole.set(row._id.role, entry);
+    }
+
+    const catalogue = Object.entries(AVAILABLE_PERMISSIONS);
+    const totalPermissions = catalogue.reduce((sum, [, list]) => sum + list.length, 0);
+
+    const roles = Object.entries(ROLE_INFO).map(([key, info]) => {
+      const granted = ROLE_DEFAULT_PERMISSIONS[key] || [];
+      const unrestricted = granted.includes('*');
+      const grantedSet = new Set(granted);
+      const groups = catalogue.map(([category, permissions]) => {
+        const held = permissions.filter((permission) => unrestricted || grantedSet.has(permission.id));
+        return {
+          category,
+          total: permissions.length,
+          granted: held.length,
+          permissions: permissions.map((permission) => ({
+            ...permission,
+            granted: unrestricted || grantedSet.has(permission.id),
+          })),
+        };
+      });
+      const accounts = byRole.get(key) || { total: 0, roleDefault: 0, custom: 0 };
+      return {
+        key,
+        ...info,
+        unrestricted,
+        // De-duplicated: a couple of the presets list the same id twice, so the raw
+        // array length is not a permission count.
+        grantedCount: unrestricted ? totalPermissions : new Set(granted).size,
+        totalPermissions,
+        groups,
+        accounts,
+        // A role whose members are all 'custom' is a role whose definition is
+        // decorative — editing the preset would change nothing for anyone.
+        presetIsLive: accounts.roleDefault > 0,
+      };
+    }).sort((a, b) => b.rank - a.rank);
+
+    return res.json({ success: true, data: { roles, totalPermissions } });
+  } catch (error) {
+    return res.status(error.status || 500).json({ success: false, message: error.message });
+  }
+});
+
+// Who actually holds a given permission, resolved rather than queried.
+router.get('/permission-holders/:permissionId', async (req, res) => {
+  try {
+    const permissionId = String(req.params.permissionId || '');
+    if (permissionId !== '*' && !KNOWN_PERMISSIONS.has(permissionId)) {
+      throw httpError(404, 'Unknown permission id.');
+    }
+
+    const filter = hasGlobalBranchAccess(req.user)
+      ? {}
+      : {
+        role: { $nin: [...GLOBAL_BRANCH_ROLES] },
+        assignedBranches: { $in: getAssignedBranchIds(req.user).map((id) => new mongoose.Types.ObjectId(id)) },
+      };
+
+    const users = await User.find(filter)
+      .select('name username email role status permissionMode permissions assignedBranches')
+      .populate('assignedBranches', 'branchCode name')
+      .lean();
+
+    const holders = users
+      .filter((user) => userDocHoldsPermission(user, permissionId))
+      .map((user) => {
+        const viaWildcard = ['super_admin', 'owner'].includes(user.role)
+          || (user.permissionMode !== 'role_default' && (user.permissions || []).includes('*'));
+        const roleDefaults = ROLE_DEFAULT_PERMISSIONS[user.role] || [];
+        return {
+          _id: user._id,
+          name: user.name,
+          username: user.username,
+          email: user.email,
+          role: user.role,
+          roleName: ROLE_INFO[user.role]?.name || user.role,
+          status: user.status,
+          permissionMode: user.permissionMode,
+          branches: (user.assignedBranches || []).map((branch) => branch.branchCode).filter(Boolean),
+          // How they got it matters: a grant that comes from the role preset is
+          // fixed by editing the role, a custom one has to be fixed per user.
+          source: viaWildcard
+            ? 'unrestricted'
+            : user.permissionMode === 'role_default'
+              ? 'role_default'
+              : roleDefaults.includes(permissionId) ? 'custom_matching_role' : 'custom_extra',
+        };
+      })
+      .sort((a, b) => a.name.localeCompare(b.name));
+
+    const permissionName = Object.values(AVAILABLE_PERMISSIONS).flat()
+      .find((permission) => permission.id === permissionId)?.name
+      || (permissionId === '*' ? 'Unrestricted access' : permissionId);
+
+    return res.json({
+      success: true,
+      data: {
+        permission: { id: permissionId, name: permissionName },
+        holders,
+        counts: {
+          total: holders.length,
+          active: holders.filter((holder) => holder.status === 'Active').length,
+          viaRoleDefault: holders.filter((holder) => holder.source === 'role_default').length,
+          viaCustom: holders.filter((holder) => holder.source.startsWith('custom')).length,
+          viaUnrestricted: holders.filter((holder) => holder.source === 'unrestricted').length,
+        },
+        scopeNote: hasGlobalBranchAccess(req.user)
+          ? 'All accounts were checked.'
+          : 'Only accounts inside your assigned branches were checked, so this is not a system-wide answer.',
+      },
+    });
+  } catch (error) {
+    return res.status(error.status || 500).json({ success: false, message: error.message });
+  }
+});
+
+// Accounts whose custom permission set diverges from their role's preset.
+// This is the blind spot in the whole model: editing a role preset has no effect
+// on a 'custom' user, and every employee-provisioned account is custom.
+router.get('/permission-drift', async (req, res) => {
+  try {
+    const filter = hasGlobalBranchAccess(req.user)
+      ? { permissionMode: 'custom' }
+      : {
+        permissionMode: 'custom',
+        role: { $nin: [...GLOBAL_BRANCH_ROLES] },
+        assignedBranches: { $in: getAssignedBranchIds(req.user).map((id) => new mongoose.Types.ObjectId(id)) },
+      };
+
+    const users = await User.find(filter)
+      .select('name username role status permissions assignedBranches updatedAt')
+      .populate('assignedBranches', 'branchCode')
+      .lean();
+
+    const rows = users.map((user) => {
+      const held = new Set(user.permissions || []);
+      const preset = ROLE_DEFAULT_PERMISSIONS[user.role] || [];
+      const presetSet = new Set(preset);
+      const unrestricted = held.has('*') || ['super_admin', 'owner'].includes(user.role);
+      const extra = unrestricted ? [] : [...held].filter((permission) => !presetSet.has(permission));
+      const missing = unrestricted ? [] : [...presetSet].filter((permission) => !held.has(permission));
+      return {
+        _id: user._id,
+        name: user.name,
+        username: user.username,
+        role: user.role,
+        roleName: ROLE_INFO[user.role]?.name || user.role,
+        status: user.status,
+        branches: (user.assignedBranches || []).map((branch) => branch.branchCode).filter(Boolean),
+        unrestricted,
+        heldCount: unrestricted ? 'all' : held.size,
+        presetCount: new Set(preset).size,
+        extra,
+        missing,
+        driftScore: extra.length + missing.length,
+        updatedAt: user.updatedAt,
+      };
+    }).filter((row) => row.unrestricted || row.driftScore > 0)
+      .sort((a, b) => b.driftScore - a.driftScore);
+
+    const totalCustom = users.length;
+    return res.json({
+      success: true,
+      data: {
+        rows,
+        summary: {
+          customAccounts: totalCustom,
+          driftingAccounts: rows.filter((row) => row.driftScore > 0).length,
+          withExtraGrants: rows.filter((row) => row.extra.length > 0).length,
+          missingRoleDefaults: rows.filter((row) => row.missing.length > 0).length,
+        },
+        note: 'Accounts on custom permissions ignore their role preset entirely. Editing a role definition will not change anything for these users. Employee-provisioned accounts are always custom.',
+      },
     });
   } catch (error) {
     return res.status(error.status || 500).json({ success: false, message: error.message });

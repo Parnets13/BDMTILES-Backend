@@ -12,11 +12,17 @@ const webUploadDirectory = path.join(uploadRoot, 'web');
 const webVideoDirectory = path.join(uploadRoot, 'web-videos');
 export const legacySupplierCreditNoteDirectory = path.join(uploadRoot, 'supplier-credit-notes');
 export const supplierCreditNoteDirectory = path.join(privateUploadRoot, 'supplier-credit-notes');
+// Candidate resumes are personal/sensitive — private-uploads, never statically served.
+export const candidateResumeDirectory = path.join(privateUploadRoot, 'candidate-resumes');
+// Generated HR documents (offer letters, appointment letters, NDAs) — same reasoning.
+export const hrGeneratedDocumentDirectory = path.join(privateUploadRoot, 'hr-documents');
 fs.mkdirSync(productUploadDirectory, { recursive: true });
 fs.mkdirSync(complaintUploadDirectory, { recursive: true });
 fs.mkdirSync(webUploadDirectory, { recursive: true });
 fs.mkdirSync(webVideoDirectory, { recursive: true });
 fs.mkdirSync(supplierCreditNoteDirectory, { recursive: true });
+fs.mkdirSync(candidateResumeDirectory, { recursive: true });
+fs.mkdirSync(hrGeneratedDocumentDirectory, { recursive: true });
 
 const storageFor = (directory) => multer.diskStorage({
   destination: (_req, _file, cb) => cb(null, directory),
@@ -105,3 +111,17 @@ export const uploadSupplierCreditNote = multer({
   fileFilter: creditNoteFileFilter,
   limits: { fileSize: 8 * 1024 * 1024 },
 }).single('document');
+
+const resumeFileFilter = (_req, file, cb) => {
+  const allowed = ['application/pdf', 'application/msword', 'application/vnd.openxmlformats-officedocument.wordprocessingml.document', 'image/jpeg', 'image/png'];
+  const allowedExts = ['.pdf', '.doc', '.docx', '.jpg', '.jpeg', '.png'];
+  const ext = path.extname(file.originalname).toLowerCase();
+  if (allowed.includes(file.mimetype) || allowedExts.includes(ext)) cb(null, true);
+  else cb(new Error('Resume must be PDF, DOC, DOCX, JPG, or PNG.'), false);
+};
+
+export const uploadCandidateResume = multer({
+  storage: storageFor(candidateResumeDirectory),
+  fileFilter: resumeFileFilter,
+  limits: { fileSize: 10 * 1024 * 1024 }, // 10MB
+}).single('resume');

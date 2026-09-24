@@ -31,6 +31,24 @@ export const generateDealerToken = (dealerId, tokenVersion = 0) => jwt.sign(
 );
 
 /**
+ * Dealer App token for a dealer's own employee.
+ *
+ * Carries BOTH the employee id and the owning dealer id. The dealer id is what
+ * every query is scoped by, so it is taken from the token rather than trusted
+ * from the request body — an employee can never reach another dealer's data by
+ * passing a different dealer id. `type` and `role` are distinct from the dealer
+ * token so an employee token can never be mistaken for the owner's.
+ *
+ * tokenVersion is the employee's own, so resetting one employee's access does not
+ * sign the dealer or their colleagues out.
+ */
+export const generateDealerEmployeeToken = (employeeId, dealerId, tokenVersion = 0) => jwt.sign(
+  { dealerEmployeeId: employeeId, dealerId, role: 'dealer_employee', type: 'dealer_employee_access', tokenVersion },
+  process.env.JWT_SECRET,
+  { expiresIn: process.env.DEALER_TOKEN_EXPIRY || '30d' }
+);
+
+/**
  * Short-lived, single-document download token.
  *
  * PDF links are opened by the device's browser / viewer, which cannot send an

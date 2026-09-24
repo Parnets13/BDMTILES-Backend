@@ -17,6 +17,7 @@ router.use(protect);
 router.use(requireBranch);
 
 router.get(['/', '/stats', '/:id'], requireAnyPermission('picking.management', 'sorting.management', 'dispatch.management'));
+router.get('/generatable-orders', requireAnyPermission('sales.order.approve', 'picking.management'));
 router.get('/assignable-staff', requireAnyPermission('picking.management', 'sorting.management', 'dispatch.management'));
 router.get('/delivery-executives', requireAnyPermission('dispatch.management', 'dispatch.verify'));
 router.get('/available-vehicles', requireAnyPermission('dispatch.management', 'dispatch.verify'));
@@ -95,6 +96,73 @@ router.post('/reserve-backorder/:soId', requireAnyPermission('sales.order.approv
   } catch (error) {
     return res.status(error.status || (['CastError', 'ValidationError'].includes(error.name) ? 422 : 500)).json({ success: false, message: error.message });
   } finally { await session.endSession(); }
+});
+
+// Sales Orders that a pick list can actually be generated from — mirrors the
+// eligibility rules enforced inside POST /generate/:soId (branch, status,
+// reservation state, and unallocated reserved quantity remaining) so the dropdown
+// that feeds that action can never offer an order that would just fail at submit
+// time. Scoped to the single active branch (req.branchId), not a user's whole
+// authorized-branch set, because a pick list is always generated against the
+// branch currently in context.
+router.get('/generatable-orders', async (req, res) => {
+  try {
+    const search = String(req.query.search || '').trim();
+    const limit = Math.min(50, Math.max(1, parseInt(req.query.limit) || 20));
+    const filter = {
+      branch: req.branchId,
+      status: { $in: ['confirmed', 'approved', 'processing', 'partial_dispatch'] },
+      reservationStatus: { $in: ['reserved', 'partial'] },
+    };
+    if (search) {
+      const regex = new RegExp(search.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'i');
+      filter.$or = [{ orderNumber: regex }, { dealerName: regex }, { customerName: regex }];
+    }
+
+    const candidates = await SalesOrder.find(filter)
+      .select('orderNumber dealerName dealerCode customerName status orderDate grandTotal items')
+      .sort({ orderDate: -1 })
+      .limit(200)
+      .lean();
+
+    // Reservation state alone isn't enough: an order can still show 'partial' or
+    // 'reserved' after every reserved unit has already been allocated to an
+    // earlier pick list. Only offer it if some line still has unallocated
+    // reserved quantity left to pick.
+    const eligible = candidates
+      .map(order => ({
+        order,
+        pickableItems: (order.items || []).filter(
+          line => Number(line.reservedQuantity || 0) - Number(line.allocatedQuantity || 0) > QUANTITY_TOLERANCE
+        ),
+      }))
+      .filter(({ pickableItems }) => pickableItems.length > 0)
+      .slice(0, limit);
+
+    res.json({
+      success: true,
+      data: eligible.map(({ order, pickableItems }) => ({
+        _id: order._id,
+        orderNumber: order.orderNumber,
+        dealerName: order.dealerName || order.customerName || '',
+        dealerCode: order.dealerCode || '',
+        status: order.status,
+        orderDate: order.orderDate,
+        grandTotal: order.grandTotal || 0,
+        itemCount: pickableItems.length,
+        // Only the still-pickable lines, with the unallocated-reserved qty
+        // precomputed, so the frontend can show exactly what a pick list from
+        // this order will contain without re-deriving the eligibility math.
+        items: pickableItems.map(line => ({
+          productName: line.productName || '',
+          productCode: line.productCode || '',
+          unit: line.unit || line.baseUnit || '',
+          quantity: Number(line.quantity || 0),
+          pendingQuantity: Number(line.reservedQuantity || 0) - Number(line.allocatedQuantity || 0),
+        })),
+      })),
+    });
+  } catch (e) { res.status(500).json({ success: false, message: e.message }); }
 });
 
 router.post('/generate/:soId', async (req, res) => {

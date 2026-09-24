@@ -92,6 +92,100 @@ router.get('/filter-options', async (req, res) => {
   } catch (error) { return handleError(res, error); }
 });
 
+/**
+ * Shade and batch registry.
+ *
+ * Stock is keyed on branch + product + warehouse + shade + batch, but shade and
+ * batch are free-text strings with no master list — they enter the system through
+ * GRN and propagate by copy. A trailing space or a case difference therefore
+ * creates a second, invisible stock bucket for what is physically the same
+ * material, and nothing in the system points that out.
+ *
+ * This reports the vocabulary that is actually in use, and flags values that look
+ * like variants of each other. It deliberately does not enforce anything: rejecting
+ * an unrecognised shade mid-receipt would block legitimate new stock.
+ */
+const normalizeKey = (value) => String(value || '').trim().toLowerCase().replace(/[\s_-]+/g, '');
+
+const buildVariantGroups = (entries) => {
+  const groups = new Map();
+  for (const entry of entries) {
+    const key = normalizeKey(entry.value);
+    if (!key) continue;
+    const bucket = groups.get(key) || [];
+    bucket.push(entry);
+    groups.set(key, bucket);
+  }
+  // Only groups with more than one spelling are worth showing.
+  return [...groups.values()]
+    .filter((bucket) => bucket.length > 1)
+    .map((bucket) => ({
+      normalized: normalizeKey(bucket[0].value),
+      variants: bucket.sort((a, b) => b.stockRows - a.stockRows),
+      totalRows: bucket.reduce((sum, entry) => sum + entry.stockRows, 0),
+      totalQty: Math.round(bucket.reduce((sum, entry) => sum + entry.totalQty, 0) * 100) / 100,
+    }))
+    .sort((a, b) => b.variants.length - a.variants.length || b.totalRows - a.totalRows);
+};
+
+router.get('/attribute-registry', async (req, res) => {
+  try {
+    const summarise = async (field) => {
+      const rows = await Stock.aggregate([
+        { $match: { branch: req.branchId } },
+        {
+          $group: {
+            _id: { $ifNull: [`$${field}`, ''] },
+            stockRows: { $sum: 1 },
+            products: { $addToSet: '$product' },
+            warehouses: { $addToSet: '$warehouse' },
+            totalQty: { $sum: '$totalQty' },
+            availableQty: { $sum: '$availableQty' },
+            lastGRNDate: { $max: '$lastGRNDate' },
+            lastSaleDate: { $max: '$lastSaleDate' },
+          },
+        },
+        { $sort: { stockRows: -1 } },
+      ]);
+
+      const entries = rows.map((row) => ({
+        value: row._id || '',
+        // The empty bucket is the normal "no shade specified" case, not an error.
+        unspecified: !row._id,
+        stockRows: row.stockRows,
+        productCount: row.products.length,
+        warehouseCount: row.warehouses.length,
+        totalQty: Math.round((row.totalQty || 0) * 100) / 100,
+        availableQty: Math.round((row.availableQty || 0) * 100) / 100,
+        lastGRNDate: row.lastGRNDate || null,
+        lastSaleDate: row.lastSaleDate || null,
+        // Leading/trailing whitespace is invisible in a table but splits the key.
+        hasPaddingIssue: Boolean(row._id) && row._id !== row._id.trim(),
+      }));
+
+      const named = entries.filter((entry) => !entry.unspecified);
+      return {
+        entries,
+        distinctValues: named.length,
+        unspecifiedRows: entries.find((entry) => entry.unspecified)?.stockRows || 0,
+        paddingIssues: named.filter((entry) => entry.hasPaddingIssue),
+        variantGroups: buildVariantGroups(named),
+      };
+    };
+
+    const [shade, batch] = await Promise.all([summarise('shade'), summarise('batch')]);
+
+    return res.json({
+      success: true,
+      data: {
+        shade,
+        batch,
+        note: 'Shade and batch are free text and have no master list. Each distinct spelling is a separate stock bucket, so variants of the same value split your stock. Correcting a value requires a stock transfer or adjustment between the two buckets — it cannot be renamed in place.',
+      },
+    });
+  } catch (error) { return handleError(res, error); }
+});
+
 router.get('/movements', async (req, res) => {
   try {
     const result = await listMovements(req.branchId, req.query);

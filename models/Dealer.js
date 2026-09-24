@@ -68,6 +68,22 @@ const dealerSchema = new mongoose.Schema(
     status: { type: String, enum: ['active', 'inactive', 'blocked'], default: 'active' },
     appAccess: { type: Boolean, default: false },
 
+    // Dealer App sub-accounts.
+    // Whether this dealer may let its own employees sign in to the Dealer App.
+    // On by default: an "approved" dealer — active status plus app access, both
+    // already enforced by protectDealer — is exactly who this feature is for.
+    // BDMTILES can turn it OFF for a specific dealer as a kill switch.
+    //
+    // Read as `!== false` everywhere, never as a truthy check: dealers created
+    // before this field existed have no value stored, and a truthy check would
+    // read that absence as "disabled" and lock them all out.
+    employeeAccessEnabled: { type: Boolean, default: true },
+    // Whether the dealer may grant an employee access to sensitive finance data
+    // (ledger, outstanding, credit limit). BDMTILES can switch this off for a
+    // dealer, which revokes any finance permission previously granted — see
+    // resolveDealerEmployeePermissions in config/dealerPermissions.js.
+    allowEmployeeFinanceAccess: { type: Boolean, default: true },
+
     // Dealer App authentication (separate from staff User accounts)
     pinHash: { type: String, default: null, select: false },
     biometricEnabled: { type: Boolean, default: false },

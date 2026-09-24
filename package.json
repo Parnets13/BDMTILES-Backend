@@ -15,6 +15,8 @@
     "migrate:quotation-readiness": "node scripts/migrateQuotationReadiness.js --dry-run",
     "migrate:quotation-readiness:execute": "node scripts/migrateQuotationReadiness.js --execute",
     "validate:quotation-readiness": "node scripts/validateQuotationReadinessScenarios.js",
+    "validate:dealer-permissions": "node scripts/validateDealerPermissions.mjs",
+    "validate:dealer-flow": "node scripts/validateDealerEmployeeFlow.mjs",
     "migrate:stock-movements": "node scripts/migrateStockMovements.js --dry-run",
     "migrate:stock-movements:execute": "node scripts/migrateStockMovements.js --execute",
     "migrate:uom-lineage": "node scripts/migrateUomLineage.js --dry-run",
@@ -49,9 +51,11 @@
     "node-cron": "^4.2.1",
     "nodemailer": "^8.0.1",
     "pdfkit": "^0.17.2",
-    "slugify": "^1.6.6"
+    "slugify": "^1.6.6",
+    "socket.io": "^4.8.3"
   },
   "devDependencies": {
-    "nodemon": "^3.1.14"
+    "nodemon": "^3.1.14",
+    "socket.io-client": "^4.8.3"
   }
 }

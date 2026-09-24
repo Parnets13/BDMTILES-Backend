@@ -21,18 +21,51 @@ import ComplaintEvidence from '../models/ComplaintEvidence.js';
 import PaymentIntimation from '../models/PaymentIntimation.js';
 import User from '../models/User.js';
 import { protectDealer } from '../middleware/dealerAuth.js';
+import { requireDealerPermission } from '../middleware/dealerPermission.js';
+import { dealerOrderScope, dealerPrincipalHasPermission } from '../config/dealerPermissions.js';
 import { uploadComplaintEvidence } from '../middleware/upload.js';
 import { generateUniqueCode } from '../utils/codeGenerator.js';
 import { generateDownloadToken } from '../utils/jwt.js';
 import { getDealerCreditExposure } from '../services/dealerCreditService.js';
+import { resolveDealerBranch } from '../services/dealerAssignmentService.js';
 import { resolvePricing } from '../services/pricingResolver.js';
-import { buildTrustedRequestItems, orderRequestFingerprint } from '../services/dealerOrderRequestService.js';
+import { buildTrustedRequestItems, orderRequestFingerprint, buildStatusCounts, resolveStatusGroup, statusFilterForGroup } from '../services/dealerOrderRequestService.js';
 import { recordDealerResponse, shortfallDto } from '../services/dealerOrderShortfallService.js';
 import { requestFingerprint } from '../utils/idempotency.js';
 import { generateBranchNumber } from '../utils/branchSequence.js';
 
 const router = Router();
 router.use(protectDealer);
+
+/**
+ * Whether the calling principal may see finance data guarded by `permission`.
+ *
+ * The dealer account owner always may. An employee may only when the dealer
+ * granted the matching permission — and `req.dealerPrincipal.permissions` has
+ * already had sensitive finance ids stripped when BDMTILES disabled finance
+ * delegation for this dealer, so that policy is honoured here for free.
+ */
+const canSeeFinance = (req, permission) => dealerPrincipalHasPermission(req.dealerPrincipal, permission);
+
+/** True when the caller may see nothing at all from the finance block. */
+const isFinanceBlind = (req) =>
+  !canSeeFinance(req, 'finance.creditLimit') && !canSeeFinance(req, 'finance.outstanding');
+
+/**
+ * Which slice of orders the caller may see. The decision itself lives in
+ * config/dealerPermissions.js as a pure function so it can be asserted in the
+ * validator; this only adapts the request to it.
+ *
+ * Resolved server-side rather than trusting a filter from the app, so a crafted
+ * request cannot widen the view past what was granted. This is what makes the
+ * app's "My Requests" tab tell the truth: it used to return the whole dealer's
+ * book under a "My" label.
+ */
+const resolveOrderScope = (req) => dealerOrderScope({
+  principal: req.dealerPrincipal,
+  employeeId: req.dealerEmployee?._id || null,
+  requested: req.query.scope,
+});
 
 const money = (value) => Math.round((Number(value) + Number.EPSILON) * 100) / 100;
 
@@ -64,13 +97,6 @@ const sendError = (res, error) => res
 
 // A dealer's operating branch is derived from their assigned sales executive's
 // default branch. Order requests, invoices and ledger are all keyed on it.
-async function resolveDealerBranch(dealer) {
-  const seId = dealer.assignedSalesExecutive?._id || dealer.assignedSalesExecutive;
-  if (!seId) return null;
-  const se = await User.findById(seId).select('defaultBranch assignedBranches').lean();
-  return se?.defaultBranch || se?.assignedBranches?.[0] || null;
-}
-
 // Which active schemes this dealer qualifies for (all / named / by category / by type).
 function schemeEligibilityFilter(dealer, branch, now = new Date()) {
   const orClauses = [
@@ -121,12 +147,24 @@ function buildAgeing(openInvoices, now = new Date()) {
 
 // ── Dashboard ────────────────────────────────────────────────────────────────
 // GET /api/v1/dealer-app/dashboard
-router.get('/dashboard', async (req, res) => {
+router.get('/dashboard', requireDealerPermission('dashboard.view'), async (req, res) => {
   try {
     const dealer = req.dealer;
     const branch = await resolveDealerBranch(dealer);
     const now = new Date();
     const monthStart = new Date(now.getFullYear(), now.getMonth(), 1);
+
+    // An employee without a finance grant must not have the ledger or the invoice
+    // list loaded at all — redacting after the query would still put the numbers
+    // in memory and one careless response away from leaking them.
+    const showCreditLimit = canSeeFinance(req, 'finance.creditLimit');
+    const showOutstanding = canSeeFinance(req, 'finance.outstanding');
+    const showPayments = dealerPrincipalHasPermission(req.dealerPrincipal, 'payments.view');
+    const financeBlind = !showCreditLimit && !showOutstanding;
+
+    // The same scope rule the Orders screen uses, so the Dashboard boxes and the
+    // Orders boxes can never show different numbers.
+    const { filter: orderScope, scope: orderScopeLabel } = resolveOrderScope(req);
 
     const invoiceScope = { dealer: dealer._id, status: { $ne: 'cancelled' } };
     const [
@@ -139,12 +177,13 @@ router.get('/dashboard', async (req, res) => {
       lastPayment,
       activeSchemeCount,
       newArrivalCount,
+      requestStatusRows,
     ] = await Promise.all([
-      DealerLedger.aggregate([
+      financeBlind ? Promise.resolve([]) : DealerLedger.aggregate([
         { $match: { dealer: new mongoose.Types.ObjectId(String(dealer._id)) } },
         { $group: { _id: null, debit: { $sum: '$debit' }, credit: { $sum: '$credit' } } },
       ]),
-      Invoice.find({ ...invoiceScope, balanceAmount: { $gt: 0 } })
+      financeBlind ? Promise.resolve([]) : Invoice.find({ ...invoiceScope, balanceAmount: { $gt: 0 } })
         .select('invoiceNumber invoiceDate dueDate grandTotal balanceAmount paymentStatus')
         .sort({ dueDate: 1, invoiceDate: 1 }).limit(500).lean(),
       SalesOrder.aggregate([
@@ -156,15 +195,25 @@ router.get('/dashboard', async (req, res) => {
         .sort({ orderDate: -1 }).limit(5).lean(),
       SalesOrder.countDocuments({ dealer: dealer._id, status: { $in: ['confirmed', 'processing', 'partially_dispatched'] } }),
       Delivery.countDocuments({ dealer: dealer._id, status: { $in: ['assigned', 'in_transit', 'reached'] } }),
-      Payment.findOne({ dealer: dealer._id, paymentType: 'dealer_receipt', status: 'confirmed' })
-        .select('paymentNumber paymentDate amount paymentMode').sort({ paymentDate: -1 }).lean(),
+      showPayments
+        ? Payment.findOne({ dealer: dealer._id, paymentType: 'dealer_receipt', status: 'confirmed' })
+          .select('paymentNumber paymentDate amount paymentMode').sort({ paymentDate: -1 }).lean()
+        : Promise.resolve(null),
       DealerScheme.countDocuments(schemeEligibilityFilter(dealer, branch, now)),
       Product.countDocuments({
         status: 'active',
         dealerVisible: { $ne: false },
         createdAt: { $gte: new Date(now.getTime() - 30 * 86400000) },
       }),
+      // The dealer's own request boxes. Scoped exactly like the Orders screen, so
+      // an employee sees their own counts and the two screens can never disagree.
+      DealerOrderRequest.aggregate([
+        { $match: { dealer: dealer._id, ...orderScope } },
+        { $group: { _id: '$status', count: { $sum: 1 } } },
+      ]),
     ]);
+
+    const requestCounts = buildStatusCounts(requestStatusRows);
 
     const outstanding = money((ledgerAgg[0]?.debit || 0) - (ledgerAgg[0]?.credit || 0));
     const creditLimit = money(dealer.creditLimit || 0);
@@ -182,24 +231,40 @@ router.get('/dashboard', async (req, res) => {
           dealerCode: dealer.dealerCode,
           dealerType: dealer.dealerType?.name || null,
         },
-        credit: {
-          creditLimit,
-          outstanding,
-          usedCredit,
-          availableCredit,
-          creditDays: dealer.creditDays || 0,
-          utilization,
-        },
-        invoices: {
-          openCount: openInvoices.length,
-          overdueCount: overdue.length,
-          overdueAmount: money(overdue.reduce((s, i) => s + Number(i.balanceAmount || 0), 0)),
-        },
-        ageing: buildAgeing(openInvoices, now),
+        // Finance is omitted rather than zeroed when the employee has no grant: a
+        // zeroed credit limit reads as "you have no credit", which is a different
+        // and misleading statement. `creditHidden` lets the app explain why the
+        // section is missing instead of rendering blanks.
+        ...(showCreditLimit || showOutstanding
+          ? {
+            credit: {
+              creditLimit: showCreditLimit ? creditLimit : null,
+              creditDays: showCreditLimit ? (dealer.creditDays || 0) : null,
+              outstanding: showOutstanding ? outstanding : null,
+              usedCredit: showOutstanding ? usedCredit : null,
+              availableCredit: showOutstanding ? availableCredit : null,
+              utilization: showOutstanding ? utilization : null,
+            },
+          }
+          : { creditHidden: true }),
+        ...(showOutstanding
+          ? {
+            invoices: {
+              openCount: openInvoices.length,
+              overdueCount: overdue.length,
+              overdueAmount: money(overdue.reduce((s, i) => s + Number(i.balanceAmount || 0), 0)),
+            },
+            ageing: buildAgeing(openInvoices, now),
+          }
+          : { invoicesHidden: true }),
         orders: {
           pending: pendingOrderCount,
           inTransit: inTransitCount,
         },
+        // Request boxes, identical in shape to what GET /order-requests returns so
+        // the app can render the same component on both screens.
+        requestCounts,
+        requestScope: orderScopeLabel,
         lastPayment: lastPayment
           ? {
             paymentNumber: lastPayment.paymentNumber,
@@ -234,7 +299,7 @@ router.get('/dashboard', async (req, res) => {
 
 // ── Catalogue with dealer-specific rate ──────────────────────────────────────
 // GET /api/v1/dealer-app/catalogue?search=&brand=&category=&page=&limit=
-router.get('/catalogue', async (req, res) => {
+router.get('/catalogue', requireDealerPermission('catalogue.view'), async (req, res) => {
   try {
     const dealer = req.dealer;
     const branch = await resolveDealerBranch(dealer);
@@ -309,7 +374,7 @@ router.get('/catalogue', async (req, res) => {
 
 // GET /api/v1/dealer-app/catalogue/filter-options — brands / categories / sizes
 // Must be declared BEFORE /catalogue/:id so it isn't captured as an :id.
-router.get('/catalogue/filter-options', async (req, res) => {
+router.get('/catalogue/filter-options', requireDealerPermission('catalogue.view'), async (req, res) => {
   try {
     const match = { status: 'active', dealerVisible: { $ne: false } };
     const [brands, categories, sizes, finishes, colours, applications] = await Promise.all([
@@ -350,7 +415,7 @@ router.get('/catalogue/filter-options', async (req, res) => {
 });
 
 // GET /api/v1/dealer-app/catalogue/:id — full detail with dealer rate
-router.get('/catalogue/:id', async (req, res) => {
+router.get('/catalogue/:id', requireDealerPermission('catalogue.view'), async (req, res) => {
   try {
     const dealer = req.dealer;
     const branch = await resolveDealerBranch(dealer);
@@ -410,7 +475,7 @@ router.get('/catalogue/:id', async (req, res) => {
 
 // ── Dealer Order Requests (dealer-initiated) ─────────────────────────────────
 // POST /api/v1/dealer-app/order-requests   { items:[{ product, quantity|boxes }], remarks }
-router.post('/order-requests', async (req, res) => {
+router.post('/order-requests', requireDealerPermission('orders.order'), async (req, res) => {
   try {
     const dealer = req.dealer;
     if (!dealer.assignedSalesExecutive?._id && !dealer.assignedSalesExecutive) {
@@ -465,6 +530,9 @@ router.post('/order-requests', async (req, res) => {
       sourceKey,
       requestFingerprint: fingerprint,
       createdBy: seId, // dealer-initiated; SE owns the follow-up
+      // Recorded at submission so dealer-employee targets have a stable basis.
+      // Null when the dealer owner raised it themselves.
+      createdByEmployee: req.dealerEmployee?._id || null,
     }]);
 
     res.status(201).json({ success: true, message: 'Your order request was submitted. Your sales executive will review it.', data: created });
@@ -479,18 +547,32 @@ router.post('/order-requests', async (req, res) => {
 // legitimately approve an over-limit order. Hard-blocking here would stop real
 // business at the wrong point. The dealer sees the position, the executive
 // decides. Declared before /order-requests/:id so it isn't read as an id.
-router.get('/order-requests/credit-check', async (req, res) => {
+router.get('/order-requests/credit-check', requireDealerPermission('orders.create'), async (req, res) => {
   try {
     const dealer = req.dealer;
     const branch = await resolveDealerBranch(dealer);
     const cartAmount = money(Math.max(0, Number(req.query.amount) || 0));
 
+    // The credit position is finance data. An employee without a finance grant
+    // gets no numbers at all — the request is still submitted for approval, so
+    // the app simply skips the advisory banner rather than showing a blank one.
+    const showCreditLimit = canSeeFinance(req, 'finance.creditLimit');
+    const showOutstanding = canSeeFinance(req, 'finance.outstanding');
+    if (!showCreditLimit && !showOutstanding) {
+      return res.json({
+        success: true,
+        data: { financeHidden: true, cartAmount, blocking: false, warnings: [] },
+      });
+    }
+
     const [ledgerAgg, exposure] = await Promise.all([
-      DealerLedger.aggregate([
-        { $match: { dealer: new mongoose.Types.ObjectId(String(dealer._id)) } },
-        { $group: { _id: null, debit: { $sum: '$debit' }, credit: { $sum: '$credit' } } },
-      ]),
-      branch
+      showOutstanding
+        ? DealerLedger.aggregate([
+          { $match: { dealer: new mongoose.Types.ObjectId(String(dealer._id)) } },
+          { $group: { _id: null, debit: { $sum: '$debit' }, credit: { $sum: '$credit' } } },
+        ])
+        : Promise.resolve([]),
+      showOutstanding && branch
         ? getDealerCreditExposure({ branchId: branch, dealer }).catch(() => null)
         : Promise.resolve(null),
     ]);
@@ -502,33 +584,39 @@ router.get('/order-requests/credit-check', async (req, res) => {
     const overBy = money(Math.max(0, projected - creditLimit));
 
     const warnings = [];
-    if (creditLimit > 0 && overBy > 0) {
-      warnings.push({
-        code: 'credit_limit',
-        severity: 'warning',
-        message: `This request would take your balance to ${projected.toLocaleString('en-IN')}, which is ${overBy.toLocaleString('en-IN')} over your ${creditLimit.toLocaleString('en-IN')} limit. Your sales executive will need to approve it.`,
-      });
-    }
-    if (exposure?.overdueAmount > 0) {
-      warnings.push({
-        code: 'overdue',
-        severity: 'warning',
-        message: `You have ${exposure.overdueAmount.toLocaleString('en-IN')} overdue across ${exposure.overdueCount} bill(s). Clearing this may speed up approval.`,
-      });
+    // A limit warning needs BOTH halves — the limit and the balance it is measured
+    // against — so it is only emitted when the caller may see both.
+    if (showCreditLimit && showOutstanding) {
+      if (creditLimit > 0 && overBy > 0) {
+        warnings.push({
+          code: 'credit_limit',
+          severity: 'warning',
+          message: `This request would take your balance to ${projected.toLocaleString('en-IN')}, which is ${overBy.toLocaleString('en-IN')} over your ${creditLimit.toLocaleString('en-IN')} limit. Your sales executive will need to approve it.`,
+        });
+      }
+      if (exposure?.overdueAmount > 0) {
+        warnings.push({
+          code: 'overdue',
+          severity: 'warning',
+          message: `You have ${exposure.overdueAmount.toLocaleString('en-IN')} overdue across ${exposure.overdueCount} bill(s). Clearing this may speed up approval.`,
+        });
+      }
     }
 
     res.json({
       success: true,
       data: {
-        creditLimit,
-        outstanding,
-        availableCredit,
-        creditDays: dealer.creditDays || 0,
+        // Nulled per permission rather than omitted, so the app can tell "you may
+        // not see this" apart from "this is zero".
+        creditLimit: showCreditLimit ? creditLimit : null,
+        creditDays: showCreditLimit ? (dealer.creditDays || 0) : null,
+        outstanding: showOutstanding ? outstanding : null,
+        availableCredit: showOutstanding ? availableCredit : null,
         cartAmount,
-        projectedOutstanding: projected,
-        overLimitBy: overBy,
-        overdueAmount: money(exposure?.overdueAmount || 0),
-        overdueCount: exposure?.overdueCount || 0,
+        projectedOutstanding: showOutstanding ? projected : null,
+        overLimitBy: showCreditLimit && showOutstanding ? overBy : null,
+        overdueAmount: showOutstanding ? money(exposure?.overdueAmount || 0) : null,
+        overdueCount: showOutstanding ? (exposure?.overdueCount || 0) : null,
         // Requests are never blocked client-side; this is guidance only.
         blocking: false,
         warnings,
@@ -664,25 +752,51 @@ const REQUEST_FIELDS = [
 ].join(' ');
 
 // GET /api/v1/dealer-app/order-requests?status=&page=&limit=
-router.get('/order-requests', async (req, res) => {
+router.get('/order-requests', requireDealerPermission('orders.view'), async (req, res) => {
   try {
     const dealer = req.dealer;
     const { page = 1, limit = 20, status } = req.query;
     const p = Math.max(1, parseInt(page, 10) || 1);
     const l = Math.min(50, Math.max(1, parseInt(limit, 10) || 20));
-    const filter = { dealer: dealer._id };
-    if (status) filter.status = status;
-    const [rows, total] = await Promise.all([
-      DealerOrderRequest.find(filter).sort({ createdAt: -1 }).skip((p - 1) * l).limit(l)
+
+    const { filter: scoped, scope } = resolveOrderScope(req);
+    const scopeFilter = { dealer: dealer._id, ...scoped };
+
+    // Which box the dealer tapped. An unknown key falls back to `all` rather than
+    // to an empty list, so a stale app build shows everything instead of nothing.
+    const group = resolveStatusGroup(req.query.group);
+    // `status` is still honoured for older app builds that filter by raw status.
+    const groupFilter = req.query.group
+      ? statusFilterForGroup(group)
+      : (status ? { status } : {});
+
+    const [rows, total, statusRows] = await Promise.all([
+      DealerOrderRequest.find({ ...scopeFilter, ...groupFilter })
+        .sort({ createdAt: -1 }).skip((p - 1) * l).limit(l)
         .select(REQUEST_FIELDS).lean(),
-      DealerOrderRequest.countDocuments(filter),
+      DealerOrderRequest.countDocuments({ ...scopeFilter, ...groupFilter }),
+      // Counts deliberately ignore the status filter: the boxes have to show the
+      // full picture so the dealer can see how much sits in each bucket, not only
+      // the one they happen to be looking at.
+      DealerOrderRequest.aggregate([
+        { $match: scopeFilter },
+        { $group: { _id: '$status', count: { $sum: 1 } } },
+      ]),
     ]);
+
     const data = await attachRequestOutcomes(rows, dealer._id);
-    res.json({ success: true, data, pagination: { currentPage: p, totalPages: Math.ceil(total / l), totalItems: total } });
+    res.json({
+      success: true,
+      data,
+      scope,
+      group,
+      counts: buildStatusCounts(statusRows),
+      pagination: { currentPage: p, totalPages: Math.ceil(total / l), totalItems: total },
+    });
   } catch (error) { sendError(res, error); }
 });
 
-router.get('/order-requests/:id', async (req, res) => {
+router.get('/order-requests/:id', requireDealerPermission('orders.view'), async (req, res) => {
   try {
     const request = await DealerOrderRequest.findOne({ _id: req.params.id, dealer: req.dealer._id })
       .select(REQUEST_FIELDS).lean();
@@ -697,7 +811,7 @@ router.get('/order-requests/:id', async (req, res) => {
 // Just the part of the request that is waiting on the dealer. The detail endpoint
 // already carries this, but the app polls this one on its own so a pending answer
 // can be surfaced without re-fetching the whole request.
-router.get('/order-requests/:id/shortfall', async (req, res) => {
+router.get('/order-requests/:id/shortfall', requireDealerPermission('orders.view'), async (req, res) => {
   try {
     const request = await DealerOrderRequest.findOne({ _id: req.params.id, dealer: req.dealer._id })
       .select('requestNumber status shortfallStatus shortfallRounds shortfallSettledAt processedAt')
@@ -724,7 +838,7 @@ router.get('/order-requests/:id/shortfall', async (req, res) => {
 //
 // `round` is required so an answer to an offer the branch has since revised is
 // rejected rather than applied to numbers the dealer never saw.
-router.post('/order-requests/:id/shortfall/respond', async (req, res) => {
+router.post('/order-requests/:id/shortfall/respond', requireDealerPermission('orders.shortfallRespond'), async (req, res) => {
   const session = await mongoose.startSession();
   try {
     const round = Number(req.body?.round);
@@ -768,7 +882,7 @@ router.post('/order-requests/:id/shortfall/respond', async (req, res) => {
 // Once the branch has approved it, rejected it, or built a quotation from it, the
 // decision is no longer the dealer's to reverse — they contact their executive.
 // This is the only writer of the 'cancelled' status.
-router.post('/order-requests/:id/cancel', async (req, res) => {
+router.post('/order-requests/:id/cancel', requireDealerPermission('orders.cancel'), async (req, res) => {
   try {
     const reason = String(req.body?.reason || '').trim().slice(0, 1000);
     const cancelled = await DealerOrderRequest.findOneAndUpdate(
@@ -798,24 +912,43 @@ router.post('/order-requests/:id/cancel', async (req, res) => {
 });
 
 // ── Orders (confirmed sales orders) ──────────────────────────────────────────
-router.get('/orders', async (req, res) => {
+router.get('/orders', requireDealerPermission('orders.view'), async (req, res) => {
   try {
     const { page = 1, limit = 20, status } = req.query;
     const p = Math.max(1, parseInt(page, 10) || 1);
     const l = Math.min(50, Math.max(1, parseInt(limit, 10) || 20));
-    const filter = { dealer: req.dealer._id, status: { $nin: ['draft'] } };
+
+    const { filter: scoped, scope } = resolveOrderScope(req);
+    const filter = { dealer: req.dealer._id, status: { $nin: ['draft'] }, ...scoped };
     if (status) filter.status = status;
-    const [data, total] = await Promise.all([
+
+    const [data, total, agg] = await Promise.all([
       SalesOrder.find(filter).sort({ orderDate: -1 }).skip((p - 1) * l).limit(l)
         .select('orderNumber orderDate status grandTotal balanceAmount paymentStatus items').lean(),
       SalesOrder.countDocuments(filter),
+      // Value of everything in scope, not just the page — this is the headline
+      // number on the "My Sales" view, so it must not change when you scroll.
+      SalesOrder.aggregate([
+        { $match: { ...filter, status: { $nin: ['draft', 'cancelled'] } } },
+        { $group: { _id: null, total: { $sum: '$grandTotal' }, count: { $sum: 1 } } },
+      ]),
     ]);
-    res.json({ success: true, data, pagination: { currentPage: p, totalPages: Math.ceil(total / l), totalItems: total } });
+
+    res.json({
+      success: true,
+      data,
+      scope,
+      summary: {
+        orderCount: agg[0]?.count || 0,
+        totalValue: Math.round(((agg[0]?.total || 0) + Number.EPSILON) * 100) / 100,
+      },
+      pagination: { currentPage: p, totalPages: Math.ceil(total / l), totalItems: total },
+    });
   } catch (error) { sendError(res, error); }
 });
 
 // GET /api/v1/dealer-app/orders/:id — order detail scoped to the dealer
-router.get('/orders/:id', async (req, res) => {
+router.get('/orders/:id', requireDealerPermission('orders.view'), async (req, res) => {
   try {
     const order = await SalesOrder.findOne({ _id: req.params.id, dealer: req.dealer._id })
       .select('orderNumber orderDate status paymentStatus grandTotal subtotal totalDiscount totalTax freightCharges loadingCharges otherCharges roundOff advanceAmount balanceAmount deliveryAddress expectedDeliveryDate items')
@@ -875,7 +1008,7 @@ router.get('/orders/:id', async (req, res) => {
 });
 
 // ── Invoices ─────────────────────────────────────────────────────────────────
-router.get('/invoices', async (req, res) => {
+router.get('/invoices', requireDealerPermission('payments.view'), async (req, res) => {
   try {
     const { page = 1, limit = 20, status } = req.query;
     const p = Math.max(1, parseInt(page, 10) || 1);
@@ -901,7 +1034,7 @@ router.get('/invoices', async (req, res) => {
 });
 
 // GET /api/v1/dealer-app/invoices/:id — invoice detail scoped to the dealer
-router.get('/invoices/:id', async (req, res) => {
+router.get('/invoices/:id', requireDealerPermission('payments.view'), async (req, res) => {
   try {
     const inv = await Invoice.findOne({ _id: req.params.id, dealer: req.dealer._id })
       .select('invoiceNumber invoiceDate dueDate status paymentStatus paidAmount balanceAmount grandTotal subtotal totalDiscount taxableTotal totalCgst totalSgst totalIgst totalTax freightCharges loadingCharges otherCharges roundOff isInterState orderNumber paymentTerms amountInWords items sellerName sellerGstin buyerName buyerGstin')
@@ -957,7 +1090,7 @@ router.get('/invoices/:id', async (req, res) => {
 });
 
 // ── Statement / ledger ───────────────────────────────────────────────────────
-router.get('/statement', async (req, res) => {
+router.get('/statement', requireDealerPermission('finance.ledger'), async (req, res) => {
   try {
     const { page = 1, limit = 30 } = req.query;
     const p = Math.max(1, parseInt(page, 10) || 1);
@@ -983,7 +1116,7 @@ router.get('/statement', async (req, res) => {
 // ── Schemes & rewards (17.6) ─────────────────────────────────────────────────
 // GET /api/v1/dealer-app/schemes — active schemes the dealer is eligible for.
 // Eligibility is derived from applicableTo (all / specific dealer / category / type).
-router.get('/schemes', async (req, res) => {
+router.get('/schemes', requireDealerPermission('schemes.view'), async (req, res) => {
   try {
     const dealer = req.dealer;
     const branch = await resolveDealerBranch(dealer);
@@ -1174,7 +1307,7 @@ router.get('/notifications', async (req, res) => {
 
 // ── Support / complaints (17.8) ──────────────────────────────────────────────
 // GET /api/v1/dealer-app/complaints
-router.get('/complaints', async (req, res) => {
+router.get('/complaints', requireDealerPermission('complaints.view'), async (req, res) => {
   try {
     const { page = 1, limit = 20, status } = req.query;
     const p = Math.max(1, parseInt(page, 10) || 1);
@@ -1191,7 +1324,7 @@ router.get('/complaints', async (req, res) => {
 });
 
 // GET /api/v1/dealer-app/complaints/:id — full detail incl. resolution history
-router.get('/complaints/:id', async (req, res) => {
+router.get('/complaints/:id', requireDealerPermission('complaints.view'), async (req, res) => {
   try {
     const c = await Complaint.findOne({ _id: req.params.id, dealer: req.dealer._id })
       .select('complaintNumber category description priority status orderNumber invoiceNumber requiresReturn returnReceived creditNoteIssued creditNoteNumber creditNoteAmount products complaintPhotos resolutionHistory resolutionNotes resolvedAt createdAt assignedToName')
@@ -1203,7 +1336,7 @@ router.get('/complaints/:id', async (req, res) => {
 
 // POST /api/v1/dealer-app/complaints — create a ticket with optional images.
 // multipart/form-data: category, description, priority, orderNumber?, invoiceNumber?, images[]
-router.post('/complaints', (req, res) => {
+router.post('/complaints', requireDealerPermission('complaints.create'), (req, res) => {
   uploadComplaintEvidence(req, res, async (uploadErr) => {
     try {
       if (uploadErr) throw appError(400, uploadErr.message || 'Image upload failed.');
@@ -1259,7 +1392,7 @@ router.post('/complaints', (req, res) => {
 
 // ── Payment intimation / UTR upload (17.5) ───────────────────────────────────
 // GET /api/v1/dealer-app/payment-intimations
-router.get('/payment-intimations', async (req, res) => {
+router.get('/payment-intimations', requireDealerPermission('payments.view'), async (req, res) => {
   try {
     const data = await PaymentIntimation.find({ dealer: req.dealer._id })
       .sort({ createdAt: -1 }).limit(50)
@@ -1271,7 +1404,7 @@ router.get('/payment-intimations', async (req, res) => {
 // POST /api/v1/dealer-app/payment-intimations — dealer notifies a payment.
 // multipart/form-data (proof optional): amount, paymentMode, utrNumber?, chequeNumber?,
 // bankName?, invoiceNumber?, invoiceId?, paymentDate?, referenceNote?, images[] (first used as proof)
-router.post('/payment-intimations', (req, res) => {
+router.post('/payment-intimations', requireDealerPermission('payments.collection'), (req, res) => {
   uploadComplaintEvidence(req, res, async (uploadErr) => {
     try {
       if (uploadErr) throw appError(400, uploadErr.message || 'Proof upload failed.');
@@ -1313,6 +1446,9 @@ router.post('/payment-intimations', (req, res) => {
         referenceNote: String(referenceNote || '').trim(),
         proofUrl,
         status: 'submitted',
+        // Recorded at submission so dealer-employee collection targets have a
+        // stable basis. Null when the dealer owner submitted it themselves.
+        createdByEmployee: req.dealerEmployee?._id || null,
       });
 
       res.status(201).json({ success: true, message: `Payment intimation ${record.intimationNumber} submitted. Accounts will verify and update your ledger.`, data: record });
@@ -1326,7 +1462,7 @@ router.post('/payment-intimations', (req, res) => {
 const downloadBase = (req) => `${req.protocol}://${req.get('host')}/api/v1/dealer-downloads`;
 
 // POST /api/v1/dealer-app/invoices/:id/download-link
-router.post('/invoices/:id/download-link', async (req, res) => {
+router.post('/invoices/:id/download-link', requireDealerPermission('payments.view'), async (req, res) => {
   try {
     const inv = await Invoice.findOne({ _id: req.params.id, dealer: req.dealer._id })
       .select('invoiceNumber').lean();
@@ -1344,7 +1480,7 @@ router.post('/invoices/:id/download-link', async (req, res) => {
 });
 
 // POST /api/v1/dealer-app/receipts/:id/download-link
-router.post('/receipts/:id/download-link', async (req, res) => {
+router.post('/receipts/:id/download-link', requireDealerPermission('payments.view'), async (req, res) => {
   try {
     const pay = await Payment.findOne({
       _id: req.params.id, dealer: req.dealer._id, paymentType: 'dealer_receipt',
@@ -1377,7 +1513,7 @@ const handoverOtp = delivery =>
   (!delivery?.otpVerified && OTP_VISIBLE_STATES.includes(delivery?.status) ? delivery.otp || '' : '');
 
 // GET /api/v1/dealer-app/deliveries?status=&page=&limit=
-router.get('/deliveries', async (req, res) => {
+router.get('/deliveries', requireDealerPermission('deliveries.view'), async (req, res) => {
   try {
     const { page = 1, limit = 20, status } = req.query;
     const p = Math.max(1, parseInt(page, 10) || 1);
@@ -1415,7 +1551,7 @@ router.get('/deliveries', async (req, res) => {
 });
 
 // GET /api/v1/dealer-app/deliveries/:id — full detail incl. proof of delivery
-router.get('/deliveries/:id', async (req, res) => {
+router.get('/deliveries/:id', requireDealerPermission('deliveries.view'), async (req, res) => {
   try {
     const d = await Delivery.findOne({ _id: req.params.id, dealer: req.dealer._id })
       .select('deliveryNumber deliveryDate status orderNumber invoiceNumber tripNumber deliveryAddress contactPhone deliveryExecutiveName items podImage podSignature podDocumentUrl receiverName startTime reachTime completionTime deliveryRemarks failureReason failureRemarks rescheduleDate otp otpVerified otpVerifiedAt vehicleNumber vehicleType driverName driverPhone')
@@ -1480,7 +1616,7 @@ router.get('/deliveries/:id', async (req, res) => {
 
 // ── Receipts (17.5) ──────────────────────────────────────────────────────────
 // Confirmed dealer receipts posted by accounts — the dealer's payment history.
-router.get('/receipts', async (req, res) => {
+router.get('/receipts', requireDealerPermission('payments.view'), async (req, res) => {
   try {
     const { page = 1, limit = 20 } = req.query;
     const p = Math.max(1, parseInt(page, 10) || 1);
@@ -1518,7 +1654,7 @@ router.get('/receipts', async (req, res) => {
 
 // ── Credit notes (17.5) ──────────────────────────────────────────────────────
 // Sales returns that produced a credit note for this dealer.
-router.get('/credit-notes', async (req, res) => {
+router.get('/credit-notes', requireDealerPermission('payments.view'), async (req, res) => {
   try {
     const { page = 1, limit = 20 } = req.query;
     const p = Math.max(1, parseInt(page, 10) || 1);
@@ -1553,7 +1689,7 @@ router.get('/credit-notes', async (req, res) => {
 // ── Debit notes (17.5) ───────────────────────────────────────────────────────
 // There is no standalone DebitNote document in the platform; debit notes are
 // posted to the dealer ledger by accounts. We surface those entries read-only.
-router.get('/debit-notes', async (req, res) => {
+router.get('/debit-notes', requireDealerPermission('payments.view'), async (req, res) => {
   try {
     const { page = 1, limit = 20 } = req.query;
     const p = Math.max(1, parseInt(page, 10) || 1);
@@ -1581,7 +1717,7 @@ router.get('/debit-notes', async (req, res) => {
 
 // ── Similar products (17.3) ──────────────────────────────────────────────────
 // Same category (falling back to brand), excluding the product itself.
-router.get('/catalogue/:id/similar', async (req, res) => {
+router.get('/catalogue/:id/similar', requireDealerPermission('catalogue.view'), async (req, res) => {
   try {
     const dealer = req.dealer;
     const branch = await resolveDealerBranch(dealer);
@@ -1696,7 +1832,7 @@ async function pointsSummary(dealerId, session = null) {
 }
 
 // GET /api/v1/dealer-app/points
-router.get('/points', async (req, res) => {
+router.get('/points', requireDealerPermission('points.view'), async (req, res) => {
   try {
     const [summary, entries] = await Promise.all([
       pointsSummary(req.dealer._id),
@@ -1725,7 +1861,7 @@ router.get('/points', async (req, res) => {
 });
 
 // GET /api/v1/dealer-app/gifts — catalogue with affordability for this dealer
-router.get('/gifts', async (req, res) => {
+router.get('/gifts', requireDealerPermission('points.view'), async (req, res) => {
   try {
     const dealer = req.dealer;
     const branch = await resolveDealerBranch(dealer);
@@ -1768,7 +1904,7 @@ router.get('/gifts', async (req, res) => {
 });
 
 // GET /api/v1/dealer-app/gift-claims
-router.get('/gift-claims', async (req, res) => {
+router.get('/gift-claims', requireDealerPermission('points.view'), async (req, res) => {
   try {
     const data = await GiftClaim.find({ dealer: req.dealer._id })
       .sort({ createdAt: -1 }).limit(50)
@@ -1780,7 +1916,7 @@ router.get('/gift-claims', async (req, res) => {
 
 // POST /api/v1/dealer-app/gift-claims  { gift, quantity?, deliveryAddress?, remarks? }
 // Debits points inside a transaction so the same points can never fund two claims.
-router.post('/gift-claims', async (req, res) => {
+router.post('/gift-claims', requireDealerPermission('points.view'), async (req, res) => {
   const session = await mongoose.startSession();
   try {
     const dealer = req.dealer;
@@ -1874,7 +2010,7 @@ router.post('/gift-claims', async (req, res) => {
 });
 
 // POST /api/v1/dealer-app/gift-claims/:id/cancel — only while still pending
-router.post('/gift-claims/:id/cancel', async (req, res) => {
+router.post('/gift-claims/:id/cancel', requireDealerPermission('points.view'), async (req, res) => {
   const session = await mongoose.startSession();
   try {
     let updated;
@@ -1924,7 +2060,7 @@ router.post('/gift-claims/:id/cancel', async (req, res) => {
 
 // ── Chat with the assigned sales executive (17.8) ─────────────────────────────
 // GET /api/v1/dealer-app/messages?complaint=
-router.get('/messages', async (req, res) => {
+router.get('/messages', requireDealerPermission('chat.view'), async (req, res) => {
   try {
     const filter = { dealer: req.dealer._id };
     if (mongoose.isValidObjectId(req.query.complaint)) filter.complaint = req.query.complaint;
@@ -1950,7 +2086,7 @@ router.get('/messages', async (req, res) => {
 });
 
 // GET /api/v1/dealer-app/messages/unread-count
-router.get('/messages/unread-count', async (req, res) => {
+router.get('/messages/unread-count', requireDealerPermission('chat.view'), async (req, res) => {
   try {
     const count = await DealerMessage.countDocuments({
       dealer: req.dealer._id, senderRole: 'executive', readByDealerAt: null,
@@ -1960,7 +2096,7 @@ router.get('/messages/unread-count', async (req, res) => {
 });
 
 // POST /api/v1/dealer-app/messages  { body, complaint? }
-router.post('/messages', async (req, res) => {
+router.post('/messages', requireDealerPermission('chat.view'), async (req, res) => {
   try {
     const dealer = req.dealer;
     const body = String(req.body?.body || '').trim();

@@ -4,7 +4,9 @@ import DealerType from '../models/DealerType.js';
 import DealerCategory from '../models/DealerCategory.js';
 import Region from '../models/Region.js';
 import Route from '../models/Route.js';
-import Dealer, { normalizeDealerMobile } from '../models/Dealer.js';
+import Dealer from '../models/Dealer.js';
+import DealerEmployee from '../models/DealerEmployee.js';
+import Incentive from '../models/Incentive.js';
 import Supplier from '../models/Supplier.js';
 import Warehouse from '../models/Warehouse.js';
 import ExpenseCategory from '../models/ExpenseCategory.js';
@@ -18,6 +20,12 @@ import {
   buildAssignmentChange,
   findAssignableExecutive,
 } from '../services/dealerAssignmentService.js';
+import {
+  assertMobileAvailable,
+  checkMobileAvailability,
+  MOBILE_IN_USE_MESSAGE,
+  MOBILE_OWNER_TYPE,
+} from '../services/mobileIdentityService.js';
 
 const router = Router();
 router.use(protect);
@@ -308,27 +316,25 @@ const sendDealerError = (res, error) => res.status(
 ).json({
   success: false,
   message: error.code === 11000 && /mobileNormalized/.test(error.message || '')
-    ? 'Another dealer already uses this mobile number. Each dealer must have a unique mobile.'
+    // Generic on purpose — see MOBILE_IN_USE_MESSAGE. Never name the holder.
+    ? MOBILE_IN_USE_MESSAGE
     : error.name === 'CastError' ? 'Invalid identifier.' : error.message,
 });
 
-// Ensures a dealer's mobile is present, valid, and unique across dealers, and
-// stamps the normalized login key. Runs for both create and update so a changed
-// number (which bypasses the pre-save hook via findByIdAndUpdate) stays in sync.
+// Ensures a dealer's mobile is present, valid, and unique ACROSS THE WHOLE
+// SYSTEM, then stamps the normalized login key. Runs for both create and update
+// so a changed number (which bypasses the pre-save hook via findByIdAndUpdate)
+// stays in sync.
+//
+// Uniqueness is global rather than dealer-vs-dealer: the Dealer App login screen
+// resolves a bare mobile number to exactly one principal, so a dealer number that
+// collided with a dealer employee, a staff user or an HRMS employee would make
+// that resolution ambiguous. See services/mobileIdentityService.js.
 async function applyDealerMobile(data, dealerId = null) {
   if (!Object.prototype.hasOwnProperty.call(data, 'mobile')) return data;
-  const normalized = normalizeDealerMobile(data.mobile);
-  if (normalized.length < 10) {
-    throw dealerError(422, 'Enter a valid 10-digit mobile number.');
-  }
-  const clash = await Dealer.findOne({
-    mobileNormalized: normalized,
-    ...(dealerId ? { _id: { $ne: dealerId } } : {}),
-  }).select('_id businessName').lean();
-  if (clash) {
-    throw dealerError(409, `Mobile ${data.mobile} is already used by dealer "${clash.businessName}". Each dealer must have a unique mobile.`);
-  }
-  data.mobileNormalized = normalized;
+  data.mobileNormalized = await assertMobileAvailable(data.mobile, {
+    exclude: dealerId ? { type: MOBILE_OWNER_TYPE.DEALER, id: dealerId } : null,
+  });
   return data;
 }
 
@@ -408,6 +414,66 @@ dealerRouter.get('/sales-executives', requirePermission('dealer.assignment.manag
 dealerRouter.get('/assignment-summary', requirePermission('dealer.assignment.manage'), async (_req, res) => {
   try {
     return res.json({ success: true, data: await assignmentSummary() });
+  } catch (error) { return sendDealerError(res, error); }
+});
+
+// GET /masters/dealers/mobile-availability?mobile=...&excludeId=...
+//
+// Lets the dealer form warn that a number is already taken by a dealer employee,
+// a staff user or an HRMS employee before the save fails. Declared before '/:id'
+// so "mobile-availability" is not read as a dealer id.
+dealerRouter.get('/mobile-availability', async (req, res) => {
+  try {
+    const excludeId = mongoose.isValidObjectId(req.query.excludeId) ? req.query.excludeId : null;
+    return res.json({
+      success: true,
+      data: await checkMobileAvailability(req.query.mobile, {
+        exclude: excludeId ? { type: MOBILE_OWNER_TYPE.DEALER, id: excludeId } : null,
+      }),
+    });
+  } catch (error) { return sendDealerError(res, error); }
+});
+
+// GET /masters/dealers/:id/employees
+//
+// The dealer's own app users — employees the dealer created from the Dealer App.
+// Read-only for staff: BDMTILES can see who a dealer has given access to (and how
+// many), but managing them stays with the dealer, who owns the relationship.
+dealerRouter.get('/:id/employees', async (req, res) => {
+  try {
+    if (!mongoose.isValidObjectId(req.params.id)) {
+      return res.status(422).json({ success: false, message: 'Invalid dealer identifier.' });
+    }
+    const dealer = await Dealer.findById(req.params.id).select('_id businessName').lean();
+    if (!dealer) return res.status(404).json({ success: false, message: 'Dealer not found.' });
+
+    const employees = await DealerEmployee.find({ dealer: dealer._id })
+      .select('name employeeCode mobile email designation joiningDate status loginEnabled role permissionMode permissions appLastLoginAt createdAt')
+      .sort({ createdAt: -1 })
+      .lean();
+
+    // How many target rules this dealer currently has running for their staff.
+    // A rule count rather than a per-employee figure: a shared rule covers
+    // several employees and would otherwise be counted once per person.
+    const activeTargets = await Incentive.countDocuments({
+      dealer: dealer._id,
+      applicableTo: 'dealer_employee',
+      incentiveType: 'target',
+      status: 'active',
+    });
+
+    const active = employees.filter((employee) => employee.status === 'active').length;
+    return res.json({
+      success: true,
+      data: employees,
+      summary: {
+        total: employees.length,
+        active,
+        inactive: employees.length - active,
+        withLogin: employees.filter((employee) => employee.loginEnabled).length,
+        activeTargets,
+      },
+    });
   } catch (error) { return sendDealerError(res, error); }
 });
 

@@ -5,6 +5,7 @@ import PurchaseReturn from '../models/PurchaseReturn.js';
 import GRN from '../models/GRN.js';
 import Stock from '../models/Stock.js';
 import Payment from '../models/Payment.js';
+import Invoice from '../models/Invoice.js';
 import DealerLedger from '../models/DealerLedger.js';
 import SupplierLedger from '../models/SupplierLedger.js';
 import PickList from '../models/PickList.js';
@@ -57,6 +58,42 @@ const dateKey = (date) => new Date(date.getTime() + IST_OFFSET_MS).toISOString()
 const countById = (rows = []) => Object.fromEntries(rows.map((row) => [row._id, row.count]));
 const sumMetric = (row, field = 'total') => row?.[0]?.[field] || 0;
 const periodMatch = (field, from, to) => ({ [field]: { $gte: from, $lt: to } });
+
+// Parses a YYYY-MM-DD string as an IST calendar-day start. Returns null for
+// anything malformed or impossible (e.g. 2026-02-31, which Date would silently
+// roll forward into March).
+const parseIstDay = (value) => {
+  const match = /^(\d{4})-(\d{2})-(\d{2})$/.exec(String(value || '').trim());
+  if (!match) return null;
+  const boundary = calendarBoundary(Number(match[1]), Number(match[2]) - 1, Number(match[3]));
+  return dateKey(boundary) === `${match[1]}-${match[2]}-${match[3]}` ? boundary : null;
+};
+
+const PROFIT_PERIODS = new Set(['today', 'month', 'year', 'custom']);
+const badRequest = (message) => Object.assign(new Error(message), { status: 400 });
+
+// Resolves the Profitability date filter into a half-open IST range [from, to).
+// Only Profitability is filtered: every other section reports fixed windows that
+// are named in the card itself ("Today's Sales", "Last 7 Days"), so re-dating them
+// from a global control would make those labels lie.
+const resolveProfitRange = (periods, query = {}) => {
+  const preset = String(query.profitPeriod || 'month').toLowerCase();
+  if (!PROFIT_PERIODS.has(preset)) {
+    throw badRequest('profitPeriod must be today, month, year, or custom.');
+  }
+  if (preset === 'today') return { preset, from: periods.today, to: periods.tomorrow };
+  if (preset === 'year') return { preset, from: periods.yearStart, to: periods.nextYearStart };
+  if (preset === 'month') return { preset, from: periods.monthStart, to: periods.nextMonthStart };
+
+  const from = parseIstDay(query.profitFrom);
+  const to = parseIstDay(query.profitTo);
+  if (!from || !to) {
+    throw badRequest('profitFrom and profitTo are required as YYYY-MM-DD for a custom profit period.');
+  }
+  if (to.getTime() < from.getTime()) throw badRequest('profitTo cannot be before profitFrom.');
+  // `to` arrives as an inclusive day; advance it so the range covers that whole day.
+  return { preset, from, to: addDays(to, 1) };
+};
 
 const getPeriods = () => {
   const now = new Date();
@@ -158,7 +195,7 @@ const buildSales = async (scopeMatch, periods, user) => {
 const buildCollections = async (scopeMatch, periods, user) => {
   const canReadPayments = hasAnyPermission(user, ['payment', 'reports.finance', 'finance.management']);
   const canReadOutstanding = hasAnyPermission(user, ['dealer.ledger', 'reports.finance', 'finance.management']);
-  const [paymentRows, balances, orderAging, customerBalances] = await Promise.all([
+  const [paymentRows, balances, orderAging, customerBalances, overdueInvoices] = await Promise.all([
     canReadPayments ? Payment.aggregate([
       { $match: { ...scopeMatch, paymentType: 'dealer_receipt', status: 'confirmed' } },
       { $facet: {
@@ -203,12 +240,31 @@ const buildCollections = async (scopeMatch, periods, user) => {
       { $group: { _id: '$customerName', name: { $first: '$customerName' }, outstanding: { $sum: '$balanceAmount' }, count: { $sum: 1 } } },
       { $sort: { outstanding: -1 } }, { $limit: 8 },
     ]) : Promise.resolve([]),
+    // Overdue is measured on the invoice, not the order: the invoice is what
+    // carries a real dueDate (derived from payment terms) and a maintained
+    // balanceAmount. dueDate < start of today means it was due yesterday or
+    // earlier, so an invoice falling due today is not yet counted as overdue.
+    // Proforma, delivery challans and credit/debit notes are excluded because
+    // they are not receivables.
+    canReadOutstanding ? Invoice.aggregate([
+      { $match: {
+        ...scopeMatch,
+        status: { $nin: ['draft', 'cancelled'] },
+        invoiceType: { $in: ['tax_invoice', 'retail_invoice'] },
+        paymentStatus: { $in: ['pending', 'partial'] },
+        balanceAmount: { $gt: 0 },
+        dueDate: { $lt: periods.today },
+      } },
+      { $group: { _id: null, overdueAmount: { $sum: '$balanceAmount' }, overdueCount: { $sum: 1 } } },
+    ]) : Promise.resolve([]),
   ]);
 
   const paymentFacets = paymentRows[0] || {};
   const modes = paymentFacets.today || [];
   const modeTotal = (selectedModes) => modes.filter((row) => selectedModes.includes(row._id)).reduce((sum, row) => sum + row.total, 0);
-  const warnings = ['Overdue collection and credit-day alerts are unavailable because orders do not persist a reliable due date or maintained overdue state. Sales-executive collection is also unavailable because receipts do not store that branch-safe attribute.'];
+  const warnings = [
+    'Overdue is counted from invoice due dates on unpaid tax and retail invoices. Ageing buckets are measured from the order date, so the two can differ when an order is invoiced later. Credit-day alerts and sales-executive collection remain unavailable: receipts do not store a branch-safe executive attribute.',
+  ];
   if (!canReadPayments) warnings.push('Collection receipts are hidden because payment or finance-report permission is required.');
   if (!canReadOutstanding) warnings.push('Outstanding balances and ageing are hidden because dealer-ledger or finance-report permission is required.');
   return {
@@ -219,9 +275,9 @@ const buildCollections = async (scopeMatch, periods, user) => {
     chequeCollection: canReadPayments ? modeTotal(['cheque']) : null,
     bankCollection: canReadPayments ? modeTotal(['upi', 'neft', 'rtgs', 'card', 'adjustment']) : null,
     pendingCollection: canReadOutstanding ? balances.reduce((sum, row) => sum + row.outstanding, 0) : null,
-    overdueCollection: null,
+    overdueCollection: canReadOutstanding ? overdueInvoices[0]?.overdueAmount || 0 : null,
     pendingOrders: canReadOutstanding ? orderAging[0]?.pendingOrders || 0 : null,
-    overdueOrders: null,
+    overdueOrders: canReadOutstanding ? overdueInvoices[0]?.overdueCount || 0 : null,
     dealerOutstanding: canReadOutstanding ? balances.slice(0, 8) : null,
     customerOutstanding: canReadOutstanding ? customerBalances : null,
     paymentModes: canReadPayments ? modes : null,
@@ -239,7 +295,7 @@ const buildCollections = async (scopeMatch, periods, user) => {
 
 const buildInventory = async (scopeMatch, periods) => {
   const valuationRate = { $cond: [{ $gt: ['$landingCost', 0] }, '$landingCost', '$purchaseRate'] };
-  const [summary, productBalances, byWarehouse, aging] = await Promise.all([
+  const [summary, productBalances, byWarehouse, aging, movement] = await Promise.all([
     Stock.aggregate([
       { $match: scopeMatch },
       { $group: {
@@ -278,6 +334,35 @@ const buildInventory = async (scopeMatch, periods) => {
         over180: { $sum: { $cond: [{ $gt: ['$ageDays', 180] }, '$availableQty', 0] } },
       } },
     ]),
+    // Movement classification, judged per product (a product can hold several
+    // stock rows across warehouse/shade/batch, so the most recent sale across all
+    // of them is what counts) and only for stock we still physically hold.
+    // daysSinceSale uses -1 as a "never sold" sentinel to avoid null comparisons.
+    Stock.aggregate([
+      { $match: scopeMatch },
+      { $group: { _id: '$product', availableQty: { $sum: '$availableQty' }, lastSaleDate: { $max: '$lastSaleDate' } } },
+      { $match: { availableQty: { $gt: 0 } } },
+      { $project: {
+        availableQty: 1,
+        hasSale: { $ne: ['$lastSaleDate', null] },
+        daysSinceSale: {
+          $cond: [
+            { $ne: ['$lastSaleDate', null] },
+            { $dateDiff: { startDate: '$lastSaleDate', endDate: periods.now, unit: 'day' } },
+            -1,
+          ],
+        },
+      } },
+      { $group: {
+        _id: null,
+        movingProducts: { $sum: { $cond: [{ $and: ['$hasSale', { $lte: ['$daysSinceSale', 90] }] }, 1, 0] } },
+        slowMovingProducts: { $sum: { $cond: [{ $and: ['$hasSale', { $gt: ['$daysSinceSale', 90] }, { $lte: ['$daysSinceSale', 180] }] }, 1, 0] } },
+        slowMovingQty: { $sum: { $cond: [{ $and: ['$hasSale', { $gt: ['$daysSinceSale', 90] }, { $lte: ['$daysSinceSale', 180] }] }, '$availableQty', 0] } },
+        nonMovingProducts: { $sum: { $cond: [{ $or: [{ $not: ['$hasSale'] }, { $gt: ['$daysSinceSale', 180] }] }, 1, 0] } },
+        nonMovingQty: { $sum: { $cond: [{ $or: [{ $not: ['$hasSale'] }, { $gt: ['$daysSinceSale', 180] }] }, '$availableQty', 0] } },
+        neverSoldProducts: { $sum: { $cond: [{ $not: ['$hasSale'] }, 1, 0] } },
+      } },
+    ]),
   ]);
 
   return {
@@ -288,7 +373,11 @@ const buildInventory = async (scopeMatch, periods) => {
     outOfStockProducts: productBalances[0]?.outOfStockProducts || 0,
     byWarehouse,
     aging: aging[0] || { under30: 0, days31To90: 0, days91To180: 0, over180: 0 },
-    warnings: ['Fast/slow-moving classifications are unavailable without branch-safe stock movement velocity history; ageing uses the latest recorded sale or GRN date.'],
+    movement: movement[0] || {
+      movingProducts: 0, slowMovingProducts: 0, slowMovingQty: 0,
+      nonMovingProducts: 0, nonMovingQty: 0, neverSoldProducts: 0,
+    },
+    warnings: ['Slow/non-moving is measured by days since the last recorded sale (slow: 91–180 days, non-moving: over 180 days or never sold) across products still in stock — not by true sales velocity. Ageing uses the latest recorded sale or GRN date.'],
   };
 };
 
@@ -393,6 +482,14 @@ const buildCrm = async (scopeMatch, periods, user) => {
           { $group: { _id: { $dateToString: { format: '%Y-%m-%d', date: '$createdAt', timezone: DASHBOARD_TIMEZONE } }, count: { $sum: 1 } } },
           { $sort: { _id: 1 } },
         ],
+        // Source mix, all-time within scope so it lines up with the totals block.
+        // customerType is the field that actually carries the acquisition source
+        // (walk_in, google_ads, facebook, instagram, online_enquiry, referral, …);
+        // leadChannel is coarser and leadSource is free text.
+        bySource: [
+          { $group: { _id: { $ifNull: ['$customerType', 'other'] }, count: { $sum: 1 } } },
+          { $sort: { count: -1, _id: 1 } },
+        ],
       } },
     ]) : Promise.resolve([]),
     canReadLeads ? Lead.find(scopeMatch)
@@ -443,6 +540,7 @@ const buildCrm = async (scopeMatch, periods, user) => {
     followupsToday: canReadLeads ? lead.followupsToday?.[0]?.count || 0 : null,
     overdueFollowups: canReadLeads ? lead.overdueFollowups?.[0]?.count || 0 : null,
     leadTrend: canReadLeads ? lead.trend || [] : null,
+    leadsBySource: canReadLeads ? lead.bySource || [] : null,
     recentLeads,
     totalComplaints: canReadComplaints ? complaintTotals.total || 0 : null,
     todayComplaints: canReadComplaints ? complaints.today?.[0]?.count || 0 : null,
@@ -471,6 +569,13 @@ const buildHr = async (scopeMatch, employeeScopeMatch, periods, user) => {
           inactive: { $sum: { $cond: [{ $eq: ['$status', 'Inactive'] }, 1, 0] } },
           onNotice: { $sum: { $cond: [{ $eq: ['$status', 'On Notice'] }, 1, 0] } },
           terminated: { $sum: { $cond: [{ $eq: ['$status', 'Terminated'] }, 1, 0] } },
+          // Still serving probation: an active employee whose probation end date
+          // has not passed yet. Employees with no probationEndDate are excluded.
+          onProbation: { $sum: { $cond: [{ $and: [
+            { $eq: ['$status', 'Active'] },
+            { $ne: ['$probationEndDate', null] },
+            { $gte: ['$probationEndDate', periods.today] },
+          ] }, 1, 0] } },
         } }],
         departments: [{ $group: { _id: { $ifNull: ['$department', 'Unassigned'] }, count: { $sum: 1 } } }, { $sort: { count: -1, _id: 1 } }],
       } },
@@ -504,6 +609,7 @@ const buildHr = async (scopeMatch, employeeScopeMatch, periods, user) => {
     inactiveEmployees: canReadEmployees ? employeeTotals.inactive || 0 : null,
     onNoticeEmployees: canReadEmployees ? employeeTotals.onNotice || 0 : null,
     terminatedEmployees: canReadEmployees ? employeeTotals.terminated || 0 : null,
+    onProbationEmployees: canReadEmployees ? employeeTotals.onProbation || 0 : null,
     departments: canReadEmployees ? employees.departments || [] : null,
     attendanceToday: canReadAttendance ? attendanceRows.reduce((sum, row) => sum + row.count, 0) : null,
     attendanceByStatus: attendanceRows,
@@ -549,14 +655,14 @@ const buildActivity = async (scopeMatch, periods) => {
   };
 };
 
-const buildProfitability = async (scopeMatch, periods) => {
+const buildProfitability = async (scopeMatch, range) => {
   const [sales, returns] = await Promise.all([
     SalesOrder.aggregate([
-      { $match: { ...scopeMatch, status: LIVE_SALES_STATUSES, ...periodMatch('orderDate', periods.monthStart, periods.nextMonthStart) } },
+      { $match: { ...scopeMatch, status: LIVE_SALES_STATUSES, ...periodMatch('orderDate', range.from, range.to) } },
       { $group: { _id: null, grossSales: { $sum: '$grandTotal' }, discounts: { $sum: '$totalDiscount' }, tax: { $sum: '$totalTax' } } },
     ]),
     SalesReturn.aggregate([
-      { $match: { ...scopeMatch, status: { $nin: ['draft', 'cancelled'] }, ...periodMatch('returnDate', periods.monthStart, periods.nextMonthStart) } },
+      { $match: { ...scopeMatch, status: { $nin: ['draft', 'cancelled'] }, ...periodMatch('returnDate', range.from, range.to) } },
       { $group: { _id: null, total: { $sum: '$grandTotal' } } },
     ]),
   ]);
@@ -564,12 +670,20 @@ const buildProfitability = async (scopeMatch, periods) => {
   const salesReturns = returns[0]?.total || 0;
   return {
     available: true,
+    // Echo the window actually used so the UI can label the figures and restore
+    // the selected filter. `to` is reported as the inclusive last day.
+    period: {
+      preset: range.preset,
+      from: dateKey(range.from),
+      to: dateKey(addDays(range.to, -1)),
+    },
     grossSales,
     salesReturns,
     netSales: grossSales - salesReturns,
     discounts: sales[0]?.discounts || 0,
     tax: sales[0]?.tax || 0,
     grossProfit: null,
+    grossProfitPercent: null,
     estimatedNetProfit: null,
     categoryMargin: null,
     productMargin: null,
@@ -597,6 +711,14 @@ export const getDashboardReport = async (req, res) => {
   const scopeMatch = requestedScope === 'all' ? { branch: { $in: branchIds } } : { branch: req.branchId };
   const employeeScopeMatch = requestedScope === 'all' ? { branchId: { $in: branchIds } } : { branchId: req.branchId };
   const periods = getPeriods();
+
+  let profitRange;
+  try {
+    profitRange = resolveProfitRange(periods, req.query);
+  } catch (error) {
+    return res.status(error.status || 400).json({ success: false, message: error.message });
+  }
+
   const tasks = [];
   const queue = (name, permissions, builder) => {
     if (hasAnyPermission(req.user, permissions)) tasks.push(builder().then((value) => ({ name, value })));
@@ -609,7 +731,7 @@ export const getDashboardReport = async (req, res) => {
   queue('crm', SECTION_PERMISSIONS.crm, () => buildCrm(scopeMatch, periods, req.user));
   queue('hr', SECTION_PERMISSIONS.hr, () => buildHr(scopeMatch, employeeScopeMatch, periods, req.user));
   queue('warehouseDelivery', SECTION_PERMISSIONS.warehouseDelivery, () => buildWarehouseDelivery(scopeMatch, periods, req.user));
-  queue('profitability', SECTION_PERMISSIONS.profitability, () => buildProfitability(scopeMatch, periods));
+  queue('profitability', SECTION_PERMISSIONS.profitability, () => buildProfitability(scopeMatch, profitRange));
   queue('activity', SECTION_PERMISSIONS.activity, () => buildActivity(scopeMatch, periods));
 
   const allowedApprovalTypes = Object.entries(APPROVAL_TYPE_PERMISSIONS)
@@ -624,21 +746,14 @@ export const getDashboardReport = async (req, res) => {
     ]).then(([pending, recent]) => ({ name: 'approvals', value: { available: true, pending, recent } })));
   }
 
-  const unavailable = [];
-  if (hasAnyPermission(req.user, SECTION_PERMISSIONS.crm)) {
-    const warning = 'CRM dashboard data is unavailable because Lead and embedded follow-ups have no branch ownership.';
-    unavailable.push({ name: 'crm', value: { available: false, data: null, warnings: [warning] } });
-  }
-  if (hasAnyPermission(req.user, SECTION_PERMISSIONS.hr)) {
-    const warning = 'HR dashboard data is unavailable because Attendance and Leave have no branch ownership and Employee uses a legacy text branch.';
-    unavailable.push({ name: 'hr', value: { available: false, data: null, warnings: [warning] } });
-  }
-  if (hasAnyPermission(req.user, SECTION_PERMISSIONS.activity)) {
-    const warning = 'Recent activity is unavailable because ActivityLog does not store an attributable branch.';
-    unavailable.push({ name: 'activity', value: { available: false, data: null, warnings: [warning] } });
-  }
-
-  const resolved = [...await Promise.all(tasks), ...unavailable];
+  // CRM, HR and Activity used to be force-stubbed as "unavailable" here because
+  // Lead, Attendance, Leave and ActivityLog had no branch field when this report
+  // was first written. They all carry an indexed `branch` now (Employee carries
+  // `branchId`, which is what employeeScopeMatch uses), so the builders above are
+  // correctly branch-scoped and their results are served directly. Legacy rows
+  // saved before branch context existed have no branch and are simply excluded,
+  // which is the safe direction — they are never attributed to the wrong branch.
+  const resolved = await Promise.all(tasks);
   const sections = Object.fromEntries(resolved.map(({ name, value }) => [name, value]));
   const warnings = resolved.flatMap(({ name, value }) => (value.warnings || []).map((message) => ({ section: name, message })));
   const metadata = {

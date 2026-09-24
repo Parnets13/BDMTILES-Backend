@@ -5,8 +5,11 @@ import mongoose from 'mongoose';
  *
  * A single conversation per dealer, addressed to their assigned executive.
  * Messages may optionally be tied to a complaint so support threads stay in
- * context. Delivery is pull-based (the app polls) — no socket infrastructure is
- * assumed.
+ * context.
+ *
+ * Delivery is realtime: a `post('save')` hook broadcasts the message over
+ * socket.io (see services/socketService.js). Clients still refetch on demand, so
+ * a dropped socket degrades to a stale screen rather than a broken one.
  */
 const dealerMessageSchema = new mongoose.Schema(
   {
@@ -44,5 +47,23 @@ const dealerMessageSchema = new mongoose.Schema(
 dealerMessageSchema.index({ dealer: 1, createdAt: -1 });
 dealerMessageSchema.index({ dealer: 1, senderRole: 1, readByDealerAt: 1 });
 dealerMessageSchema.index({ branch: 1, senderRole: 1, readByAdminAt: 1 });
+
+/**
+ * Broadcast the message to everyone watching this thread.
+ *
+ * A model hook rather than an emit inside each route, so none of the three write
+ * paths — dealer app, Sales Executive app, support desk — can forget to notify the
+ * other side. A missed emit is invisible until somebody reports that chat
+ * "sometimes" does not update, which is exactly the failure worth designing out.
+ *
+ * The import is dynamic because socketService imports this model; a static import
+ * here would be a cycle. Delivery is fire-and-forget on purpose — realtime is
+ * best-effort and must never affect whether the message itself was saved.
+ */
+dealerMessageSchema.post('save', function notifyRealtime(doc) {
+  import('../services/socketService.js')
+    .then(({ emitNewMessage }) => emitNewMessage(doc))
+    .catch(() => { /* the message is saved; realtime is the only thing lost */ });
+});
 
 export default mongoose.model('DealerMessage', dealerMessageSchema);
