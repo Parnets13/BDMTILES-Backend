@@ -62,40 +62,59 @@ const toTracking = (order, delivery) => ({
 
 // A website customer can only order stock that is actually available. The reservation in
 // reserveSalesOrderInventory is the real authority (it moves availableQty -> reservedQty
-// under a guard), but its error names only the product. This pre-check reads the same
-// stock key the reservation will target — branch + warehouse + shade + batch — and reports
-// exactly how much is left, so the storefront can tell the customer what to do.
+// under a guard), but its error names only the product. This pre-check mirrors the admin
+// stockMovementService#getStockSummary logic — stock is scoped to the online branch and
+// summed across ALL warehouses, ALL shades, and ALL batches.  It must match
+// onlineAvailability in shopProductRoutes exactly so the storefront, cart, and checkout
+// all agree on how much is left.
 const assertOnlineStockAvailable = async (items, { branchId, session }) => {
-  // Aggregate the cart by stock key first: two lines of the same product must be
-  // checked against their combined quantity, not individually.
+  // Aggregate requested quantities by product (ignore warehouse/shade/batch here —
+  // the storefront never exposes those to the customer).
   const required = new Map();
   for (const item of items) {
-    const key = [item.product, item.warehouse, item.shade || '', item.batch || ''].map(String).join('|');
-    const current = required.get(key);
+    const id = String(item.product);
+    const current = required.get(id);
     if (current) current.quantity += Number(item.quantity || 0);
-    else required.set(key, {
+    else required.set(id, {
       product: item.product,
-      warehouse: item.warehouse,
-      shade: item.shade || '',
-      batch: item.batch || '',
       productName: item.productName || item.productCode || 'item',
       quantity: Number(item.quantity || 0),
     });
   }
 
-  const rows = await Stock.find({
-    branch: branchId,
-    $or: [...required.values()].map(({ product, warehouse, shade, batch }) => ({ product, warehouse, shade, batch })),
-  }).select('product warehouse shade batch availableQty').session(session).lean();
+  const requiredProductIds = [...required.values()].map((v) => v.product);
+  const normalizedIds = requiredProductIds.map((id) =>
+    (typeof id === 'string' && mongoose.isValidObjectId(id))
+      ? new mongoose.Types.ObjectId(id)
+      : id,
+  );
+  const rows = await Stock.aggregate([
+      {
+        $match: {
+          branch: branchId,
+          product: { $in: normalizedIds },
+        },
+      },
+      {
+        $group: {
+          _id: '$product',
+          availableQty: {
+            $sum: {
+              $max: [0, { $ifNull: ['$availableQty', 0] }],
+            },
+          },
+        },
+      },
+    ]).session(session);
 
-  const availableByKey = new Map(rows.map((row) => [
-    [row.product, row.warehouse, row.shade || '', row.batch || ''].map(String).join('|'),
+  const availableByProduct = new Map(rows.map((row) => [
+    String(row._id),
     Number(row.availableQty || 0),
   ]));
 
   const shortfalls = [];
-  for (const [key, need] of required) {
-    const available = availableByKey.get(key) || 0;
+  for (const need of required.values()) {
+    const available = availableByProduct.get(String(need.product)) || 0;
     if (need.quantity - available > QUANTITY_TOLERANCE) {
       shortfalls.push({ productName: need.productName, requested: need.quantity, available: Math.max(0, available) });
     }
@@ -133,8 +152,8 @@ router.post('/', async (req, res) => {
       const branchId = await getOnlineBranchId();
 
       // Validate products are online-visible; the server owns pricing (never trust client rates).
-      const productIds = rawItems.map((i) => i.productId).filter(mongoose.isValidObjectId);
-      const products = await Product.find({ _id: { $in: productIds }, status: 'active', onlineVisible: true })
+      const submittedProductIds = rawItems.map((i) => i.productId).filter(mongoose.isValidObjectId);
+      const products = await Product.find({ _id: { $in: submittedProductIds }, status: 'active', onlineVisible: true })
         .select('_id')
         .session(session)
         .lean();
@@ -168,18 +187,86 @@ router.post('/', async (req, res) => {
       // Online orders never need staff pricing approval; drop any below-minimum flags.
       const orderNumber = await generateBranchNumber(branchId, 'salesOrder', new Date(), { session });
 
-      // Auto-assign the default (first active) warehouse for the online branch to any
-      // item that has no warehouse set — customers don't pick a warehouse.
-      const defaultWarehouse = await Warehouse.findOne({ branch: branchId, status: 'active' })
-        .sort({ type: 1, createdAt: 1 }) // prefer 'main' type first (alphabetically 'main' < 'transit')
+      // Website customers never pick a warehouse, shade, or batch. We need to
+      // assign a concrete stock bucket (warehouse + shade + batch) per item so
+      // the reservation engine `reserveSalesOrderInventory` can move qty from
+      // `availableQty` -> `reservedQty`.  Strategy mirrors admin StockPage:
+      //
+      //   1. Consider every warehouse in the online branch (matches the
+      //      aggregation used by `assertOnlineStockAvailable` above AND by the
+      //      shopProductRoutes `onlineAvailability` helper — so numbers always
+      //      agree between the list/detail/cart/checkout views).
+      //   2. For every product, pick the bucket (warehouse + shade + batch)
+      //      with the largest `availableQty` so reservations prefer full bins.
+      //   3. If a product truly has no bucket with stock anywhere, fall back
+      //      to the earliest-created warehouse with empty shade/batch so the
+      //      final reservation guard still runs and errors properly.
+      const branchWarehouses = await Warehouse.find({ branch: branchId })
+        .sort({ type: 1, createdAt: 1 })
         .select('_id')
         .session(session)
         .lean();
-      if (!defaultWarehouse) {
+      if (!branchWarehouses.length) {
         throw Object.assign(new Error('Online ordering is temporarily unavailable. Please try again later.'), { status: 503 });
       }
+      const fallbackWarehouse = branchWarehouses[0]._id;
+      const productIds = priced.items.map((i) => i.product);
+      const normalizedIds = productIds.map((id) =>
+        (typeof id === 'string' && mongoose.isValidObjectId(id))
+          ? new mongoose.Types.ObjectId(id)
+          : id,
+      );
+      const warehouseIds = branchWarehouses.map((w) => w._id);
+
+      // Rank all buckets (warehouse + shade + batch) by availableQty for the
+      // products in this order, then take the single best bucket per product.
+      const bestBuckets = await Stock.aggregate([
+        {
+          $match: {
+            branch: branchId,
+            warehouse: { $in: warehouseIds },
+            product: { $in: normalizedIds },
+            availableQty: { $gt: 0 },
+          },
+        },
+        { $sort: { availableQty: -1, updatedAt: -1 } },
+        {
+          $group: {
+            _id: '$product',
+            warehouse: { $first: '$warehouse' },
+            shade: { $first: '$shade' },
+            batch: { $first: '$batch' },
+          },
+        },
+      ]).session(session);
+
+      const bucketByProduct = new Map(
+        bestBuckets.map((b) => [
+          String(b._id),
+          {
+            warehouse: b.warehouse,
+            shade: b.shade || '',
+            batch: b.batch || '',
+          },
+        ]),
+      );
+
+      // Apply bucket assignment to each priced item. Explicitly-provided
+      // warehouse/shade/batch (e.g. future features) are never overwritten.
       priced.items.forEach((item) => {
-        if (!item.warehouse) item.warehouse = defaultWarehouse._id;
+        const assigned = bucketByProduct.get(String(item.product));
+        if (assigned) {
+          if (!item.warehouse) item.warehouse = assigned.warehouse;
+          if (!item.shade) item.shade = assigned.shade;
+          if (!item.batch) item.batch = assigned.batch;
+        } else {
+          // No warehouse has stock; reservation step will still surface this.
+          // Use the earliest-created warehouse + empty shade/batch so the
+          // reservation guard runs against a deterministic valid key.
+          if (!item.warehouse) item.warehouse = fallbackWarehouse;
+          if (!item.shade) item.shade = '';
+          if (!item.batch) item.batch = '';
+        }
       });
 
       // A website customer can only buy what is actually on the shelf. Check availability

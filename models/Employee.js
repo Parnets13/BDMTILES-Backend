@@ -1,4 +1,5 @@
 import mongoose from 'mongoose';
+import MasterSequence from './MasterSequence.js';
 
 const employeeSchema = new mongoose.Schema(
   {
@@ -96,14 +97,16 @@ employeeSchema.pre('save', function (next) {
   next();
 });
 
-// Auto-generate empId
+// Auto-generate empId using an atomic sequence counter so concurrent
+// requests can never produce the same value (the old findOne+increment
+// pattern was non-atomic and caused E11000 duplicate key errors).
 employeeSchema.statics.generateEmpId = async function () {
-  const last = await this.findOne().sort({ createdAt: -1 }).select('empId').lean();
-  if (last?.empId) {
-    const num = parseInt(last.empId.replace(/\D/g, '')) || 0;
-    return `EMP${String(num + 1).padStart(4, '0')}`;
-  }
-  return 'EMP0001';
+  const seq = await MasterSequence.findOneAndUpdate(
+    { key: 'empId' },
+    { $inc: { value: 1 } },
+    { upsert: true, new: true },
+  );
+  return `EMP${String(seq.value).padStart(4, '0')}`;
 };
 
 employeeSchema.index({ name: 'text', empId: 'text', mobile: 'text' });

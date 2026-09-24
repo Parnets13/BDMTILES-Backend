@@ -79,7 +79,7 @@ const setSalesOrderDeliveryStatus = async (salesOrderId, branch, _hasDeliverySho
 
 const isPodEvidenceReference = value => {
   if (!value) return false;
-  return /^(https?:\/\/|data:image\/(?:png|jpeg|jpg|webp);base64,|\/?uploads\/)/i.test(value);
+  return /^(https?:\/\/|data:image\/(?:png|jpeg|jpg|webp);base64,|data:text\/plain;base64,|\/?uploads\/)/i.test(value);
 };
 
 const stateConflict = (res, delivery, expected, action) => res.status(409).json({
@@ -97,7 +97,10 @@ router.get('/', async (req, res) => {
       const regex = new RegExp(search, 'i');
       filter.$or = [{ deliveryNumber: regex }, { orderNumber: regex }, { dealerName: regex }, { tripNumber: regex }];
     }
-    if (status) filter.status = status;
+    if (status) {
+      const statuses = String(status).split(',').map(s => s.trim()).filter(Boolean);
+      filter.status = statuses.length === 1 ? statuses[0] : { $in: statuses };
+    }
     if (deliveryExecutive && req.user.role !== 'delivery_executive') filter.deliveryExecutive = deliveryExecutive;
 
     const [deliveries, total] = await Promise.all([
@@ -186,7 +189,7 @@ router.post('/', async (req, res) => {
       dealerCode: tripOrder.dealerCode || salesOrder.dealerCode || '',
       contactPhone: tripOrder.contactPhone || salesOrder.customerPhone || '',
       deliveryAddress: tripOrder.deliveryAddress || salesOrder.deliveryAddress || '',
-      deliveryExecutive: trip.deliveryExecutive || undefined,
+      deliveryExecutive: trip.deliveryExecutive || pickList?.deliveryExecutive || undefined,
       deliveryExecutiveName: trip.deliveryExecutiveName || '',
       totalBoxes: tripOrder.totalBoxes,
       unfulfilledQty,
@@ -243,8 +246,9 @@ router.patch('/:id/reached', async (req, res) => {
     if (delivery.status !== 'in_transit') return stateConflict(res, delivery, 'in_transit', 'mark reached');
     delivery.status = 'reached';
     delivery.reachTime = new Date();
-    const lat = Number(req.body.lat);
-    const lng = Number(req.body.lng);
+    const body = req.body || {};
+    const lat = Number(body.lat);
+    const lng = Number(body.lng);
     if (Number.isFinite(lat) && Number.isFinite(lng)) delivery.deliveryLocation = { lat, lng };
     await delivery.save();
     await syncDispatchTrip(delivery);

@@ -436,6 +436,28 @@ router.patch('/:id/dispatch', async (req, res) => {
       lockedTrip.deliveryExecutive = dispatchVehicle.deliveryExecutive?._id || dispatchVehicle.deliveryExecutive || null;
       lockedTrip.deliveryExecutiveName = dispatchVehicle.deliveryExecutive?.name || '';
 
+      // If the vehicle has no linked delivery executive, fall back to the one
+      // captured on the PickList during loading verification (DriverVehicleModal).
+      // This covers the common case where the vehicle record is not fully set up
+      // in the master but the loading operator selected a driver account directly.
+      if (!lockedTrip.deliveryExecutive) {
+        const pickListIds = lockedTrip.orders.map(o => o.pickList).filter(Boolean);
+        const plWithDE = await PickList.findOne({
+          _id: { $in: pickListIds },
+          branch: req.branchId,
+          deliveryExecutive: { $exists: true, $ne: null },
+        })
+          .select('deliveryExecutive')
+          .populate('deliveryExecutive', 'name')
+          .session(session)
+          .lean();
+        if (plWithDE?.deliveryExecutive) {
+          const de = plWithDE.deliveryExecutive;
+          lockedTrip.deliveryExecutive = de._id || de;
+          lockedTrip.deliveryExecutiveName = de.name || '';
+        }
+      }
+
       // Controlled compatibility path for trips created before PickList references were persisted.
       for (const order of lockedTrip.orders) {
         if (order.pickList) continue;

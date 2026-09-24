@@ -1,5 +1,7 @@
 import { Router } from 'express';
 import mongoose from 'mongoose';
+import path from 'path';
+import { fileURLToPath } from 'url';
 import Product from '../models/Product.js';
 import Stock from '../models/Stock.js';
 import StockMovement from '../models/StockMovement.js';
@@ -9,6 +11,51 @@ import Subcategory from '../models/Subcategory.js';
 import { protect, requirePermission, requireAnyPermission } from '../middleware/auth.js';
 import { uploadProductImages } from '../middleware/upload.js';
 import { normalizeProductUomConfig } from '../services/stockUomService.js';
+import { generateEmbedding } from '../services/imageEmbedding.js';
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname  = path.dirname(__filename);
+const UPLOADS_ROOT = path.join(__dirname, '..', 'uploads');
+
+/**
+ * Resolve a stored image path (e.g. "/uploads/products/xxx.jpg"
+ * or "uploads/products/xxx.jpg") to an absolute filesystem path.
+ */
+function resolveImagePath(imagePath) {
+  if (!imagePath) return null;
+  let clean = imagePath.startsWith('/') ? imagePath.slice(1) : imagePath;
+  if (clean.startsWith('uploads/')) return path.join(__dirname, '..', clean);
+  return path.join(UPLOADS_ROOT, clean);
+}
+
+/**
+ * Fire-and-forget: generate an embedding for the product's first image
+ * and save it to the product document.
+ * Never throws — errors are logged silently so the main save request
+ * is not affected.
+ *
+ * @param {string} productId  MongoDB ObjectId string
+ * @param {string[]} images   Array of image relative paths
+ */
+async function scheduleEmbedding(productId, images) {
+  if (!images || images.length === 0) return;
+  // Run in background — do not await
+  (async () => {
+    try {
+      const imagePath = resolveImagePath(images[0]);
+      if (!imagePath) return;
+      const embedding = await generateEmbedding(imagePath);
+      await Product.findByIdAndUpdate(productId, {
+        imageEmbedding: embedding,
+        imageEmbeddingVersion: 1,
+        imageEmbeddingUpdatedAt: new Date(),
+      });
+      console.log(`[ImageEmbedding] ✅ Indexed product ${productId} (${embedding.length}d)`);
+    } catch (err) {
+      console.error(`[ImageEmbedding] ❌ Failed for product ${productId}:`, err.message);
+    }
+  })();
+}
 
 const router = Router();
 router.use(protect);
@@ -75,6 +122,7 @@ router.get('/', async (req, res) => {
         .populate('brand', 'name')
         .populate('category', 'name')
         .populate('subcategory', 'name')
+        .select('-imageEmbedding') // exclude large vector from list view
         .lean(),
       Product.countDocuments(filter),
     ]);
@@ -159,6 +207,7 @@ router.get('/:id', async (req, res) => {
       .populate('brand', 'name')
       .populate('category', 'name')
       .populate('subcategory', 'name')
+      .select('-imageEmbedding') // exclude heavy vector; status shown via imageEmbeddingUpdatedAt
       .lean();
     if (!product) return res.status(404).json({ success: false, message: 'Product not found.' });
     res.json({ success: true, data: product });
@@ -190,6 +239,10 @@ router.post('/', canCreateProduct, async (req, res) => {
     }
 
     const product = await Product.create(productData);
+
+    // Fire-and-forget: generate image embedding for visual search
+    scheduleEmbedding(String(product._id), product.images);
+
     res.status(201).json({ success: true, message: 'Product created.', data: product });
   } catch (error) {
     if (error.code === 11000) return res.status(400).json({ success: false, message: 'Product code already exists.' });
@@ -225,6 +278,15 @@ router.put('/:id', canUpdateProduct, async (req, res) => {
       .populate('category', 'name')
       .populate('subcategory', 'name');
     if (!product) return res.status(404).json({ success: false, message: 'Product not found.' });
+
+    // Fire-and-forget: re-generate embedding if images changed
+    const prevImages = existing.images || [];
+    const newImages  = product.images  || [];
+    const imagesChanged = newImages[0] !== prevImages[0];
+    if (imagesChanged || (newImages.length > 0 && !product.imageEmbedding?.length)) {
+      scheduleEmbedding(String(product._id), newImages);
+    }
+
     res.json({ success: true, message: 'Product updated.', data: product });
   } catch (error) {
     if (error.code === 11000) return res.status(400).json({ success: false, message: 'Product code already exists.' });

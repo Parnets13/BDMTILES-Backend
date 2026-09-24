@@ -2,10 +2,12 @@ import { Router } from 'express';
 import mongoose from 'mongoose';
 import Product from '../../models/Product.js';
 import Stock from '../../models/Stock.js';
-import Warehouse from '../../models/Warehouse.js';
 import Category from '../../models/Category.js';
 import Brand from '../../models/Brand.js';
 import { getOnlineBranchId } from '../../utils/onlineBranch.js';
+import { upload } from '../../middleware/upload.js';
+import { generateEmbedding, findSimilarProducts } from '../../services/imageEmbedding.js';
+import fs from 'fs/promises';
 
 const router = Router();
 
@@ -29,13 +31,15 @@ const ONLY_ONLINE = { status: 'active', onlineVisible: true };
 /**
  * How much of each product the storefront may actually sell.
  *
- * Checkout reserves against exactly one stock key: the online branch's default
- * warehouse, with no shade or batch, because a customer never picks either.
- * Summing every stock row would advertise shade- or batch-held stock nobody can
- * buy, so the cart would accept a quantity the order endpoint then rejects.
+ * Mirrors the AUTHORITATIVE admin `getStockSummary` / `listStocks` pattern
+ * (see services/stockMovementService.js lines 297-397): stock is scoped ONLY to
+ * the online branch, then summed across EVERY warehouse, every shade, and
+ * every batch in that branch.  The old code restricted lookups to a single
+ * `Warehouse.findOne({...})` bucket, which silently dropped stock held in any
+ * non-default warehouse and made SKUs look out of stock despite the admin panel
+ * clearly showing them as available.
  *
- * Returned for lists as well as the single product, so a listing page and the
- * cart can cap the quantity instead of discovering the limit at checkout.
+ * Returns a Map<productId, availableQtyNumber>.  A missing key means zero.
  * Availability is best-effort: a lookup failure must never hide the catalogue.
  */
 const onlineAvailability = async (productIds) => {
@@ -43,22 +47,37 @@ const onlineAvailability = async (productIds) => {
   if (!productIds?.length) return byProduct;
   try {
     const branchId = await getOnlineBranchId();
-    const warehouse = await Warehouse.findOne({ branch: branchId, status: 'active' })
-      .sort({ type: 1, createdAt: 1 })
-      .select('_id')
-      .lean();
-    if (!warehouse) return byProduct;
-    const rows = await Stock.find({
-      branch: branchId,
-      warehouse: warehouse._id,
-      shade: '',
-      batch: '',
-      product: { $in: productIds },
-    }).select('product availableQty').lean();
+    const normalizedIds = productIds.map((id) =>
+      (typeof id === 'string' && mongoose.isValidObjectId(id))
+        ? new mongoose.Types.ObjectId(id)
+        : id,
+    );
+    // Match the admin stock summary: branch-scoped and summed across every
+    // warehouse/shade/batch bucket. `availableQty` already excludes reserved,
+    // quoted, blocked, damaged, and otherwise unavailable quantities.
+    const rows = await Stock.aggregate([
+      {
+        $match: {
+          branch: branchId,
+          product: { $in: normalizedIds },
+        },
+      },
+      {
+        $group: {
+          _id: '$product',
+          availableQty: {
+            $sum: {
+              $max: [0, { $ifNull: ['$availableQty', 0] }],
+            },
+          },
+        },
+      },
+    ]);
     for (const row of rows) {
-      byProduct.set(String(row.product), Math.max(0, Number(row.availableQty || 0)));
+      byProduct.set(String(row._id), Math.max(0, Number(row.availableQty || 0)));
     }
-  } catch {
+  } catch (err) {
+    console.error('[shopProductRoutes] onlineAvailability failed:', err.message);
     // Leave the map empty; callers fall back to zero.
   }
   return byProduct;
@@ -309,6 +328,130 @@ router.get('/:id', async (req, res) => {
       data: { ...toPublic(product), availableQty, inStock: availableQty > 0 },
     });
   } catch (error) {
+    return res.status(500).json({ success: false, message: error.message });
+  }
+});
+
+// POST /api/v1/shop/products/search-by-image — visual product search
+// Accepts an uploaded image, generates embedding, finds similar products
+router.post('/search-by-image', (req, res, next) => {
+  // Use multer as a callback so we can return proper JSON on upload errors
+  upload.single('image')(req, res, (err) => {
+    if (err) {
+      console.error('[ImageSearch] Upload error:', err.message);
+      return res.status(400).json({ success: false, message: err.message });
+    }
+    next();
+  });
+}, async (req, res) => {
+  try {
+    // Validate image upload
+    if (!req.file) {
+      console.error('[ImageSearch] No file received. Content-Type:', req.headers['content-type']);
+      console.error('[ImageSearch] Body keys:', Object.keys(req.body || {}));
+      return res.status(400).json({ 
+        success: false, 
+        message: 'No image provided. Send a multipart/form-data request with field name "image".' 
+      });
+    }
+
+    console.log('[ImageSearch] File received:', req.file.originalname, req.file.size, 'bytes', req.file.mimetype);
+
+    // Generate embedding from uploaded image
+    let queryEmbedding;
+    try {
+      queryEmbedding = await generateEmbedding(req.file.path);
+      console.log('[ImageSearch] Generated embedding with', queryEmbedding.length, 'dimensions');
+    } catch (embeddingError) {
+      console.error('[ImageSearch] Embedding generation failed:', embeddingError);
+      // Clean up uploaded file
+      try {
+        await fs.unlink(req.file.path);
+      } catch {}
+      return res.status(500).json({ 
+        success: false, 
+        message: 'Failed to process image. Please try a different image.' 
+      });
+    }
+
+    // Find products with embeddings (only online visible products)
+    const productsWithEmbeddings = await Product.find({
+      ...ONLY_ONLINE,
+      imageEmbedding: { $exists: true, $ne: null, $not: { $size: 0 } },
+    })
+      .select('_id imageEmbedding')
+      .lean();
+
+    console.log('[ImageSearch] Found', productsWithEmbeddings.length, 'products with embeddings');
+
+    if (productsWithEmbeddings.length === 0) {
+      // Clean up uploaded file
+      try {
+        await fs.unlink(req.file.path);
+      } catch {}
+      return res.json({
+        success: true,
+        data: [],
+        message: 'No indexed products available for visual search yet.',
+        pagination: { currentPage: 1, totalPages: 1, totalItems: 0, itemsPerPage: 20 },
+      });
+    }
+
+    // Calculate similarity scores
+    const similarProducts = findSimilarProducts(
+      queryEmbedding,
+      productsWithEmbeddings.map(p => ({
+        id: String(p._id),
+        embedding: p.imageEmbedding,
+      })),
+      20 // Top 20 results
+    );
+
+    console.log('[ImageSearch] Top match similarity:', similarProducts[0]?.similarity || 0);
+
+    // Fetch full product details for top matches
+    const productIds = similarProducts.map(p => new mongoose.Types.ObjectId(p.id));
+    const products = await Product.find({ _id: { $in: productIds } })
+      .select(PUBLIC_PRODUCT_FIELDS)
+      .populate('brand', 'name')
+      .populate('category', 'name')
+      .populate('subcategory', 'name')
+      .lean();
+
+    // Create a map for quick lookup and preserve similarity order
+    const productMap = new Map(products.map(p => [String(p._id), p]));
+    const orderedProducts = similarProducts
+      .map(sp => productMap.get(sp.id))
+      .filter(p => p); // Filter out any missing products
+
+    // Add availability info
+    const results = await withAvailability(orderedProducts.map(toPublic));
+
+    // Clean up uploaded file
+    try {
+      await fs.unlink(req.file.path);
+    } catch (cleanupError) {
+      console.warn('[ImageSearch] Failed to cleanup uploaded file:', cleanupError);
+    }
+
+    return res.json({
+      success: true,
+      data: results,
+      pagination: {
+        currentPage: 1,
+        totalPages: 1,
+        totalItems: results.length,
+        itemsPerPage: 20,
+      },
+    });
+  } catch (error) {
+    console.error('[ImageSearch] Search failed:', error);
+    // Clean up uploaded file on error
+    if (req.file?.path) {
+      try {
+        await fs.unlink(req.file.path);
+      } catch {}
+    }
     return res.status(500).json({ success: false, message: error.message });
   }
 });

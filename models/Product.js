@@ -83,6 +83,11 @@ const productSchema = new mongoose.Schema(
     images360: [String],        // 360-degree image URLs
     cataloguePdf: { type: String, default: '' }, // catalogue PDF URL
 
+    // Image embedding for visual search (1000-dim MobileNetV2-12 ONNX features, L2-normalised)
+    imageEmbedding: { type: [Number], default: null },
+    imageEmbeddingVersion: { type: Number, default: 1 }, // bump when model changes to trigger re-index
+    imageEmbeddingUpdatedAt: { type: Date, default: null },
+
     // Flags
     status: { type: String, enum: ['active', 'inactive', 'draft'], default: 'active' },
     isNewArrival: { type: Boolean, default: false },
@@ -114,6 +119,8 @@ const productSchema = new mongoose.Schema(
 productSchema.index({ itemName: 'text', productCode: 'text', aliasName: 'text' });
 productSchema.index({ brand: 1, category: 1, subcategory: 1 });
 productSchema.index({ status: 1 });
+// Index for visual search - products with embeddings
+productSchema.index({ imageEmbedding: 1, status: 1, onlineVisible: 1 });
 
 // Auto-calculate maxPurchaseRate before save
 productSchema.pre('save', function (next) {

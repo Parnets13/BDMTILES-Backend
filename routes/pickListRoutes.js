@@ -1,11 +1,13 @@
 import { Router } from 'express';
 import mongoose from 'mongoose';
 import PickList from '../models/PickList.js';
+import DispatchTrip from '../models/DispatchTrip.js';
 import SalesOrder from '../models/SalesOrder.js';
 import { applyStockMovement, stockOperationKey } from '../services/stockMovementService.js';
 import { stableUomSnapshot } from '../services/stockUomService.js';
 import User from '../models/User.js';
 import Vehicle from '../models/Vehicle.js';
+import Delivery from '../models/Delivery.js';
 import { ROLE_DEFAULT_PERMISSIONS } from '../config/permissions.js';
 import { protect, requirePermission, requireAnyPermission } from '../middleware/auth.js';
 import { requireBranch } from '../utils/branchScope.js';
@@ -806,9 +808,144 @@ router.patch('/:id/verify-loading', async (req, res) => {
       if (req.body.vehicleType) claimed.vehicleType = req.body.vehicleType;
       if (req.body.driverName) claimed.driverName = req.body.driverName;
       if (req.body.driverPhone) claimed.driverPhone = req.body.driverPhone;
+
+      // If no deliveryExecutive ObjectId was sent (manual mode), try to resolve
+      // one by matching the typed driverPhone or driverName against User accounts
+      // in this branch that have the delivery_executive role.
+      if (!claimed.deliveryExecutive && (req.body.driverPhone || req.body.driverName)) {
+        const query = { role: 'delivery_executive' };
+        if (req.body.driverPhone) {
+          query.phone = req.body.driverPhone.trim();
+        } else {
+          query.name = new RegExp(`^${req.body.driverName.trim()}$`, 'i');
+        }
+        const matchedUser = await User.findOne(query).select('_id name').session(session).lean();
+        if (matchedUser) {
+          claimed.deliveryExecutive = matchedUser._id;
+          console.log(`[verify-loading] Resolved deliveryExecutive from driverPhone/Name: ${matchedUser.name}`);
+        }
+      }
       
       claimed.loadingVerificationProcessing = false;
       await claimed.save({ session });
+
+      // Propagate driver/vehicle selection to the linked DispatchTrip so that
+      // when the trip is dispatched the Delivery document inherits the correct
+      // deliveryExecutive. This is the source that deliveryRoutes reads for
+      // role-based filtering — without this the driver cannot see their deliveries.
+      if (claimed.dispatchTrip && (req.body.deliveryExecutive || req.body.vehicleNumber)) {
+        const tripUpdate = {};
+        if (req.body.deliveryExecutive) {
+          tripUpdate.deliveryExecutive = req.body.deliveryExecutive;
+          // Resolve the name so the denormalised field stays consistent
+          const deUser = await User.findById(req.body.deliveryExecutive)
+            .select('name')
+            .session(session)
+            .lean();
+          tripUpdate.deliveryExecutiveName = deUser?.name || req.body.driverName || '';
+        }
+        if (req.body.vehicleNumber) tripUpdate.vehicleNumber = req.body.vehicleNumber;
+        if (req.body.vehicleType)   tripUpdate.vehicleType   = req.body.vehicleType;
+        if (req.body.driverName)    tripUpdate.driverName    = req.body.driverName;
+        if (req.body.driverPhone)   tripUpdate.driverPhone   = req.body.driverPhone;
+        await DispatchTrip.updateOne(
+          { _id: claimed.dispatchTrip, branch: req.branchId },
+          { $set: tripUpdate },
+          { session }
+        );
+
+        // If the trip was already dispatched before loading verification ran
+        // (edge case: re-entry after partial dispatch), update the Delivery
+        // document directly so the driver's role-based filter works immediately
+        // without waiting for a re-dispatch.
+        if (tripUpdate.deliveryExecutive) {
+          const deliveryUpdate = {
+            deliveryExecutive: tripUpdate.deliveryExecutive,
+            deliveryExecutiveName: tripUpdate.deliveryExecutiveName || '',
+          };
+          if (tripUpdate.vehicleNumber) deliveryUpdate.vehicleNumber = tripUpdate.vehicleNumber;
+          if (tripUpdate.vehicleType)   deliveryUpdate.vehicleType   = tripUpdate.vehicleType;
+          if (tripUpdate.driverName)    deliveryUpdate.driverName    = tripUpdate.driverName;
+          if (tripUpdate.driverPhone)   deliveryUpdate.driverPhone   = tripUpdate.driverPhone;
+          await Delivery.updateMany(
+            {
+              branch: req.branchId,
+              dispatchTrip: claimed.dispatchTrip,
+              // Only update deliveries that haven't been completed yet
+              status: { $nin: ['delivered', 'partially_delivered', 'failed'] },
+            },
+            { $set: deliveryUpdate },
+            { session }
+          );
+        }
+      }
+
+      // Auto-create a Delivery document immediately when:
+      //  • the PickList has a deliveryExecutive assigned, AND
+      //  • it has no dispatchTrip (no web trip was created yet)
+      // This lets the driver see the order in the Delivery tab right away
+      // without waiting for the web admin to create and dispatch a trip.
+      if (claimed.deliveryExecutive && !claimed.dispatchTrip) {
+        const existingDel = await Delivery.findOne({
+          salesOrder: claimed.salesOrder,
+          branch: claimed.branch,
+        }).session(session).lean();
+
+        if (!existingDel && claimed.salesOrder) {
+          const so = await SalesOrder.findById(claimed.salesOrder)
+            .select('orderNumber dealer dealerName dealerCode customerName customerPhone deliveryAddress')
+            .session(session)
+            .lean();
+
+          if (so) {
+            // Resolve driver name for the denormalised field
+            let deUser = null;
+            if (claimed.deliveryExecutive) {
+              deUser = await User.findById(claimed.deliveryExecutive)
+                .select('name')
+                .session(session)
+                .lean();
+            }
+
+            const deliveryNumber = await generateBranchNumber(
+              claimed.branch,
+              'delivery',
+              new Date(),
+              { session },
+            );
+
+            await Delivery.create([{
+              deliveryNumber,
+              branch: claimed.branch,
+              salesOrder: claimed.salesOrder,
+              orderNumber: so.orderNumber,
+              dealer: so.dealer || undefined,
+              dealerName: so.dealerName || so.customerName || '',
+              dealerCode: so.dealerCode || '',
+              contactPhone: so.customerPhone || '',
+              deliveryAddress: so.deliveryAddress || '',
+              deliveryExecutive: claimed.deliveryExecutive,
+              deliveryExecutiveName: deUser?.name || claimed.driverName || '',
+              vehicleNumber: claimed.vehicleNumber || '',
+              vehicleType: claimed.vehicleType || '',
+              driverName: claimed.driverName || '',
+              driverPhone: claimed.driverPhone || '',
+              totalBoxes: claimed.totalBoxes || 0,
+              unfulfilledQty: 0,
+              hasFulfillmentShortage: false,
+              items: [],
+              itemReconciliationState: 'legacy',
+              otp: String(Math.floor(100000 + Math.random() * 900000)),
+              status: 'assigned',
+              startTime: new Date(),
+              createdBy: req.user._id,
+            }], { session });
+
+            console.log(`[verify-loading] Auto-created Delivery ${deliveryNumber} for ${claimed.pickListNumber} → ${deUser?.name}`);
+          }
+        }
+      }
+
       loaded = claimed;
     });
     return res.json({
