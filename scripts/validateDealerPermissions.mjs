@@ -10,6 +10,7 @@
  *
  * Exits non-zero on the first failing group so a pipeline stops.
  */
+import { readdirSync, readFileSync } from 'node:fs';
 import {
   ALL_DEALER_PERMISSIONS,
   DEALER_AVAILABLE_PERMISSIONS,
@@ -299,6 +300,76 @@ check(
     triggerEventForDealer('product', 'monthly'),
   ],
   ['monthly_sales', 'order_created', 'collection_target', 'target_achieved'],
+);
+
+// ── Route gating and enforcement ─────────────────────────────────────────────
+// Both of these were real defects found by hand, so they are asserted from now on:
+//
+//   * /notifications was the only route in the dealer-app router with no gate. An
+//     employee with no payments grant could read invoice balances, ledger credits
+//     and credit-note amounts straight out of its body text.
+//   * catalogue.priceView / catalogue.stockView were stored, offered in the
+//     permission editor and granted by presets, but read by nothing — so unticking
+//     them changed nothing at all.
+//
+// A route definition and a permission id are both just text, so a scan is the right
+// level for this: it catches the defect where it is actually made.
+section('Every dealer-app route is permission gated');
+
+const ROUTE_FILES = ['dealerAppRoutes.js', 'dealerEmployeeRoutes.js', 'dealerTargetRoutes.js'];
+const GATE = /requireDealerPermission|requireAnyDealerPermission|requireDealerOwner/;
+const ROUTE_DEF = /^router\.(get|post|put|patch|delete)\(/;
+
+const ungated = [];
+for (const file of ROUTE_FILES) {
+  const source = readFileSync(new URL(`../routes/${file}`, import.meta.url), 'utf8');
+  source.split('\n').forEach((line, index) => {
+    if (ROUTE_DEF.test(line) && !GATE.test(line)) ungated.push(`${file}:${index + 1}`);
+  });
+}
+check('no dealer-app route is reachable without a permission', ungated, []);
+
+section('Every catalogued permission is enforced, or declared reserved');
+
+// The enforcement layer: a permission that no route, service or middleware reads
+// cannot change any behaviour, however carefully it is described in the editor.
+const enforcementFiles = [];
+const collect = (dir) => {
+  for (const entry of readdirSync(new URL(`../${dir}/`, import.meta.url), { withFileTypes: true })) {
+    if (entry.isDirectory()) collect(`${dir}/${entry.name}`);
+    else if (entry.name.endsWith('.js')) enforcementFiles.push(`${dir}/${entry.name}`);
+  }
+};
+['routes', 'services', 'middleware'].forEach(collect);
+const enforcementText = enforcementFiles
+  .map((file) => readFileSync(new URL(`../${file}`, import.meta.url), 'utf8'))
+  .join('\n');
+
+// Read by a pure helper rather than a route gate, so it never appears in the
+// enforcement directories. dealerOrderScope is the only one today.
+const HELPER_CONSUMED = new Set(['orders.viewAll']);
+
+// Known and deliberately NOT yet fixed. Each is offered in the editor and granted
+// by at least one preset, but nothing implements it — exactly the defect
+// catalogue.priceView had. Listed explicitly so a NEW one fails this check rather
+// than quietly joining a pile, and so implementing one forces this list to shrink.
+//
+// `reports.sales` is absent only because the id is shared with the staff catalog
+// and so appears in routes/reportRoutes.js; it is likewise unimplemented for
+// dealers. The scan cannot see that difference, which is why it is called out here.
+const KNOWN_UNENFORCED = new Set(['orders.edit', 'reports.view', 'reports.collection']);
+
+const unenforced = ALL_DEALER_PERMISSIONS.filter((id) =>
+  !DEALER_RESERVED_PERMISSION_IDS.includes(id)
+  && !HELPER_CONSUMED.has(id)
+  && !KNOWN_UNENFORCED.has(id)
+  && !enforcementText.includes(`'${id}'`),
+);
+check('no permission is offered without something enforcing it', unenforced, []);
+check(
+  'the known-unenforced list has not gone stale',
+  [...KNOWN_UNENFORCED].filter((id) => enforcementText.includes(`'${id}'`)),
+  [],
 );
 
 // ── Report ──────────────────────────────────────────────────────────────────

@@ -6,7 +6,15 @@ import Category from '../../models/Category.js';
 import Brand from '../../models/Brand.js';
 import { getOnlineBranchId } from '../../utils/onlineBranch.js';
 import { upload } from '../../middleware/upload.js';
-import { generateEmbedding, findSimilarProducts } from '../../services/imageEmbedding.js';
+// imageEmbedding service is optional (requires onnxruntime-node package)
+let generateEmbedding = null, findSimilarProducts = null;
+try {
+  const module = await import('../../services/imageEmbedding.js');
+  generateEmbedding = module.generateEmbedding;
+  findSimilarProducts = module.findSimilarProducts;
+} catch (err) {
+  console.warn('[shopProductRoutes] imageEmbedding service unavailable:', err.message);
+}
 import fs from 'fs/promises';
 
 const router = Router();

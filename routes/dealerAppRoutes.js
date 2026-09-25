@@ -10,6 +10,13 @@ import Quotation from '../models/Quotation.js';
 import DealerOrderRequest from '../models/DealerOrderRequest.js';
 import DealerScheme from '../models/DealerScheme.js';
 import Delivery from '../models/Delivery.js';
+// Picking and loading happen UPSTREAM of a Delivery — the row is not created until the
+// pick list is `loaded` — so the dealer-facing stage needs both of these to say anything
+// about an order before it is on a vehicle.
+import PickList from '../models/PickList.js';
+import DispatchTrip from '../models/DispatchTrip.js';
+import {resolveStage, stageLabel} from '../utils/deliveryStage.js';
+import {findDealerPickLists, stagesByOrder, findDealerPickListDetail} from '../services/dealerFulfilmentService.js';
 import Payment from '../models/Payment.js';
 import SalesReturn from '../models/SalesReturn.js';
 import Gift from '../models/Gift.js';
@@ -38,14 +45,17 @@ const router = Router();
 router.use(protectDealer);
 
 /**
- * Whether the calling principal may see finance data guarded by `permission`.
+ * Whether the calling principal holds `permission`.
  *
- * The dealer account owner always may. An employee may only when the dealer
- * granted the matching permission — and `req.dealerPrincipal.permissions` has
- * already had sensitive finance ids stripped when BDMTILES disabled finance
- * delegation for this dealer, so that policy is honoured here for free.
+ * The dealer account owner always does. An employee does only when the dealer
+ * granted it — and `req.dealerPrincipal.permissions` has already had sensitive
+ * finance ids stripped when BDMTILES disabled finance delegation for this dealer,
+ * so that policy is honoured here for free.
  */
-const canSeeFinance = (req, permission) => dealerPrincipalHasPermission(req.dealerPrincipal, permission);
+const canSee = (req, permission) => dealerPrincipalHasPermission(req.dealerPrincipal, permission);
+
+/** Finance call sites read better under their own name. Same check. */
+const canSeeFinance = canSee;
 
 /** True when the caller may see nothing at all from the finance block. */
 const isFinanceBlind = (req) =>
@@ -89,6 +99,32 @@ const mrpSaving = (mrp, rate) => {
     discountPercent: Math.round(((listPrice - yourPrice) / listPrice) * 100),
     savingPerUnit: money(listPrice - yourPrice),
   };
+};
+
+/**
+ * Remove the catalogue fields the caller was not granted.
+ *
+ * `catalogue.priceView` and `catalogue.stockView` are separate grants, so the rate
+ * block and the quantity are removed independently — a dealer can let an employee
+ * see what is in stock without letting them see what it costs. Until this existed
+ * both permissions were stored but read by nothing, so unticking "Price View"
+ * changed nothing and the employee still saw rates.
+ *
+ * Keys are DELETED rather than set to null: `dealerRate: null` still tells the app
+ * that a rate exists and renders as "free", which is worse than the field being
+ * absent. A missing field is the honest signal, and the app hides the control.
+ */
+const shapeCatalogueItem = (item, { showPrice, showStock }) => {
+  const shaped = { ...item };
+  if (!showPrice) {
+    delete shaped.dealerRate;
+    delete shaped.mrp;
+    delete shaped.discountPercent;
+    delete shaped.savingPerUnit;
+    delete shaped.pricing;
+  }
+  if (!showStock) delete shaped.availableQty;
+  return shaped;
 };
 const appError = (status, message) => Object.assign(new Error(message), { status });
 const sendError = (res, error) => res
@@ -339,6 +375,10 @@ router.get('/catalogue', requireDealerPermission('catalogue.view'), async (req, 
     ]) : [];
     const stockByProduct = new Map(stockRows.map(r => [String(r._id), r.availableQty]));
 
+    // Two independent grants, applied to every row below.
+    const showPrice = canSee(req, 'catalogue.priceView');
+    const showStock = canSee(req, 'catalogue.stockView');
+
     const data = await Promise.all(products.map(async (product) => {
       let rate = null;
       try {
@@ -346,10 +386,17 @@ router.get('/catalogue', requireDealerPermission('catalogue.view'), async (req, 
           const priced = await resolvePricing({
             branchId: branch, dealerId: dealer._id, product, quantity: 1, pricingDate: new Date(),
           });
-          rate = { effectiveRate: money(priced.effectiveRate), baseRate: money(priced.baseRate), rateField: priced.rateField };
+          // For catalogue: show pricingRate (base + dealer pricing override, but NOT discount mapping)
+          // Discount mapping is only applied in cart
+          rate = { 
+            catalogueRate: money(priced.pricingRate),  // Base rate before discount mapping
+            effectiveRate: money(priced.effectiveRate), // Full discounted rate (for cart)
+            baseRate: money(priced.baseRate), 
+            rateField: priced.rateField 
+          };
         }
       } catch { /* pricing is best-effort in the catalogue list */ }
-      return {
+      return shapeCatalogueItem({
         _id: product._id,
         productCode: product.productCode,
         itemName: product.itemName,
@@ -362,10 +409,11 @@ router.get('/catalogue', requireDealerPermission('catalogue.view'), async (req, 
         piecesPerBox: product.piecesPerBox || 0,
         sqftPerBox: product.sqftPerBox || 0,
         image: product.images?.[0] || '',
-        dealerRate: rate?.effectiveRate ?? null,
-        ...mrpSaving(product.mrp, rate?.effectiveRate ?? null),
+        dealerRate: rate?.catalogueRate ?? null,  // Show pricingRate in catalogue, NOT effectiveRate
+        effectiveRate: rate?.effectiveRate ?? null,  // For cart calculations (with discount mapping)
+        ...mrpSaving(product.mrp, rate?.catalogueRate ?? null),
         availableQty: Number(stockByProduct.get(String(product._id)) || 0),
-      };
+      }, { showPrice, showStock });
     }));
 
     res.json({ success: true, data, pagination: { currentPage: p, totalPages: Math.ceil(total / l), totalItems: total } });
@@ -423,16 +471,25 @@ router.get('/catalogue/:id', requireDealerPermission('catalogue.view'), async (r
       .populate('brand', 'name').populate('category', 'name').populate('subcategory', 'name').lean();
     if (!product) throw appError(404, 'Product not found.');
 
+    // Two independent grants — see shapeCatalogueItem.
+    const showPrice = canSee(req, 'catalogue.priceView');
+    const showStock = canSee(req, 'catalogue.stockView');
+
     let pricing = null;
     let availableQty = 0;
     if (branch) {
       try {
         const priced = await resolvePricing({ branchId: branch, dealerId: dealer._id, product, quantity: 1, pricingDate: new Date() });
+        // For catalogue detail: show pricingRate (before discount mapping)
+        // Discount mapping only applies in cart
+        const catalogueRate = money(priced.pricingRate);
         pricing = {
-          effectiveRate: money(priced.effectiveRate),
+          dealerRate: catalogueRate,  // For backward compatibility with app
+          catalogueRate,  // Show this rate in product detail
+          effectiveRate: money(priced.effectiveRate), // Full discounted rate (for cart reference)
           baseRate: money(priced.baseRate),
           rateField: priced.rateField,
-          ...mrpSaving(product.mrp, priced.effectiveRate),
+          ...mrpSaving(product.mrp, priced.pricingRate), // Calculate MRP saving against pricingRate
         };
       } catch { /* ignore */ }
       const stockRows = await Stock.aggregate([
@@ -444,7 +501,7 @@ router.get('/catalogue/:id', requireDealerPermission('catalogue.view'), async (r
 
     res.json({
       success: true,
-      data: {
+      data: shapeCatalogueItem({
         _id: product._id,
         productCode: product.productCode,
         itemName: product.itemName,
@@ -468,7 +525,7 @@ router.get('/catalogue/:id', requireDealerPermission('catalogue.view'), async (r
         images360: product.images360 || [],
         pricing,
         availableQty,
-      },
+      }, { showPrice, showStock }),
     });
   } catch (error) { sendError(res, error); }
 });
@@ -934,9 +991,14 @@ router.get('/orders', requireDealerPermission('orders.view'), async (req, res) =
       ]),
     ]);
 
+    // An order being picked or already packed still reads as "approved" — SalesOrder has
+    // no status between approved and dispatched. Annotating the row is what makes
+    // "packed" visible on the order itself, which is where a dealer looks for it.
+    const stageByOrder = await stagesByOrder(req.dealer._id, data.map(o => o._id));
+
     res.json({
       success: true,
-      data,
+      data: data.map(o => ({...o, fulfilment: stageByOrder.get(String(o._id)) || null})),
       scope,
       summary: {
         orderCount: agg[0]?.count || 0,
@@ -965,12 +1027,17 @@ router.get('/orders/:id', requireDealerPermission('orders.view'), async (req, re
     ]) : [];
     const stockByProduct = new Map(stockRows.map(r => [String(r._id), r.availableQty]));
 
+    const stageByOrder = await stagesByOrder(req.dealer._id, [order._id]);
+
     res.json({
       success: true,
       data: {
         orderNumber: order.orderNumber,
         orderDate: order.orderDate,
         status: order.status,
+        // Null when nothing is being picked yet — the caller should leave `status`
+        // alone rather than inventing a stage.
+        fulfilment: stageByOrder.get(String(order._id)) || null,
         paymentStatus: order.paymentStatus,
         deliveryAddress: order.deliveryAddress,
         expectedDeliveryDate: order.expectedDeliveryDate,
@@ -1183,13 +1250,26 @@ router.get('/schemes', requireDealerPermission('schemes.view'), async (req, res)
 // ── Notifications feed (17.7) ────────────────────────────────────────────────
 // Synthesized from the dealer's own domain events (no dealer-recipient store
 // exists yet). Categories: order, dispatch, invoice, payment, scheme, offer.
+//
+// Each source is read ONLY when the caller holds the permission that would let
+// them open the matching screen. Without that, this feed was a side door: an
+// employee with no payments grant could read invoice balances, ledger credits and
+// credit-note amounts, which every other screen redacts. Skipping the QUERY — not
+// blanking the text afterwards — is what keeps those numbers out of memory.
 // GET /api/v1/dealer-app/notifications
-router.get('/notifications', async (req, res) => {
+router.get('/notifications', requireDealerPermission('dashboard.view'), async (req, res) => {
   try {
     const dealer = req.dealer;
     const branch = await resolveDealerBranch(dealer);
     const now = new Date();
     const items = [];
+
+    const showOrders = canSee(req, 'orders.view');
+    // Invoices, ledger credits and credit notes are all money.
+    const showMoney = canSee(req, 'payments.view');
+    const showSchemes = canSee(req, 'schemes.view');
+    const showDeliveries = canSee(req, 'deliveries.view');
+    const showArrivals = canSee(req, 'catalogue.view');
 
     const [
       recentOrders,
@@ -1199,31 +1279,37 @@ router.get('/notifications', async (req, res) => {
       recentDeliveries,
       recentCreditNotes,
       newArrivals,
+      // Orders still in the warehouse. Without this the feed could only ever talk about
+      // rows that already exist as deliveries, so an order that was picked, packed or
+      // loaded produced no entry at all — which is why "notification not showing" and
+      // "packed order not appearing" turned out to be the same bug.
+      warehousePickLists,
     ] = await Promise.all([
-      SalesOrder.find({ dealer: dealer._id, status: { $nin: ['draft'] } })
-        .select('orderNumber orderDate status updatedAt grandTotal').sort({ updatedAt: -1 }).limit(10).lean(),
-      Invoice.find({ dealer: dealer._id, status: { $ne: 'cancelled' } })
-        .select('invoiceNumber invoiceDate dueDate grandTotal balanceAmount paymentStatus').sort({ invoiceDate: -1 }).limit(10).lean(),
-      DealerLedger.find({ dealer: dealer._id, credit: { $gt: 0 } })
-        .select('referenceNumber entryDate credit description').sort({ entryDate: -1 }).limit(6).lean(),
-      branch ? DealerScheme.find({
+      showOrders ? SalesOrder.find({ dealer: dealer._id, status: { $nin: ['draft'] } })
+        .select('orderNumber orderDate status updatedAt grandTotal').sort({ updatedAt: -1 }).limit(10).lean() : [],
+      showMoney ? Invoice.find({ dealer: dealer._id, status: { $ne: 'cancelled' } })
+        .select('invoiceNumber invoiceDate dueDate grandTotal balanceAmount paymentStatus').sort({ invoiceDate: -1 }).limit(10).lean() : [],
+      showMoney ? DealerLedger.find({ dealer: dealer._id, credit: { $gt: 0 } })
+        .select('referenceNumber entryDate credit description').sort({ entryDate: -1 }).limit(6).lean() : [],
+      showSchemes && branch ? DealerScheme.find({
         branch, status: 'active', endDate: { $gte: now, $lte: new Date(now.getTime() + 14 * 86400000) },
         $or: [{ applicableTo: 'all' }, { dealers: dealer._id }],
-      }).select('schemeName endDate').limit(6).lean() : Promise.resolve([]),
+      }).select('schemeName endDate').limit(6).lean() : [],
       // Dispatch + delivery updates (17.7)
-      Delivery.find({ dealer: dealer._id })
+      showDeliveries ? Delivery.find({ dealer: dealer._id })
         .select('deliveryNumber deliveryDate status orderNumber startTime completionTime updatedAt')
-        .sort({ updatedAt: -1 }).limit(10).lean(),
+        .sort({ updatedAt: -1 }).limit(10).lean() : [],
       // Credit note generated (17.7)
-      SalesReturn.find({ dealer: dealer._id, creditNoteNumber: { $nin: [null, ''] } })
+      showMoney ? SalesReturn.find({ dealer: dealer._id, creditNoteNumber: { $nin: [null, ''] } })
         .select('creditNoteNumber creditNoteDate grandTotal returnDate')
-        .sort({ creditNoteDate: -1 }).limit(6).lean(),
+        .sort({ creditNoteDate: -1 }).limit(6).lean() : [],
       // New arrivals (17.7) — dealer-visible products added in the last 30 days
-      Product.find({
+      showArrivals ? Product.find({
         status: 'active',
         dealerVisible: { $ne: false },
         createdAt: { $gte: new Date(now.getTime() - 30 * 86400000) },
-      }).select('itemName productCode createdAt brand').sort({ createdAt: -1 }).limit(6).lean(),
+      }).select('itemName productCode createdAt brand').sort({ createdAt: -1 }).limit(6).lean() : [],
+      showDeliveries ? findDealerPickLists(dealer._id, {limit: 10, includeLoaded: true}) : [],
     ]);
 
     for (const o of recentOrders) {
@@ -1278,6 +1364,28 @@ router.get('/notifications', async (req, res) => {
           : `Status: ${readable}${d.orderNumber ? ` · ${d.orderNumber}` : ''}.`,
         date: d.completionTime || d.startTime || d.updatedAt || d.deliveryDate,
         deliveryId: d._id,
+      });
+    }
+
+    // Warehouse updates. These have no delivery to point at — that is the whole reason
+    // they were missing — so they carry the order number instead.
+    for (const p of warehousePickLists) {
+      const picked =
+        p.totalRequestedQty > 0
+          ? ` ${p.totalPickedQty} of ${p.totalRequestedQty} picked.`
+          : '';
+      items.push({
+        id: `picklist-${p._id}`,
+        type: 'dispatch',
+        title: `${p.stageLabel} — ${p.orderNumber || p.pickListNumber}`,
+        body:
+          p.stage === 'picking'
+            ? `Your order is being picked in the warehouse.${picked}`
+            : p.stage === 'packing'
+            ? 'Your order is packed and being made ready for dispatch.'
+            : 'Your order is loaded on the vehicle and waiting to leave.',
+        date: p.since,
+        orderNumber: p.orderNumber || '',
       });
     }
 
@@ -1524,18 +1632,41 @@ router.get('/deliveries', requireDealerPermission('deliveries.view'), async (req
 
     const [data, total] = await Promise.all([
       Delivery.find(filter).sort({ deliveryDate: -1 }).skip((p - 1) * l).limit(l)
-        .select('deliveryNumber deliveryDate status orderNumber invoiceNumber tripNumber deliveryExecutiveName items completionTime otp otpVerified vehicleNumber')
+        .select('deliveryNumber deliveryDate status orderNumber invoiceNumber tripNumber dispatchTrip deliveryExecutiveName items completionTime otp otpVerified vehicleNumber')
         .lean(),
       Delivery.countDocuments(filter),
     ]);
 
-    res.json({
-      success: true,
-      data: data.map(d => ({
+    // Resolve the upstream stage for the whole page in two queries rather than two per
+    // delivery. The pick lists come off the delivery's own item lineage, so this stays
+    // scoped to rows the dealer is already allowed to see — it cannot leak another
+    // dealer's order through a shared pick list.
+    const pickIds = [...new Set(data.flatMap(d => (d.items || []).map(i => i.pickList).filter(Boolean).map(String)))];
+    const tripIds = [...new Set(data.map(d => d.dispatchTrip).filter(Boolean).map(String))];
+    const [picks, trips] = await Promise.all([
+      pickIds.length ? PickList.find({_id: {$in: pickIds}}).select('status').lean() : [],
+      tripIds.length ? DispatchTrip.find({_id: {$in: tripIds}}).select('status').lean() : [],
+    ]);
+    const pickById = new Map(picks.map(x => [String(x._id), x.status]));
+    const tripById = new Map(trips.map(x => [String(x._id), x.status]));
+
+    const deliveries = data.map(d => {
+      const pickStatus = (d.items || []).map(i => pickById.get(String(i.pickList))).find(Boolean) || '';
+      const tripStatus = tripById.get(String(d.dispatchTrip)) || '';
+      const stage = resolveStage({
+        pickListStatus: pickStatus,
+        tripStatus,
+        deliveryStatus: d.status,
+      });
+      return {
         _id: d._id,
         deliveryNumber: d.deliveryNumber,
         deliveryDate: d.deliveryDate,
         status: d.status,
+        // What the dealer is shown. `status` stays as the delivery's own state for
+        // anything that keys off it.
+        stage,
+        stageLabel: stageLabel(stage),
         orderNumber: d.orderNumber || '',
         invoiceNumber: d.invoiceNumber || '',
         itemCount: (d.items || []).length,
@@ -1544,8 +1675,55 @@ router.get('/deliveries', requireDealerPermission('deliveries.view'), async (req
         vehicleNumber: d.vehicleNumber || '',
         otp: handoverOtp(d),
         otpVerified: Boolean(d.otpVerified),
-      })),
-      pagination: { currentPage: p, totalPages: Math.ceil(total / l), totalItems: total },
+        preDispatch: false,
+      };
+    });
+
+    // Orders still in the warehouse have no Delivery row, so however far along they had
+    // got they were invisible here — a packed order simply did not appear. They go on
+    // top of page 1: they are the most recent thing happening to the dealer's orders,
+    // and the app only ever requests page 1.
+    const preDispatch =
+      p === 1
+        ? (await findDealerPickLists(req.dealer._id, {limit: 10})).map(row => ({
+            _id: row._id,
+            // No delivery number exists yet, so the order number is what the dealer
+            // actually recognises; the pick list number is the fallback.
+            deliveryNumber: row.orderNumber || row.pickListNumber,
+            deliveryDate: row.since,
+            status: row.status,
+            stage: row.stage,
+            stageLabel: row.stageLabel,
+            orderNumber: row.orderNumber,
+            invoiceNumber: '',
+            itemCount: row.itemCount,
+            deliveryExecutiveName: '',
+            completionTime: null,
+            vehicleNumber: '',
+            otp: '',
+            otpVerified: false,
+            // Lets the app tell a not-yet-dispatched order from a real delivery, so it
+            // never offers a handover OTP for goods still in the warehouse.
+            preDispatch: true,
+          }))
+        : [];
+
+    // Merged by date rather than simply concatenated. Both halves arrive date-sorted
+    // from their own query, but concatenating put every warehouse row above every
+    // delivery regardless of age — a two-week-old packed order sat above a delivery
+    // that went out this morning.
+    const combined = [...preDispatch, ...deliveries].sort(
+      (a, b) => new Date(b.deliveryDate || 0) - new Date(a.deliveryDate || 0),
+    );
+
+    res.json({
+      success: true,
+      data: combined,
+      pagination: {
+        currentPage: p,
+        totalPages: Math.ceil((total + preDispatch.length) / l),
+        totalItems: total + preDispatch.length,
+      },
     });
   } catch (error) { sendError(res, error); }
 });
@@ -1554,17 +1732,64 @@ router.get('/deliveries', requireDealerPermission('deliveries.view'), async (req
 router.get('/deliveries/:id', requireDealerPermission('deliveries.view'), async (req, res) => {
   try {
     const d = await Delivery.findOne({ _id: req.params.id, dealer: req.dealer._id })
-      .select('deliveryNumber deliveryDate status orderNumber invoiceNumber tripNumber deliveryAddress contactPhone deliveryExecutiveName items podImage podSignature podDocumentUrl receiverName startTime reachTime completionTime deliveryRemarks failureReason failureRemarks rescheduleDate otp otpVerified otpVerifiedAt vehicleNumber vehicleType driverName driverPhone')
+      .select('deliveryNumber deliveryDate status orderNumber invoiceNumber tripNumber dispatchTrip deliveryAddress contactPhone deliveryExecutiveName items podImage podSignature podDocumentUrl receiverName startTime reachTime completionTime deliveryRemarks failureReason failureRemarks rescheduleDate otp otpVerified otpVerifiedAt vehicleNumber vehicleType driverName driverPhone')
       .populate('items.product', 'itemName productCode unit')
       .lean();
-    if (!d) throw appError(404, 'Delivery not found.');
+    if (!d) {
+      // The deliveries list also carries rows for orders still in the warehouse, whose
+      // `_id` is a PickList rather than a Delivery. The lookup above only searches
+      // Delivery, so without this branch every one of those rows opened straight to
+      // "Delivery not found".
+      const preDispatch = await findDealerPickListDetail(req.dealer._id, req.params.id);
+      if (!preDispatch) throw appError(404, 'Delivery not found.');
+      return res.json({success: true, data: preDispatch});
+    }
 
-    // Tracking timeline built from the real timestamps the delivery flow records.
+    // Picking and loading happen BEFORE this Delivery exists — the row is created when
+    // the pick list reaches `loaded` — so the upstream timestamps have to be read back
+    // off the pick list and the trip. Without this the timeline began at "Assigned" and
+    // made it look as though nothing at all had happened to the order until then.
+    const pickIds = [...new Set((d.items || []).map(i => i.pickList).filter(Boolean).map(String))];
+    const [picks, trip] = await Promise.all([
+      pickIds.length
+        ? PickList.find({_id: {$in: pickIds}})
+            .select('status pickDate assignedAt pickingStartTime sortingStartTime packingEndTime loadingEndTime')
+            .sort({pickDate: 1})
+            .lean()
+        : [],
+      d.dispatchTrip
+        ? DispatchTrip.findById(d.dispatchTrip)
+            .select('status loadingStartTime dispatchTime')
+            .lean()
+        : null,
+    ]);
+
+    // One delivery can span several pick lists, so each warehouse step takes the
+    // EARLIEST matching timestamp — the point at which that stage began for the order as
+    // a whole, not one pick list's arbitrary timing.
+    const earliest = (key) =>
+      picks.map(x => x[key]).filter(Boolean).sort((a, b) => new Date(a) - new Date(b))[0] || null;
+    // Loading is the one step where the LAST pick list matters: the order is only fully
+    // loaded once the final one is.
+    const latest = (key) =>
+      picks.map(x => x[key]).filter(Boolean).sort((a, b) => new Date(b) - new Date(a))[0] || null;
+
+    const stage = resolveStage({
+      pickListStatus: picks[0]?.status || '',
+      tripStatus: trip?.status || '',
+      deliveryStatus: d.status,
+    });
+
+    // Built from the real timestamps the flow records. A step with no timestamp stays
+    // pending rather than claiming to be done.
     const timeline = [
-      { key: 'assigned', label: 'Assigned', at: d.deliveryDate || null },
-      { key: 'in_transit', label: 'In transit', at: d.startTime || null },
-      { key: 'reached', label: 'Reached location', at: d.reachTime || null },
-      { key: 'delivered', label: 'Delivered', at: d.completionTime || null },
+      {key: 'picking', label: 'Picking', at: earliest('pickingStartTime') || earliest('assignedAt') || earliest('pickDate')},
+      {key: 'packing', label: 'Packing', at: earliest('sortingStartTime') || earliest('packingEndTime')},
+      {key: 'loading', label: 'Loading', at: trip?.loadingStartTime || latest('loadingEndTime')},
+      {key: 'assigned', label: 'Assigned', at: d.deliveryDate || null},
+      {key: 'in_transit', label: 'In transit', at: d.startTime || trip?.dispatchTime || null},
+      {key: 'reached', label: 'Reached location', at: d.reachTime || null},
+      {key: 'delivered', label: 'Delivered', at: d.completionTime || null},
     ];
 
     res.json({
@@ -1574,6 +1799,11 @@ router.get('/deliveries/:id', requireDealerPermission('deliveries.view'), async 
         deliveryDate: d.deliveryDate,
         completionTime: d.completionTime || null,
         status: d.status,
+        // What the dealer is shown. The raw warehouse statuses are deliberately NOT
+        // exposed — collapsing them is the point, and "sorted" is not the dealer's
+        // business.
+        stage,
+        stageLabel: stageLabel(stage),
         orderNumber: d.orderNumber || '',
         invoiceNumber: d.invoiceNumber || '',
         tripNumber: d.tripNumber || '',
@@ -1741,6 +1971,9 @@ router.get('/catalogue/:id/similar', requireDealerPermission('catalogue.view'), 
       products = [...products, ...extra];
     }
 
+    const showPrice = canSee(req, 'catalogue.priceView');
+    const showStock = canSee(req, 'catalogue.stockView');
+
     const data = await Promise.all(products.map(async (product) => {
       let rate = null;
       try {
@@ -1748,10 +1981,11 @@ router.get('/catalogue/:id/similar', requireDealerPermission('catalogue.view'), 
           const priced = await resolvePricing({
             branchId: branch, dealerId: dealer._id, product, quantity: 1, pricingDate: new Date(),
           });
-          rate = money(priced.effectiveRate);
+          // For related products: show pricingRate (before discount mapping)
+          rate = money(priced.pricingRate);
         }
       } catch { /* pricing is best-effort here */ }
-      return {
+      return shapeCatalogueItem({
         _id: product._id,
         productCode: product.productCode,
         itemName: product.itemName,
@@ -1762,7 +1996,7 @@ router.get('/catalogue/:id/similar', requireDealerPermission('catalogue.view'), 
         image: product.images?.[0] || '',
         dealerRate: rate,
         ...mrpSaving(product.mrp, rate),
-      };
+      }, { showPrice, showStock });
     }));
 
     res.json({ success: true, data });

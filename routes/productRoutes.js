@@ -11,7 +11,14 @@ import Subcategory from '../models/Subcategory.js';
 import { protect, requirePermission, requireAnyPermission } from '../middleware/auth.js';
 import { uploadProductImages } from '../middleware/upload.js';
 import { normalizeProductUomConfig } from '../services/stockUomService.js';
-import { generateEmbedding } from '../services/imageEmbedding.js';
+// imageEmbedding service is optional (requires onnxruntime-node package)
+let generateEmbedding = null;
+try {
+  const module = await import('../services/imageEmbedding.js');
+  generateEmbedding = module.generateEmbedding;
+} catch (err) {
+  console.warn('[productRoutes] imageEmbedding service unavailable:', err.message);
+}
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname  = path.dirname(__filename);

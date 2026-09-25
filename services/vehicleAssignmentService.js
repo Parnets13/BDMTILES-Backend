@@ -1,6 +1,7 @@
 import mongoose from 'mongoose';
 import Vehicle from '../models/Vehicle.js';
 import DispatchTrip from '../models/DispatchTrip.js';
+import {userCanAccessBranch} from '../utils/branchScope.js';
 
 /**
  * Resolving a vehicle for a dispatch assignment.
@@ -24,6 +25,23 @@ const startOfToday = () => {
   const now = new Date();
   now.setHours(0, 0, 0, 0);
   return now;
+};
+
+/**
+ * Whether the vehicle's linked executive may operate in this branch.
+ *
+ * Uses the same rule as the rest of the system — `userCanAccessBranch`, which honours
+ * the global roles — and additionally accepts `defaultBranch`.
+ *
+ * The previous check read `assignedBranches` alone. That rejected an executive whose
+ * profile carries only a default branch, even though `dealerAssignmentService` treats
+ * exactly that as their branch, so the app accepted them everywhere except here.
+ */
+const executiveCoversBranch = (executive, branchId) => {
+  if (!branchId) return true;
+  if (userCanAccessBranch(executive, branchId)) return true;
+  const own = String(executive.defaultBranch?._id || executive.defaultBranch || '');
+  return Boolean(own) && own === String(branchId);
 };
 
 const expiryProblems = (vehicle) => {
@@ -113,11 +131,30 @@ export async function resolveVehicleForAssignment({
 
   if (vehicle.deliveryExecutive) {
     const executive = vehicle.deliveryExecutive;
-    const belongsToBranch = !branchId || (executive.assignedBranches || []).some(id => String(id) === String(branchId));
-    if (executive.role !== 'delivery_executive' || executive.status !== 'Active' || !belongsToBranch) {
+    const who = executive.name ? ` (${executive.name})` : '';
+
+    // Reported one at a time, naming the value that actually failed. The previous
+    // message listed three possible causes without saying which had tripped, so acting
+    // on it meant opening Vehicle Master, opening the executive's profile and comparing
+    // three fields by hand — for a check the server had already made.
+    if (executive.status !== 'Active') {
       throw conflict(
         409,
-        `${vehicle.vehicleNumber}'s linked Delivery Executive is inactive, has the wrong role, or is not assigned to the active branch. Update Vehicle Master before assigning it.`,
+        `${vehicle.vehicleNumber}'s linked Delivery Executive${who} is marked "${executive.status || 'Inactive'}" in User Master. Reactivate the account, or clear the executive on the vehicle.`,
+        'VEHICLE_EXECUTIVE_UNAVAILABLE',
+      );
+    }
+    if (executive.role !== 'delivery_executive') {
+      throw conflict(
+        409,
+        `${vehicle.vehicleNumber}'s linked executive${who} has the role "${executive.role || 'none'}", not Delivery Executive. Change the role, or clear the executive on the vehicle.`,
+        'VEHICLE_EXECUTIVE_UNAVAILABLE',
+      );
+    }
+    if (!executiveCoversBranch(executive, branchId)) {
+      throw conflict(
+        409,
+        `${vehicle.vehicleNumber}'s linked executive${who} is not assigned to the active branch. Add this branch to their profile, or clear the executive on the vehicle.`,
         'VEHICLE_EXECUTIVE_UNAVAILABLE',
       );
     }

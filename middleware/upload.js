@@ -125,3 +125,13 @@ export const uploadCandidateResume = multer({
   fileFilter: resumeFileFilter,
   limits: { fileSize: 10 * 1024 * 1024 }, // 10MB
 }).single('resume');
+
+// Generic upload middleware for temporary uploads (e.g., visual search)
+const tempUploadDirectory = path.join(uploadRoot, 'temp');
+fs.mkdirSync(tempUploadDirectory, { recursive: true });
+
+export const upload = multer({
+  storage: storageFor(tempUploadDirectory),
+  fileFilter,
+  limits: { fileSize: 5 * 1024 * 1024 }, // 5MB
+});
