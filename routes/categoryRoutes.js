@@ -49,10 +49,10 @@ router.get('/brands', async (req, res) => {
 // POST create brand
 router.post('/brands', async (req, res) => {
   try {
-    const { name, description } = req.body;
+    const { name, description, image } = req.body;
     if (!name?.trim()) return res.status(400).json({ success: false, message: 'Brand name is required.' });
 
-    const brand = await Brand.create({ name: name.trim(), description, createdBy: req.user._id });
+    const brand = await Brand.create({ name: name.trim(), description, image, createdBy: req.user._id });
     res.status(201).json({ success: true, message: 'Brand created.', data: brand });
   } catch (error) {
     if (error.code === 11000) return res.status(400).json({ success: false, message: 'Brand already exists.' });
