@@ -164,7 +164,7 @@ router.get('/', async (req, res) => {
     const limit = Math.min(100, Math.max(1, parseInt(req.query.limit, 10) || 24));
     const filter = { ...ONLY_ONLINE };
 
-    const { search, category, categoryName, subcategory, brand, tileSize, finish, surface, thickness, tileType, colour, applicationArea } = req.query;
+    const { search, category, categoryName, subcategory, brand, tileSize, finish, surface, thickness, tileType, colour, applicationArea, minPrice, maxPrice, minRating, dealOnly } = req.query;
     const escapeRegex = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 
     if (search) {
@@ -245,8 +245,15 @@ router.get('/', async (req, res) => {
     if (tileType) filter.tileType = String(tileType);
     if (colour) filter.colour = new RegExp(`^${String(colour)}$`, 'i');
     if (applicationArea) filter.applicationArea = new RegExp(String(applicationArea), 'i');
+    if (Number.isFinite(Number(minRating)) && Number(minRating) > 0) filter.rating = { $gte: Number(minRating) };
+    if (dealOnly === 'true') filter.isDealOfWeek = true;
+    const priceConditions = [];
+    const effectivePrice = { $cond: [{ $gt: [{ $ifNull: ['$mrp', 0] }, 0] }, '$mrp', '$retailRate'] };
+    if (Number.isFinite(Number(minPrice)) && Number(minPrice) >= 0) priceConditions.push({ $gte: [effectivePrice, Number(minPrice)] });
+    if (Number.isFinite(Number(maxPrice)) && Number(maxPrice) >= 0) priceConditions.push({ $lte: [effectivePrice, Number(maxPrice)] });
+    if (priceConditions.length) filter.$expr = { $and: priceConditions };
 
-    const sortField = ['itemName', 'retailRate', 'mrp', 'createdAt'].includes(req.query.sortBy) ? req.query.sortBy : 'createdAt';
+    const sortField = ['itemName', 'retailRate', 'mrp', 'createdAt', 'rating'].includes(req.query.sortBy) ? req.query.sortBy : 'createdAt';
     const sortOrder = req.query.order === 'asc' ? 1 : -1;
 
     const [items, totalItems] = await Promise.all([
