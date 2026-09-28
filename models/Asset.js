@@ -11,6 +11,41 @@ const maintenanceLogSchema = new mongoose.Schema({
   remarks:     { type: String, trim: true, default: '' },
 }, { _id: true, timestamps: false });
 
+/**
+ * Append-only custody and condition trail for an asset. The asset document holds
+ * only its *current* assignment, so without this there is no way to answer "who
+ * had this before?" or "what has this employee ever held?". Each entry records
+ * the before and after state so the history reads as a sequence of changes.
+ */
+const assetMovementSchema = new mongoose.Schema({
+  type: {
+    type: String,
+    enum: ['assigned', 'returned', 'transferred', 'damaged', 'repaired', 'status_change', 'disposed', 'lost'],
+    required: true,
+  },
+  date: { type: Date, required: true, default: Date.now },
+
+  fromEmployee:     { type: mongoose.Schema.Types.ObjectId, ref: 'Employee' },
+  fromEmployeeName: { type: String, trim: true, default: '' },
+  toEmployee:       { type: mongoose.Schema.Types.ObjectId, ref: 'Employee' },
+  toEmployeeName:   { type: String, trim: true, default: '' },
+
+  fromLocation:   { type: String, trim: true, default: '' },
+  toLocation:     { type: String, trim: true, default: '' },
+  fromDepartment: { type: String, trim: true, default: '' },
+  toDepartment:   { type: String, trim: true, default: '' },
+
+  statusBefore:    { type: String, default: '' },
+  statusAfter:     { type: String, default: '' },
+  conditionBefore: { type: String, default: '' },
+  conditionAfter:  { type: String, default: '' },
+
+  reason:         { type: String, trim: true, default: '' },
+  remarks:        { type: String, trim: true, default: '' },
+  recordedBy:     { type: mongoose.Schema.Types.ObjectId, ref: 'User' },
+  recordedByName: { type: String, trim: true, default: '' },
+}, { _id: true, timestamps: false });
+
 const assetSchema = new mongoose.Schema(
   {
     // ── Identification ──────────────────────────────────────────
@@ -70,6 +105,9 @@ const assetSchema = new mongoose.Schema(
     lastMaintenanceDate: { type: Date },
     nextMaintenanceDue:  { type: Date },
 
+    // ── Custody / condition trail (assign, return, transfer, damage) ──
+    movements: [assetMovementSchema],
+
     // ── Miscellaneous ─────────────────────────────────────────────
     notes:     { type: String, trim: true, default: '' },
     imageUrl:  { type: String, trim: true, default: '' },
@@ -84,5 +122,9 @@ assetSchema.index({ status: 1 });
 assetSchema.index({ category: 1 });
 assetSchema.index({ assignedTo: 1 });
 assetSchema.index({ nextMaintenanceDue: 1 });
+// Custody history lookups: "what has this employee ever held?" scans movements
+// by employee on both sides of a handover, newest first.
+assetSchema.index({ 'movements.toEmployee': 1, 'movements.date': -1 });
+assetSchema.index({ 'movements.fromEmployee': 1, 'movements.date': -1 });
 
 export default mongoose.model('Asset', assetSchema);

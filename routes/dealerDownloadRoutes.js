@@ -12,6 +12,13 @@ import { streamInvoicePdf, streamReceiptPdf } from '../services/dealerPdfService
  * device's browser / PDF viewer, which cannot attach an Authorization header.
  * Authorisation instead comes from a short-lived token that is bound to one
  * dealer AND one document, minted by an authenticated endpoint.
+ *
+ * Permission-wise this is a two-step chain: the mint endpoint
+ * (`POST /dealer-app/invoices/:id/download-link`) requires `payments.view`, so an
+ * employee the dealer has not granted that cannot obtain a token in the first
+ * place. Revoking the permission does not retroactively kill a token already
+ * minted, which is accepted: the token is bound to this dealer and this one
+ * document, and expires in 5 minutes.
  */
 const router = Router();
 

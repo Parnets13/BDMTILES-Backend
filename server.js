@@ -8,6 +8,9 @@ import connectDB from './config/db.js';
 import errorHandler from './middleware/errorHandler.js';
 import authRoutes from './routes/authRoutes.js';
 import dealerAuthRoutes from './routes/dealerAuthRoutes.js';
+import dealerEmployeeRoutes from './routes/dealerEmployeeRoutes.js';
+import dealerTargetRoutes from './routes/dealerTargetRoutes.js';
+import dealerEmployeeTargetRoutes from './routes/dealerEmployeeTargetRoutes.js';
 import dealerAppRoutes from './routes/dealerAppRoutes.js';
 import dealerDownloadRoutes from './routes/dealerDownloadRoutes.js';
 import shopRoutes from './routes/shop/index.js';
@@ -19,6 +22,8 @@ import productRoutes from './routes/productRoutes.js';
 import masterRoutes from './routes/masterRoutes.js';
 import salesOrderRoutes from './routes/salesOrderRoutes.js';
 import hrmsRoutes from './routes/hrmsRoutes.js';
+import recruitmentRoutes from './routes/recruitmentRoutes.js';
+import hrTemplateRoutes from './routes/hrTemplateRoutes.js';
 import purchaseRoutes from './routes/purchaseRoutes.js';
 import salesReturnRoutes from './routes/salesReturnRoutes.js';
 import paymentRoutes from './routes/paymentRoutes.js';
@@ -68,6 +73,7 @@ import dealerOrderRequestRoutes from './routes/dealerOrderRequestRoutes.js';
 import attendanceRoutes from './routes/attendanceRoutes.js';
 import { startReservationExpiryScheduler } from './services/reservationExpiryScheduler.js';
 import { startQuotationHoldExpiryScheduler } from './services/quotationHoldExpiryScheduler.js';
+import { initSocket, getSocket } from './services/socketService.js';
 
 const app = express();
 const allowedOrigins = String(process.env.FRONTEND_URL || 'http://localhost:5173')
@@ -126,6 +132,10 @@ app.use('/api/v1/web-management', webManagementRoutes); // storefront CMS (staff
 app.use('/api/v1/wallets', walletRoutes); // customer BDM Cash wallet management
 app.use('/api/v1/auth', authRoutes);
 app.use('/api/v1/dealer-app/auth', dealerAuthRoutes);
+// Team management must be mounted before the generic dealer-app router, otherwise
+// '/employees/...' falls through to it and 404s.
+app.use('/api/v1/dealer-app/employees', dealerEmployeeRoutes);
+app.use('/api/v1/dealer-app/targets', dealerTargetRoutes);
 app.use('/api/v1/dealer-app', dealerAppRoutes);
 // Token-authorised PDF downloads (opened by the device viewer, not the app itself).
 app.use('/api/v1/dealer-downloads', dealerDownloadRoutes);
@@ -134,8 +144,13 @@ app.use('/api/v1/category-setup', categoryRoutes);
 app.use('/api/v1/products', productRoutes);
 app.use('/api/v1/masters/branches', branchRoutes);
 app.use('/api/v1/masters', masterRoutes);
+// Staff view of the targets dealers set for their own employees. Separate prefix
+// from /masters so the dealer-scoped sub-resource does not have to live under it.
+app.use('/api/v1/dealer-employee-targets', dealerEmployeeTargetRoutes);
 app.use('/api/v1/sales-orders', salesOrderRoutes);
 app.use('/api/v1/hrms', hrmsRoutes);
+app.use('/api/v1/recruitment', recruitmentRoutes);
+app.use('/api/v1/hr-templates', hrTemplateRoutes);
 app.use('/api/v1/purchase', purchaseRoutes);
 app.use('/api/v1/sales-returns', salesReturnRoutes);
 app.use('/api/v1/payments', paymentRoutes);
@@ -209,6 +224,10 @@ const start = async () => {
   httpServer = app.listen(PORT, HOST, () => {
     console.log(`\n🚀 BDMTILES Backend | http://${HOST}:${PORT} | ${process.env.NODE_ENV || 'development'}\n`);
   });
+  // Realtime chat rides on the same HTTP server: one port, one CORS allow-list,
+  // and no extra deployment surface. `allowedOrigins` is passed rather than
+  // re-read so the socket and REST layers cannot drift on CORS.
+  initSocket(httpServer, { allowedOrigins });
   return httpServer;
 };
 
@@ -220,6 +239,13 @@ const shutdown = async signal => {
     reservationExpiryScheduler?.stop(),
     quotationHoldExpiryScheduler?.stop(),
   ]);
+  // socket.io holds open connections that httpServer.close() alone will not
+  // release, so a graceful shutdown would otherwise hang.
+  await new Promise((resolve) => {
+    const socket = getSocket();
+    if (!socket) return resolve();
+    return socket.close(resolve);
+  });
   if (httpServer?.listening) await new Promise(resolve => httpServer.close(resolve));
   await mongoose.disconnect();
 };

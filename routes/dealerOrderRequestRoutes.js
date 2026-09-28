@@ -27,6 +27,7 @@ router.use(protect);
 router.use(requireBranch);
 
 // Keep in sync with the `status` enum on models/DealerOrderRequest.js.
+const VALID_SHORTFALL_STATUSES = new Set(['none', 'awaiting_dealer', 'needs_reconfirmation', 'accepted', 'rejected', 'closed']);
 const VALID_STATUSES = new Set([
   'submitted',
   'approved',
@@ -91,6 +92,29 @@ async function listRequests(req, res, ownerOnly) {
     }
     if (req.query.dealer) filter.dealer = req.query.dealer;
     if (req.query.salesExecutive && !ownerOnly) filter.salesExecutive = req.query.salesExecutive;
+    if (req.query.shortfallStatus) {
+      if (!VALID_SHORTFALL_STATUSES.has(req.query.shortfallStatus)) throw routeError(422, 'Invalid shortfall status.');
+      filter.shortfallStatus = req.query.shortfallStatus;
+    }
+    if (req.query.dateFrom || req.query.dateTo) {
+      const submittedAt = {};
+      if (req.query.dateFrom) {
+        const from = new Date(req.query.dateFrom);
+        if (Number.isNaN(from.getTime())) throw routeError(422, 'dateFrom is invalid.');
+        from.setHours(0, 0, 0, 0);
+        submittedAt.$gte = from;
+      }
+      if (req.query.dateTo) {
+        const to = new Date(req.query.dateTo);
+        if (Number.isNaN(to.getTime())) throw routeError(422, 'dateTo is invalid.');
+        to.setHours(23, 59, 59, 999);
+        submittedAt.$lte = to;
+      }
+      filter.submittedAt = submittedAt;
+    }
+    // Requests staff have adjusted since the dealer submitted them.
+    if (req.query.edited === 'true') filter['editHistory.0'] = { $exists: true };
+    if (req.query.edited === 'false') filter['editHistory.0'] = { $exists: false };
     if (req.query.search && String(req.query.search).trim()) {
       const regex = new RegExp(escapeRegex(String(req.query.search).trim()), 'i');
       filter.$or = [

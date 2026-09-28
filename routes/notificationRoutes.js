@@ -6,6 +6,7 @@ import NotificationSettings from '../models/NotificationSettings.js';
 import { protect, requirePermission } from '../middleware/auth.js';
 import { requireBranch } from '../utils/branchScope.js';
 import { createNotificationEvent } from '../services/notificationService.js';
+import { channelCapabilities } from '../services/systemCapabilityService.js';
 
 const router = Router();
 const TEMPLATE_WRITE_FIELDS = [
@@ -83,6 +84,14 @@ router.patch('/inbox/:id/read', async (req, res) => {
   } catch (error) {
     return res.status(500).json({ success: false, message: error.message });
   }
+});
+
+// Which channels can actually be delivered. Served to anyone who can read their
+// own inbox, because the settings and template screens both need to warn that
+// selecting WhatsApp/SMS/push stores a preference but sends nothing. Derived from
+// the dispatcher's own behaviour so the UI cannot claim more than the code does.
+router.get('/channel-capabilities', requirePermission('notification.inbox'), (req, res) => {
+  res.json({ success: true, data: channelCapabilities() });
 });
 
 // All remaining controls are owner-only.

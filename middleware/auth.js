@@ -2,13 +2,11 @@ import { verifyToken } from '../utils/jwt.js';
 import User from '../models/User.js';
 import Branch from '../models/Branch.js';
 import { resolveBranchContext } from '../utils/branchScope.js';
-import { ROLE_DEFAULT_PERMISSIONS } from '../config/permissions.js';
+import { PERMISSION_ALIASES, ROLE_DEFAULT_PERMISSIONS } from '../config/permissions.js';
 
-const LEGACY_PERMISSION_ALIASES = {
-  'lead.management': ['lead.view', 'lead.create', 'lead.update', 'lead.assign', 'lead.app', 'lead.respond', 'lead.followup', 'lead.convert', 'lead.delete'],
-  'cheque.management': ['cheque.view', 'cheque.create', 'cheque.deposit', 'cheque.clear', 'cheque.bounce', 'cheque.return'],
-  'delivery.management': ['delivery.view', 'delivery.execute', 'delivery.verify', 'delivery.complete', 'delivery.fail'],
-};
+// Single source of truth lives in config/permissions.js so the backend, the
+// frontend and the permissions-config endpoint cannot drift apart.
+const LEGACY_PERMISSION_ALIASES = PERMISSION_ALIASES;
 
 const tokenFromRequest = (req) => {
   if (req.headers.authorization?.startsWith('Bearer ')) return req.headers.authorization.split(' ')[1];

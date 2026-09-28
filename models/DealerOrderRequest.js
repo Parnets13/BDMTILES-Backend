@@ -208,6 +208,11 @@ const dealerOrderRequestSchema = new mongoose.Schema({
   requestFingerprint: { type: String, required: true },
   approvedFingerprint: { type: String, default: '' },
   createdBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true },
+  // Which of the dealer's own employees raised this, when they were signed in as
+  // one. Null for the dealer owner. This is what dealer-employee targets and
+  // incentives are measured against, so it is recorded at submission time and
+  // never inferred later.
+  createdByEmployee: { type: mongoose.Schema.Types.ObjectId, ref: 'DealerEmployee' },
 }, { timestamps: true });
 
 dealerOrderRequestSchema.index({ branch: 1, requestNumber: 1 }, { unique: true });
@@ -221,5 +226,7 @@ dealerOrderRequestSchema.index(
 );
 // Drives the dealer app's "needs your response" badge and the branch's follow-up list.
 dealerOrderRequestSchema.index({ branch: 1, dealer: 1, shortfallStatus: 1, updatedAt: -1 });
+// Drives dealer-employee achievement: "requests raised by this employee in this window".
+dealerOrderRequestSchema.index({ dealer: 1, createdByEmployee: 1, createdAt: -1 });
 
 export default mongoose.model('DealerOrderRequest', dealerOrderRequestSchema);

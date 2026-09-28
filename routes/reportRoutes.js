@@ -6,10 +6,14 @@ import GRN from '../models/GRN.js';
 import Stock from '../models/Stock.js';
 import Payment from '../models/Payment.js';
 import DealerLedger from '../models/DealerLedger.js';
+import SupplierLedger from '../models/SupplierLedger.js';
+import Expense from '../models/Expense.js';
+import Invoice from '../models/Invoice.js';
 import Employee from '../models/Employee.js';
 import Attendance from '../models/Attendance.js';
 import Leave from '../models/Leave.js';
-import { protect, requirePermission } from '../middleware/auth.js';
+import Branch from '../models/Branch.js';
+import { protect, requirePermission, requireAnyPermission } from '../middleware/auth.js';
 import { requireBranch } from '../utils/branchScope.js';
 import { getDashboardReport } from '../services/dashboardReport.js';
 
@@ -386,6 +390,12 @@ router.get('/dealer-performance', requirePermission('reports.sales'), async (req
           revenue: { $sum: '$grandTotal' },
           orders: { $sum: 1 },
           avgOrderValue: { $avg: '$grandTotal' },
+          // CAVEAT: this is the advance taken at order time, not money actually
+          // collected against the dealer. The UI labels it "Collected" and derives
+          // a Collection % from it, so both understate real collection whenever a
+          // dealer pays after ordering. Switching to confirmed Payment records
+          // would be more accurate but changes the reported figures, so it needs a
+          // deliberate decision rather than a silent fix.
           paidAmount: { $sum: '$advanceAmount' },
           balanceAmount: { $sum: '$balanceAmount' },
         },
@@ -503,52 +513,12 @@ router.get('/profitability', requirePermission('reports.sales'), async (req, res
   } catch (e) { res.status(500).json({ success: false, message: e.message }); }
 });
 
-// ═══════════════════════════════════════════════════════
-// DEALER PERFORMANCE REPORT
-// ═══════════════════════════════════════════════════════
-router.get('/dealer-performance', requirePermission('reports.sales'), async (req, res) => {
-  try {
-    const { dateFrom, dateTo } = req.query;
-    const match = { branch: req.branchId, status: { $nin: ['cancelled', 'draft'] }, ...dateFilter(dateFrom, dateTo, 'orderDate') };
-
-    const dealerPerformance = await SalesOrder.aggregate([
-      { $match: match },
-      {
-        $group: {
-          _id: { $ifNull: ['$dealer', '$customerName'] },
-          dealerName: { $first: { $ifNull: ['$dealerName', '$customerName'] } },
-          dealerCode: { $first: { $ifNull: ['$dealerCode', '$customerPhone'] } },
-          salesValue: { $sum: '$grandTotal' },
-          orderCount: { $sum: 1 },
-          avgOrderValue: { $avg: '$grandTotal' },
-          totalDiscount: { $sum: '$totalDiscount' },
-          firstOrder: { $min: '$orderDate' },
-          lastOrder: { $max: '$orderDate' },
-          dealerRef: { $first: '$dealer' },
-        },
-      },
-      { $sort: { salesValue: -1 } },
-    ]);
-
-    // Get payment data per dealer
-    const paymentMatch = { branch: req.branchId, ...dateFilter(dateFrom, dateTo, 'paymentDate') };
-    const dealerPayments = await Payment.aggregate([
-      { $match: { status: 'confirmed', ...paymentMatch } },
-      { $group: { _id: '$dealer', collected: { $sum: '$amount' } } },
-    ]);
-    const paymentMap = {};
-    dealerPayments.forEach(p => { paymentMap[String(p._id)] = p.collected; });
-
-    const enriched = dealerPerformance.map(d => ({
-      ...d,
-      collectionValue: d.dealerRef ? paymentMap[String(d.dealerRef)] || 0 : 0,
-      collectionRatio: d.salesValue > 0 ? Math.round(((d.dealerRef ? paymentMap[String(d.dealerRef)] : 0) || 0) / d.salesValue * 100) : 0,
-      dealerRef: undefined,
-    }));
-
-    res.json({ success: true, data: enriched });
-  } catch (e) { res.status(500).json({ success: false, message: e.message }); }
-});
+// NOTE: a second, richer GET /dealer-performance handler used to live here. It was
+// unreachable — Express matches the first registration (see DEALER PERFORMANCE
+// above), so this one never executed. Removed to stop it being mistaken for the
+// live handler. It computed collection from confirmed Payment records, which is a
+// truer "collected" figure than the advanceAmount the live handler reports; see
+// the note on that handler.
 
 // ═══════════════════════════════════════════════════════
 // SALES EXECUTIVE PERFORMANCE REPORT
@@ -575,6 +545,391 @@ router.get('/se-performance', requirePermission('reports.sales'), async (req, re
     ]);
 
     res.json({ success: true, data: sePerformance });
+  } catch (e) { res.status(500).json({ success: false, message: e.message }); }
+});
+
+// ═══════════════════════════════════════════════════════
+// SUPPLIER PERFORMANCE REPORT
+// Purchase volume, receipt reliability and what we still owe, per supplier.
+// ═══════════════════════════════════════════════════════
+router.get('/supplier-performance', requirePermission('reports.purchase'), async (req, res) => {
+  try {
+    const { dateFrom, dateTo } = req.query;
+    const branch = req.branchId;
+
+    const [poRows, grnRows, ledgerRows] = await Promise.all([
+      PurchaseOrder.aggregate([
+        { $match: { branch, status: { $nin: ['draft', 'cancelled', 'rejected'] }, ...dateFilter(dateFrom, dateTo, 'poDate') } },
+        { $group: {
+          _id: '$supplier',
+          supplierName: { $first: '$supplierName' },
+          poCount: { $sum: 1 },
+          poValue: { $sum: '$grandTotal' },
+          avgPoValue: { $avg: '$grandTotal' },
+          receivedPos: { $sum: { $cond: [{ $eq: ['$status', 'received'] }, 1, 0] } },
+          partialPos: { $sum: { $cond: [{ $eq: ['$status', 'partial_received'] }, 1, 0] } },
+          firstPo: { $min: '$poDate' },
+          lastPo: { $max: '$poDate' },
+        } },
+      ]),
+      GRN.aggregate([
+        { $match: { branch, status: { $ne: 'draft' }, ...dateFilter(dateFrom, dateTo, 'grnDate') } },
+        { $group: { _id: '$supplier', grnCount: { $sum: 1 }, lastGrnDate: { $max: '$grnDate' } } },
+      ]),
+      // Supplier ledger is the reverse of the dealer ledger: credit is what we owe
+      // the supplier, debit is what we have paid.
+      SupplierLedger.aggregate([
+        { $match: { branch } },
+        { $group: {
+          _id: '$supplier',
+          supplierName: { $last: '$supplierName' },
+          supplierCode: { $last: '$supplierCode' },
+          payable: { $sum: { $subtract: [{ $ifNull: ['$credit', 0] }, { $ifNull: ['$debit', 0] }] } },
+        } },
+      ]),
+    ]);
+
+    const grnMap = new Map(grnRows.map((row) => [String(row._id), row]));
+    const ledgerMap = new Map(ledgerRows.map((row) => [String(row._id), row]));
+    const keys = new Set([...poRows, ...grnRows, ...ledgerRows].map((row) => String(row._id)));
+
+    const data = [...keys].map((key) => {
+      const po = poRows.find((row) => String(row._id) === key) || {};
+      const grn = grnMap.get(key) || {};
+      const ledger = ledgerMap.get(key) || {};
+      const poCount = po.poCount || 0;
+      return {
+        _id: key,
+        supplierName: po.supplierName || ledger.supplierName || '—',
+        supplierCode: ledger.supplierCode || '',
+        poCount,
+        poValue: po.poValue || 0,
+        avgPoValue: po.avgPoValue || 0,
+        grnCount: grn.grnCount || 0,
+        lastGrnDate: grn.lastGrnDate || null,
+        // Share of purchase orders fully received — a rough delivery-reliability read.
+        fulfilmentRate: poCount > 0 ? Math.round(((po.receivedPos || 0) / poCount) * 100) : null,
+        partialPos: po.partialPos || 0,
+        payable: ledger.payable || 0,
+        firstPo: po.firstPo || null,
+        lastPo: po.lastPo || null,
+      };
+    }).sort((a, b) => b.poValue - a.poValue);
+
+    res.json({ success: true, data });
+  } catch (e) { res.status(500).json({ success: false, message: e.message }); }
+});
+
+// ═══════════════════════════════════════════════════════
+// BRANCH PERFORMANCE REPORT
+// The only cross-branch report here: it spans the branches the user is assigned
+// to rather than the single active branch, because comparing one branch with
+// itself is meaningless. Users still never see a branch they aren't assigned to.
+// ═══════════════════════════════════════════════════════
+router.get('/branch-performance', requirePermission('reports.sales'), async (req, res) => {
+  try {
+    const { dateFrom, dateTo } = req.query;
+    const branchIds = (req.user.assignedBranches || [])
+      .map((entry) => entry?._id || entry)
+      .filter(Boolean);
+    const scope = branchIds.length ? branchIds : [req.branchId];
+
+    const [salesRows, collectionRows] = await Promise.all([
+      SalesOrder.aggregate([
+        { $match: { branch: { $in: scope }, status: { $nin: ['cancelled', 'draft'] }, ...dateFilter(dateFrom, dateTo, 'orderDate') } },
+        { $group: {
+          _id: '$branch',
+          salesValue: { $sum: '$grandTotal' },
+          orderCount: { $sum: 1 },
+          avgOrderValue: { $avg: '$grandTotal' },
+          totalDiscount: { $sum: '$totalDiscount' },
+          outstanding: { $sum: '$balanceAmount' },
+          uniqueDealers: { $addToSet: '$dealer' },
+        } },
+        { $addFields: { dealerCount: { $size: '$uniqueDealers' } } },
+        { $project: { uniqueDealers: 0 } },
+      ]),
+      Payment.aggregate([
+        { $match: { branch: { $in: scope }, status: 'confirmed', paymentType: 'dealer_receipt', ...dateFilter(dateFrom, dateTo, 'paymentDate') } },
+        { $group: { _id: '$branch', collected: { $sum: '$amount' }, receipts: { $sum: 1 } } },
+      ]),
+    ]);
+
+    const collectionMap = new Map(collectionRows.map((row) => [String(row._id), row]));
+    const branchInfo = await Branch.find({ _id: { $in: scope } })
+      .select('branchCode name city status').lean();
+    const branchMap = new Map(branchInfo.map((row) => [String(row._id), row]));
+
+    const data = scope.map((id) => {
+      const key = String(id);
+      const sales = salesRows.find((row) => String(row._id) === key) || {};
+      const collection = collectionMap.get(key) || {};
+      const info = branchMap.get(key) || {};
+      const salesValue = sales.salesValue || 0;
+      const collected = collection.collected || 0;
+      return {
+        _id: key,
+        branchName: info.name || '—',
+        branchCode: info.branchCode || '',
+        city: info.city || '',
+        salesValue,
+        orderCount: sales.orderCount || 0,
+        avgOrderValue: sales.avgOrderValue || 0,
+        totalDiscount: sales.totalDiscount || 0,
+        dealerCount: sales.dealerCount || 0,
+        outstanding: sales.outstanding || 0,
+        collected,
+        receipts: collection.receipts || 0,
+        collectionRatio: salesValue > 0 ? Math.round((collected / salesValue) * 100) : null,
+      };
+    }).sort((a, b) => b.salesValue - a.salesValue);
+
+    res.json({ success: true, data });
+  } catch (e) { res.status(500).json({ success: false, message: e.message }); }
+});
+
+// ═══════════════════════════════════════════════════════
+// WAREHOUSE PERFORMANCE REPORT
+// Stock held, value and movement freshness per warehouse in the active branch.
+// ═══════════════════════════════════════════════════════
+router.get('/warehouse-performance', requirePermission('reports.inventory'), async (req, res) => {
+  try {
+    const branch = req.branchId;
+    const valuationRate = { $cond: [{ $gt: ['$landingCost', 0] }, '$landingCost', '$purchaseRate'] };
+
+    const [stockRows, grnRows] = await Promise.all([
+      Stock.aggregate([
+        { $match: { branch } },
+        { $group: {
+          _id: '$warehouse',
+          totalQty: { $sum: '$totalQty' },
+          availableQty: { $sum: '$availableQty' },
+          reservedQty: { $sum: '$reservedQty' },
+          blockedQty: { $sum: '$blockedQty' },
+          damagedQty: { $sum: '$damagedQty' },
+          stockValue: { $sum: { $multiply: ['$availableQty', valuationRate] } },
+          stockRows: { $sum: 1 },
+          products: { $addToSet: '$product' },
+          lastSaleDate: { $max: '$lastSaleDate' },
+          lastGRNDate: { $max: '$lastGRNDate' },
+        } },
+        { $addFields: { productCount: { $size: '$products' } } },
+        { $project: { products: 0 } },
+        { $lookup: { from: 'warehouses', localField: '_id', foreignField: '_id', as: 'warehouseInfo' } },
+        { $project: {
+          totalQty: 1, availableQty: 1, reservedQty: 1, blockedQty: 1, damagedQty: 1,
+          stockValue: 1, stockRows: 1, productCount: 1, lastSaleDate: 1, lastGRNDate: 1,
+          warehouseName: { $ifNull: [{ $first: '$warehouseInfo.name' }, 'Unknown warehouse'] },
+          warehouseCode: { $ifNull: [{ $first: '$warehouseInfo.warehouseCode' }, ''] },
+        } },
+        { $sort: { stockValue: -1 } },
+      ]),
+      // Receipts land per GRN line, so unwind to attribute them to a warehouse.
+      GRN.aggregate([
+        { $match: { branch, status: { $ne: 'draft' } } },
+        { $unwind: '$items' },
+        { $group: { _id: '$items.warehouse', grnLines: { $sum: 1 }, lastReceipt: { $max: '$grnDate' } } },
+      ]),
+    ]);
+
+    const grnMap = new Map(grnRows.map((row) => [String(row._id), row]));
+    const data = stockRows.map((row) => ({
+      ...row,
+      grnLines: grnMap.get(String(row._id))?.grnLines || 0,
+      lastReceipt: grnMap.get(String(row._id))?.lastReceipt || row.lastGRNDate || null,
+    }));
+
+    res.json({ success: true, data });
+  } catch (e) { res.status(500).json({ success: false, message: e.message }); }
+});
+
+// ═══════════════════════════════════════════════════════
+// COLLECTION REPORT
+// Confirmed dealer receipts: totals, split by mode, daily trend and top payers.
+// ═══════════════════════════════════════════════════════
+router.get('/collection-report', requirePermission('reports.finance'), async (req, res) => {
+  try {
+    const { dateFrom, dateTo } = req.query;
+    const match = {
+      branch: req.branchId,
+      status: 'confirmed',
+      paymentType: 'dealer_receipt',
+      ...dateFilter(dateFrom, dateTo, 'paymentDate'),
+    };
+
+    const [facets] = await Payment.aggregate([
+      { $match: match },
+      { $facet: {
+        summary: [{ $group: { _id: null, total: { $sum: '$amount' }, receipts: { $sum: 1 }, avgReceipt: { $avg: '$amount' } } }],
+        byMode: [
+          { $group: { _id: '$paymentMode', total: { $sum: '$amount' }, count: { $sum: 1 } } },
+          { $sort: { total: -1 } },
+        ],
+        daily: [
+          { $group: { _id: { $dateToString: { format: '%Y-%m-%d', date: '$paymentDate', timezone: 'Asia/Kolkata' } }, total: { $sum: '$amount' }, count: { $sum: 1 } } },
+          { $sort: { _id: 1 } },
+        ],
+        // Payment stores the counterparty as a denormalised partyName plus a
+        // dealer ref; group on the dealer where present so receipts from the same
+        // dealer don't split on spelling, and fall back to partyName otherwise.
+        topPayers: [
+          { $group: {
+            _id: { $ifNull: ['$dealer', '$partyName'] },
+            name: { $first: '$partyName' },
+            total: { $sum: '$amount' },
+            count: { $sum: 1 },
+          } },
+          { $sort: { total: -1 } },
+          { $limit: 15 },
+        ],
+      } },
+    ]);
+
+    res.json({
+      success: true,
+      data: {
+        summary: facets?.summary?.[0] || { total: 0, receipts: 0, avgReceipt: 0 },
+        byMode: facets?.byMode || [],
+        daily: facets?.daily || [],
+        topPayers: facets?.topPayers || [],
+      },
+    });
+  } catch (e) { res.status(500).json({ success: false, message: e.message }); }
+});
+
+// ═══════════════════════════════════════════════════════
+// EXPENSE REPORT
+// Claims by category, status, department and claimant.
+// ═══════════════════════════════════════════════════════
+router.get('/expense-report', requireAnyPermission('reports.finance', 'expense.management'), async (req, res) => {
+  try {
+    const { dateFrom, dateTo, status, category } = req.query;
+    const match = { branch: req.branchId, ...dateFilter(dateFrom, dateTo, 'expenseDate') };
+    if (status) match.status = status;
+    if (category) match.category = category;
+
+    const [facets] = await Expense.aggregate([
+      { $match: match },
+      { $facet: {
+        summary: [{ $group: {
+          _id: null,
+          total: { $sum: '$amount' },
+          claims: { $sum: 1 },
+          // Cancelled and rejected claims are excluded from the approved figure so
+          // the numbers below reconcile with what finance actually owes.
+          approved: { $sum: { $cond: [{ $in: ['$status', ['approved', 'reimbursed']] }, '$amount', 0] } },
+          pending: { $sum: { $cond: [{ $eq: ['$status', 'pending'] }, '$amount', 0] } },
+          reimbursed: { $sum: { $cond: [{ $eq: ['$status', 'reimbursed'] }, '$amount', 0] } },
+          rejected: { $sum: { $cond: [{ $eq: ['$status', 'rejected'] }, '$amount', 0] } },
+        } }],
+        byCategory: [
+          { $group: { _id: '$category', total: { $sum: '$amount' }, count: { $sum: 1 } } },
+          { $sort: { total: -1 } },
+        ],
+        byStatus: [
+          { $group: { _id: '$status', total: { $sum: '$amount' }, count: { $sum: 1 } } },
+          { $sort: { total: -1 } },
+        ],
+        byDepartment: [
+          { $group: { _id: { $ifNull: ['$department', 'Unassigned'] }, total: { $sum: '$amount' }, count: { $sum: 1 } } },
+          { $sort: { total: -1 } },
+        ],
+        byEmployee: [
+          { $group: { _id: '$employee', employeeName: { $first: '$employeeName' }, total: { $sum: '$amount' }, count: { $sum: 1 } } },
+          { $sort: { total: -1 } },
+          { $limit: 15 },
+        ],
+        monthly: [
+          { $group: { _id: { $dateToString: { format: '%Y-%m', date: '$expenseDate', timezone: 'Asia/Kolkata' } }, total: { $sum: '$amount' }, count: { $sum: 1 } } },
+          { $sort: { _id: 1 } },
+        ],
+      } },
+    ]);
+
+    res.json({
+      success: true,
+      data: {
+        summary: facets?.summary?.[0] || { total: 0, claims: 0, approved: 0, pending: 0, reimbursed: 0, rejected: 0 },
+        byCategory: facets?.byCategory || [],
+        byStatus: facets?.byStatus || [],
+        byDepartment: facets?.byDepartment || [],
+        byEmployee: facets?.byEmployee || [],
+        monthly: facets?.monthly || [],
+      },
+    });
+  } catch (e) { res.status(500).json({ success: false, message: e.message }); }
+});
+
+// ═══════════════════════════════════════════════════════
+// OUTSTANDING REPORT
+// Both sides of the balance sheet in one place: receivable from dealers and
+// payable to suppliers, plus overdue invoices. The separate Aging Report covers
+// receivable bucketing in more depth.
+// ═══════════════════════════════════════════════════════
+router.get('/outstanding-report', requirePermission('reports.finance'), async (req, res) => {
+  try {
+    const branch = req.branchId;
+    const today = new Date();
+    today.setHours(0, 0, 0, 0);
+
+    const [receivables, payables, overdue] = await Promise.all([
+      DealerLedger.aggregate([
+        { $match: { branch } },
+        { $group: {
+          _id: '$dealer',
+          name: { $last: '$dealerName' },
+          code: { $last: '$dealerCode' },
+          outstanding: { $sum: { $subtract: [{ $ifNull: ['$debit', 0] }, { $ifNull: ['$credit', 0] }] } },
+          lastEntry: { $max: '$entryDate' },
+        } },
+        { $match: { outstanding: { $gt: 0 } } },
+        { $sort: { outstanding: -1 } },
+      ]),
+      SupplierLedger.aggregate([
+        { $match: { branch } },
+        { $group: {
+          _id: '$supplier',
+          name: { $last: '$supplierName' },
+          code: { $last: '$supplierCode' },
+          outstanding: { $sum: { $subtract: [{ $ifNull: ['$credit', 0] }, { $ifNull: ['$debit', 0] }] } },
+          lastEntry: { $max: '$entryDate' },
+        } },
+        { $match: { outstanding: { $gt: 0 } } },
+        { $sort: { outstanding: -1 } },
+      ]),
+      // Same basis as the dashboard's overdue figure so the two agree.
+      Invoice.aggregate([
+        { $match: {
+          branch,
+          status: { $nin: ['draft', 'cancelled'] },
+          invoiceType: { $in: ['tax_invoice', 'retail_invoice'] },
+          paymentStatus: { $in: ['pending', 'partial'] },
+          balanceAmount: { $gt: 0 },
+          dueDate: { $lt: today },
+        } },
+        { $group: { _id: null, amount: { $sum: '$balanceAmount' }, count: { $sum: 1 } } },
+      ]),
+    ]);
+
+    const receivableTotal = receivables.reduce((sum, row) => sum + row.outstanding, 0);
+    const payableTotal = payables.reduce((sum, row) => sum + row.outstanding, 0);
+
+    res.json({
+      success: true,
+      data: {
+        summary: {
+          receivableTotal,
+          payableTotal,
+          netPosition: receivableTotal - payableTotal,
+          dealersOwing: receivables.length,
+          suppliersOwed: payables.length,
+          overdueAmount: overdue[0]?.amount || 0,
+          overdueCount: overdue[0]?.count || 0,
+        },
+        receivables,
+        payables,
+      },
+    });
   } catch (e) { res.status(500).json({ success: false, message: e.message }); }
 });
 

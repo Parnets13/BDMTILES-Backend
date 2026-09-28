@@ -17,6 +17,7 @@ import { convertQuotationCore, conversionFingerprint, conversionSourceKey, findC
 import { assertQuotationMatchesRequest, refreshAndFingerprintRequest } from '../services/dealerOrderRequestService.js';
 import { syncAutomaticApprovalRequest } from '../services/approvalRequestService.js';
 import { protect, requireAnyPermission, requirePermission, userHasPermission } from '../middleware/auth.js';
+import { assertQuotationTypeAllowed, assertSalesOrderTypeAllowed, resolveCustomerType } from '../services/customerTypeAccess.js';
 import { assertWarehousesInBranch, requireBranch } from '../utils/branchScope.js';
 import { computeSplitPlan, executeSplit, loadSplitFamily } from '../services/quotationSplitService.js';
 import {
@@ -647,6 +648,16 @@ router.post('/', requirePermission('quotation.management'), async (req, res) => 
       const dealer = data.dealer ? await findActiveDealer(data.dealer, session) : null;
       if (data.dealer && !dealer) throw routeError(404, 'Dealer not found.');
       if (!dealer && !data.customerName) throw routeError(422, 'customerName is required for walk-in quotations.');
+
+      // Customer-type scoping. The type is derived from the dealer where possible
+      // rather than trusted from the body, because `customerType` is client-supplied
+      // and never validated against the dealer — so a caller limited to retail could
+      // otherwise raise a wholesaler quotation just by mislabelling it.
+      assertQuotationTypeAllowed(
+        req.user,
+        resolveCustomerType({ dealer, requestedType: data.customerType }).type
+      );
+
       await assertWarehousesInBranch((data.items || []).map(item => item.warehouse), req.branchId, { session });
       const { fields } = await priceQuotation(data, dealer, req.branchId, session);
       const stockSnapshotAt = new Date();
@@ -953,6 +964,28 @@ router.post('/:id/convert', requirePermission('quotation.management'), requirePe
     if (replay) return res.json(await conversionResponse(replay.quotation, replay.salesOrder, replay.conversion, true));
   } catch (error) {
     return res.status(error.status || 500).json({ success: false, message: error.message });
+  }
+
+  // Conversion is where the sales order is actually written (POST /sales-orders is a
+  // permanent 405), so this is the only place the sales.order.<type> permissions can
+  // bind. Checked before the transaction opens so a refusal costs nothing.
+  try {
+    const quotation = await Quotation.findOne({ _id: req.params.id, branch: req.branchId })
+      .select('customerType dealer')
+      .populate({ path: 'dealer', select: 'dealerType', populate: { path: 'dealerType', select: 'pricingTier' } })
+      .lean();
+    if (quotation) {
+      assertSalesOrderTypeAllowed(
+        req.user,
+        resolveCustomerType({ dealer: quotation.dealer || null, requestedType: quotation.customerType }).type
+      );
+    }
+  } catch (error) {
+    return res.status(error.status || 500).json({
+      success: false,
+      ...(typeof error.code === 'string' ? { code: error.code } : {}),
+      message: error.message,
+    });
   }
 
   const session = await mongoose.startSession();

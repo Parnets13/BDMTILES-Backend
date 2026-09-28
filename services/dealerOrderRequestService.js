@@ -4,6 +4,82 @@ import { normalizeOrderItemsUom } from './orderPricingService.js';
 const routeError = (status, message) => Object.assign(new Error(message), { status });
 const roundQuantity = value => Math.round((Number(value) + Number.EPSILON) * 1e6) / 1e6;
 
+/**
+ * The tappable status boxes the dealer app shows on Orders and the Dashboard.
+ *
+ * Two properties this map must keep, and both are asserted in
+ * scripts/validateDealerEmployeeFlow.mjs against the model's own enum:
+ *
+ *   1. COMPLETE — every status on DealerOrderRequest appears in exactly one
+ *      group, so no request can be invisible from every box.
+ *   2. DISJOINT — no status appears in two groups, so the boxes never
+ *      double-count and `all` is always the sum of the others.
+ *
+ * `all` is deliberately an empty list: it means "no status filter", which is also
+ * why it is the default view.
+ *
+ * `pending` is the one a dealer actually wants: everything still in flight,
+ * whether the ball is with BDMTILES, with stock, or with the dealer. `submitted`
+ * is kept separate because it is the only one that means "nobody has looked at
+ * this yet".
+ */
+export const ORDER_STATUS_GROUPS = {
+  all: [],
+  submitted: ['submitted'],
+  pending: ['partially_processed', 'awaiting_dealer', 'awaiting_stock', 'quotation_linked'],
+  approved: ['approved'],
+  rejected: ['rejected'],
+  cancelled: ['cancelled'],
+};
+
+/** Display order for the boxes, and the default (`all`) is first. */
+export const ORDER_STATUS_GROUP_ORDER = ['all', 'submitted', 'pending', 'approved', 'rejected', 'cancelled'];
+
+/** Labels the app renders. Kept server-side so both screens agree. */
+export const ORDER_STATUS_GROUP_LABELS = {
+  all: 'All',
+  submitted: 'Submitted',
+  pending: 'Pending',
+  approved: 'Approved',
+  rejected: 'Rejected',
+  cancelled: 'Cancelled',
+};
+
+/** Everything not yet resolved — the Dashboard's "in progress" figure. */
+export const PENDING_ORDER_STATUSES = ORDER_STATUS_GROUPS.pending;
+
+/**
+ * Turn a group key into a Mongo status filter.
+ *
+ * An unknown or empty key falls back to `all` rather than to an empty result, so
+ * a stale app build or a typo shows everything instead of a blank screen.
+ */
+export const statusFilterForGroup = (group) => {
+  const statuses = ORDER_STATUS_GROUPS[String(group || '').toLowerCase()];
+  if (!statuses || !statuses.length) return {};
+  return { status: { $in: statuses } };
+};
+
+/** Resolve any requested group to a key that actually exists. */
+export const resolveStatusGroup = (group) => {
+  const key = String(group || '').toLowerCase();
+  return Object.prototype.hasOwnProperty.call(ORDER_STATUS_GROUPS, key) ? key : 'all';
+};
+
+/**
+ * Roll a per-status aggregation up into the group counts the boxes show.
+ * `all` is the total, so the boxes always add up to it.
+ */
+export const buildStatusCounts = (rows = []) => {
+  const byStatus = Object.fromEntries(rows.map((row) => [row._id, row.count]));
+  const counts = { all: rows.reduce((sum, row) => sum + row.count, 0) };
+  for (const [key, statuses] of Object.entries(ORDER_STATUS_GROUPS)) {
+    if (key === 'all') continue;
+    counts[key] = statuses.reduce((sum, status) => sum + (byStatus[status] || 0), 0);
+  }
+  return counts;
+};
+
 function productId(item) {
   return String(item?.product?._id || item?.product || '');
 }

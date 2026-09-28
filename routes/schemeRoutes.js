@@ -24,6 +24,12 @@ const canManage = requireAnyPermission('scheme.entry', 'incentive.rules.manage')
 const canSubmit = requireAnyPermission('claim.submission', 'incentive.earnings.record');
 const canApprove = requireAnyPermission('incentive.reconciliation', 'incentive.earnings.approve');
 
+// Supplier vs dealer split: supplier.scheme and dealer.scheme existed but enforced
+// nothing. Now they do, per-path. Someone holding the aggregate can manage both;
+// someone holding only one of the party-specific grants is limited to its routes.
+const canManageSupplierScheme = requireAnyPermission('scheme.entry', 'incentive.rules.manage', 'supplier.scheme');
+const canManageDealerScheme = requireAnyPermission('scheme.entry', 'incentive.rules.manage', 'dealer.scheme');
+
 function routeError(status, message) {
   const error = new Error(message);
   error.status = status;
@@ -271,7 +277,7 @@ router.get('/supplier/stats', canView, async (req, res) => {
   } catch (error) { return sendError(res, error); }
 });
 
-router.post('/supplier', canManage, async (req, res) => {
+router.post('/supplier', canManageSupplierScheme, async (req, res) => {
   const session = await mongoose.startSession();
   try {
     let scheme;
@@ -305,7 +311,7 @@ router.get('/supplier/:id/analysis', canView, async (req, res) => {
   } catch (error) { return sendError(res, error); }
 });
 
-router.put('/supplier/:id', canManage, async (req, res) => {
+router.put('/supplier/:id', canManageSupplierScheme, async (req, res) => {
   try {
     const current = await SupplierScheme.findOne({ _id: req.params.id, branch: req.branchId });
     if (!current) throw routeError(404, 'Scheme not found in the active branch.');
@@ -336,7 +342,7 @@ router.get('/dealer', canView, async (req, res) => {
   } catch (error) { return sendError(res, error); }
 });
 
-router.post('/dealer', canManage, async (req, res) => {
+router.post('/dealer', canManageDealerScheme, async (req, res) => {
   const session = await mongoose.startSession();
   try {
     let scheme;
@@ -388,7 +394,7 @@ router.get('/dealer/:id/analysis', canView, async (req, res) => {
   } catch (error) { return sendError(res, error); }
 });
 
-router.put('/dealer/:id', canManage, async (req, res) => {
+router.put('/dealer/:id', canManageDealerScheme, async (req, res) => {
   try {
     const current = await DealerScheme.findOne({ _id: req.params.id, branch: req.branchId });
     if (!current) throw routeError(404, 'Scheme not found in the active branch.');
@@ -417,8 +423,8 @@ async function changeStatus(Model, req, res) {
   } catch (error) { return sendError(res, error); }
 }
 
-router.patch('/supplier/:id/status', canManage, (req, res) => changeStatus(SupplierScheme, req, res));
-router.patch('/dealer/:id/status', canManage, (req, res) => changeStatus(DealerScheme, req, res));
+router.patch('/supplier/:id/status', canManageSupplierScheme, (req, res) => changeStatus(SupplierScheme, req, res));
+router.patch('/dealer/:id/status', canManageDealerScheme, (req, res) => changeStatus(DealerScheme, req, res));
 
 async function submitBaseSettlement(req, res, partyType) {
   const session = await mongoose.startSession();

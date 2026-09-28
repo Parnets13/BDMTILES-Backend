@@ -68,7 +68,7 @@ const DATE_ONLY = /^(\d{4})-(\d{2})-(\d{2})$/;
  * before breakfast on the first day would fall outside the window. Both ends are
  * therefore built from local components so the range is symmetric.
  */
-function parseBoundary(value, edge) {
+export function parseBoundary(value, edge) {
   const raw = String(value ?? '');
   const parts = DATE_ONLY.exec(raw);
   if (parts) {
