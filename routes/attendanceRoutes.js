@@ -147,7 +147,7 @@ router.post('/mark', async (req, res) => {
       date: today,
     });
 
-    if (existing) {
+    if (existing?.punchIn) {
       return res.status(400).json({
         success: false,
         message: 'Attendance already marked for today',
@@ -155,17 +155,27 @@ router.post('/mark', async (req, res) => {
       });
     }
 
-    // Create attendance record
-    const attendance = await Attendance.create({
+    if (existing && !['Absent', 'Present'].includes(existing.status)) {
+      return res.status(400).json({
+        success: false,
+        message: `Attendance cannot be marked because today's status is ${existing.status}.`,
+        data: existing,
+      });
+    }
+
+    // Reuse an unpunched Absent record when the attendance process created it
+    // earlier in the day; otherwise create the employee's punch-in record.
+    const attendance = existing || new Attendance({
       branch: branchId,
       employee: employee._id,
       date: today,
-      punchIn: new Date(),
-      punchInLocation: req.body.location || undefined,
-      status: 'Present',
-      source: 'App',
-      markedBy: userId,
     });
+    attendance.punchIn = new Date();
+    attendance.punchInLocation = req.body.location || undefined;
+    attendance.status = 'Present';
+    attendance.source = 'App';
+    attendance.markedBy = userId;
+    await attendance.save();
 
     return res.json({
       success: true,
