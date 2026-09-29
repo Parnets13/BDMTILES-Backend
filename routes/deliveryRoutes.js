@@ -28,7 +28,7 @@ router.patch('/:id/fail', requirePermission('delivery.fail'));
 const terminalStatuses = ['delivered', 'partially_delivered', 'failed'];
 const deliveryScope = req => ({
   branch: req.branchId,
-  ...(req.user.role === 'delivery_executive' ? { deliveryExecutive: req.user._id } : {}),
+  ...(req.user.role !== 'supervisor' ? { deliveryExecutive: req.user._id } : {}),
 });
 const findAccessibleDelivery = (req, id) => Delivery.findOne({ _id: id, ...deliveryScope(req) });
 const safeDelivery = value => {
@@ -109,7 +109,7 @@ router.get('/', async (req, res) => {
         .lean(),
       Delivery.countDocuments(filter),
     ]);
-    res.json({ success: true, data: deliveries, pagination: { currentPage: p, totalPages: Math.ceil(total / l), totalItems: total } });
+    res.json({ success: true, data: deliveries, pagination: { currentPage: p, totalPages: Math.ceil(total / l), totalItems: total, itemsPerPage: l } });
   } catch (e) { res.status(500).json({ success: false, message: e.message }); }
 });
 
