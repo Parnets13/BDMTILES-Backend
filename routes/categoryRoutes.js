@@ -2,11 +2,23 @@ import { Router } from 'express';
 import Brand from '../models/Brand.js';
 import Category from '../models/Category.js';
 import Subcategory from '../models/Subcategory.js';
+import HomeCategory from '../models/webContent/HomeCategory.js';
 import { protect, requirePermission } from '../middleware/auth.js';
+import { uploadBrandImage } from '../middleware/upload.js';
 
 const router = Router();
 router.use(protect);
 router.use(requirePermission('category.setup'));
+
+// Web Management category names available for brand-category assignment.
+router.get('/web-categories', async (_req, res) => {
+  try {
+    const categories = await HomeCategory.find({}).sort({ sortOrder: 1, name: 1 }).select('name status').lean();
+    res.json({ success: true, data: categories });
+  } catch (error) {
+    res.status(500).json({ success: false, message: error.message });
+  }
+});
 
 // ═══════════════════════════════════════
 // BRANDS
@@ -46,13 +58,22 @@ router.get('/brands', async (req, res) => {
   }
 });
 
+// POST upload a brand logo. The returned path is stored in Brand.image.
+router.post('/brands/upload-image', (req, res) => {
+  uploadBrandImage(req, res, (err) => {
+    if (err) return res.status(400).json({ success: false, message: err.message });
+    if (!req.file) return res.status(400).json({ success: false, message: 'No image uploaded.' });
+    res.json({ success: true, message: 'Brand logo uploaded.', data: `/uploads/brands/${req.file.filename}` });
+  });
+});
+
 // POST create brand
 router.post('/brands', async (req, res) => {
   try {
-    const { name, description } = req.body;
+    const { name, description, image } = req.body;
     if (!name?.trim()) return res.status(400).json({ success: false, message: 'Brand name is required.' });
 
-    const brand = await Brand.create({ name: name.trim(), description, createdBy: req.user._id });
+    const brand = await Brand.create({ name: name.trim(), description, image, createdBy: req.user._id });
     res.status(201).json({ success: true, message: 'Brand created.', data: brand });
   } catch (error) {
     if (error.code === 11000) return res.status(400).json({ success: false, message: 'Brand already exists.' });

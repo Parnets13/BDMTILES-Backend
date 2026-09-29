@@ -4,6 +4,7 @@ import Product from '../../models/Product.js';
 import Stock from '../../models/Stock.js';
 import Category from '../../models/Category.js';
 import Brand from '../../models/Brand.js';
+import Subcategory from '../../models/Subcategory.js';
 import { getOnlineBranchId } from '../../utils/onlineBranch.js';
 import { upload } from '../../middleware/upload.js';
 // imageEmbedding service is optional (requires onnxruntime-node package)
@@ -163,7 +164,7 @@ router.get('/', async (req, res) => {
     const limit = Math.min(100, Math.max(1, parseInt(req.query.limit, 10) || 24));
     const filter = { ...ONLY_ONLINE };
 
-    const { search, category, categoryName, subcategory, brand, tileSize, finish, tileType, colour, applicationArea } = req.query;
+    const { search, category, categoryName, subcategory, brand, tileSize, finish, surface, thickness, tileType, colour, applicationArea, minPrice, maxPrice, minRating, dealOnly } = req.query;
     const escapeRegex = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 
     if (search) {
@@ -223,15 +224,36 @@ router.get('/', async (req, res) => {
         filter.category = { $in: matchedCats.map(c => c._id) };
       }
     }
-    if (subcategory && mongoose.isValidObjectId(subcategory)) filter.subcategory = subcategory;
-    if (brand && mongoose.isValidObjectId(brand)) filter.brand = brand;
+    if (subcategory) {
+      if (mongoose.isValidObjectId(subcategory)) filter.subcategory = subcategory;
+      else {
+        const match = await Subcategory.findOne({name: new RegExp(`^${escapeRegex(String(subcategory).trim())}$`, 'i'), status: 'active'}).select('_id').lean();
+        filter.subcategory = match?._id || { $in: [] };
+      }
+    }
+    if (brand) {
+      if (mongoose.isValidObjectId(brand)) filter.brand = brand;
+      else {
+        const match = await Brand.findOne({name: new RegExp(`^${escapeRegex(String(brand).trim())}$`, 'i'), status: 'active'}).select('_id').lean();
+        filter.brand = match?._id || { $in: [] };
+      }
+    }
     if (tileSize) filter.tileSize = String(tileSize);
     if (finish) filter.finish = String(finish);
+    if (surface) filter.surface = String(surface);
+    if (thickness) filter.thickness = String(thickness);
     if (tileType) filter.tileType = String(tileType);
     if (colour) filter.colour = new RegExp(`^${String(colour)}$`, 'i');
     if (applicationArea) filter.applicationArea = new RegExp(String(applicationArea), 'i');
+    if (Number.isFinite(Number(minRating)) && Number(minRating) > 0) filter.rating = { $gte: Number(minRating) };
+    if (dealOnly === 'true') filter.isDealOfWeek = true;
+    const priceConditions = [];
+    const effectivePrice = { $cond: [{ $gt: [{ $ifNull: ['$mrp', 0] }, 0] }, '$mrp', '$retailRate'] };
+    if (Number.isFinite(Number(minPrice)) && Number(minPrice) >= 0) priceConditions.push({ $gte: [effectivePrice, Number(minPrice)] });
+    if (Number.isFinite(Number(maxPrice)) && Number(maxPrice) >= 0) priceConditions.push({ $lte: [effectivePrice, Number(maxPrice)] });
+    if (priceConditions.length) filter.$expr = { $and: priceConditions };
 
-    const sortField = ['itemName', 'retailRate', 'mrp', 'createdAt'].includes(req.query.sortBy) ? req.query.sortBy : 'createdAt';
+    const sortField = ['itemName', 'retailRate', 'mrp', 'createdAt', 'rating'].includes(req.query.sortBy) ? req.query.sortBy : 'createdAt';
     const sortOrder = req.query.order === 'asc' ? 1 : -1;
 
     const [items, totalItems] = await Promise.all([
@@ -291,22 +313,37 @@ router.get('/new-arrivals', async (_req, res) => {
 // GET /api/v1/shop/filter-options — distinct values for storefront filters (online products only)
 router.get('/filter-options', async (_req, res) => {
   try {
-    const [sizes, finishes, types, colours, areas] = await Promise.all([
+    const [sizes, finishes, surfaces, thicknesses, types, colours, areas, brandIds, subcategoryIds, categoryIds] = await Promise.all([
       Product.distinct('tileSize', ONLY_ONLINE),
       Product.distinct('finish', ONLY_ONLINE),
+      Product.distinct('surface', ONLY_ONLINE),
+      Product.distinct('thickness', ONLY_ONLINE),
       Product.distinct('tileType', ONLY_ONLINE),
       Product.distinct('colour', ONLY_ONLINE),
       Product.distinct('applicationArea', ONLY_ONLINE),
+      Product.distinct('brand', ONLY_ONLINE),
+      Product.distinct('subcategory', ONLY_ONLINE),
+      Product.distinct('category', ONLY_ONLINE),
     ]);
     const clean = (arr) => arr.filter((v) => v && String(v).trim()).sort();
+    const [brands, subcategories, categories] = await Promise.all([
+      Brand.find({_id: {$in: brandIds}, status: 'active'}).select('_id name image').sort({name: 1}).lean(),
+      Subcategory.find({_id: {$in: subcategoryIds}, status: 'active'}).select('_id name').sort({name: 1}).lean(),
+      Category.find({_id: {$in: categoryIds}, status: 'active'}).select('_id name').sort({name: 1}).lean(),
+    ]);
     return res.json({
       success: true,
       data: {
         tileSizes: clean(sizes),
         finishes: clean(finishes),
+        surfaces: clean(surfaces),
+        thicknesses: clean(thicknesses),
         tileTypes: clean(types),
         colours: clean(colours),
         applicationAreas: clean(areas),
+        brands: brands.map((brand) => ({id: String(brand._id), name: brand.name, image: brand.image || ''})),
+        subcategories: subcategories.map((subcategory) => ({id: String(subcategory._id), name: subcategory.name})),
+        categories: categories.map((category) => ({id: String(category._id), name: category.name})),
       },
     });
   } catch (error) {

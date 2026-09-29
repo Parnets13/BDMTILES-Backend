@@ -4,6 +4,7 @@ const brandSchema = new mongoose.Schema(
   {
     name: { type: String, required: true, trim: true, unique: true },
     description: { type: String, trim: true, default: '' },
+    image: { type: String, trim: true, default: '' },
     status: { type: String, enum: ['active', 'inactive'], default: 'active' },
     createdBy: { type: mongoose.Schema.Types.ObjectId, required: true },
   },
