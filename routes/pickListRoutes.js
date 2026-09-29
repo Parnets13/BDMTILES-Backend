@@ -25,29 +25,33 @@ const requireWorkflowManager = (req, res, next) => (
     : res.status(403).json({ success: false, message: 'Supervisor access is required for this action.' })
 );
 
-router.param('id', async (req, res, next, id) => {
+const requireAssignedPickList = async (req, res, next) => {
   try {
     if (canViewUnassignedWorkflowOrders(req.user)) return next();
-    const assigned = await PickList.exists({ _id: id, branch: req.branchId, assignedTo: req.user._id });
+    if (!mongoose.isValidObjectId(req.params.id)) {
+      return res.status(400).json({ success: false, message: 'Invalid _id' });
+    }
+    const assigned = await PickList.exists({ _id: req.params.id, branch: req.branchId, assignedTo: req.user._id });
     if (!assigned) return res.status(404).json({ success: false, message: 'Pick list not found.' });
     return next();
   } catch (error) {
     return next(error);
   }
-});
+};
 
-router.get(['/', '/stats', '/:id'], requireAnyPermission('picking.management', 'sorting.management', 'dispatch.management'));
+router.get(['/', '/stats'], requireAnyPermission('picking.management', 'sorting.management', 'dispatch.management'));
+router.get('/:id', requireAnyPermission('picking.management', 'sorting.management', 'dispatch.management'), requireAssignedPickList);
 router.get('/generatable-orders', requireAnyPermission('sales.order.approve', 'picking.management'), requireWorkflowManager);
 router.get('/assignable-staff', requireAnyPermission('picking.management', 'sorting.management', 'dispatch.management'), requireWorkflowManager);
 router.get('/delivery-executives', requireAnyPermission('dispatch.management', 'dispatch.verify'));
 router.get('/available-vehicles', requireAnyPermission('dispatch.management', 'dispatch.verify'));
 router.post('/generate/:soId', requireAnyPermission('sales.order.approve', 'picking.management'), requireWorkflowManager);
-router.patch('/:id/assign', requirePermission('picking.management'), requireWorkflowManager);
-router.patch(['/:id/start', '/:id/complete-picking', '/:id/verify'], requirePermission('picking.management'));
-router.patch(['/:id/sort', '/:id/pack'], requirePermission('sorting.management'));
-router.patch('/:id/ready', requireAnyPermission('sorting.management', 'dispatch.management'));
-router.patch('/:id/verify-loading', requireAnyPermission('dispatch.management', 'dispatch.verify'));
-router.patch('/:id/mark-short', requireAnyPermission('picking.management', 'sorting.management'));
+router.patch('/:id/assign', requireAssignedPickList, requirePermission('picking.management'), requireWorkflowManager);
+router.patch(['/:id/start', '/:id/complete-picking', '/:id/verify'], requireAssignedPickList, requirePermission('picking.management'));
+router.patch(['/:id/sort', '/:id/pack'], requireAssignedPickList, requirePermission('sorting.management'));
+router.patch('/:id/ready', requireAssignedPickList, requireAnyPermission('sorting.management', 'dispatch.management'));
+router.patch('/:id/verify-loading', requireAssignedPickList, requireAnyPermission('dispatch.management', 'dispatch.verify'));
+router.patch('/:id/mark-short', requireAssignedPickList, requireAnyPermission('picking.management', 'sorting.management'));
 
 const stateError = (res, record, expected, action) => res.status(409).json({
   success: false,
