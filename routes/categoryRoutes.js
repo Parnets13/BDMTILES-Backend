@@ -2,12 +2,23 @@ import { Router } from 'express';
 import Brand from '../models/Brand.js';
 import Category from '../models/Category.js';
 import Subcategory from '../models/Subcategory.js';
+import HomeCategory from '../models/webContent/HomeCategory.js';
 import { protect, requirePermission } from '../middleware/auth.js';
 import { uploadBrandImage } from '../middleware/upload.js';
 
 const router = Router();
 router.use(protect);
 router.use(requirePermission('category.setup'));
+
+// Web Management category names available for brand-category assignment.
+router.get('/web-categories', async (_req, res) => {
+  try {
+    const categories = await HomeCategory.find({}).sort({ sortOrder: 1, name: 1 }).select('name status').lean();
+    res.json({ success: true, data: categories });
+  } catch (error) {
+    res.status(500).json({ success: false, message: error.message });
+  }
+});
 
 // ═══════════════════════════════════════
 // BRANDS
