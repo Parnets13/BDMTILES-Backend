@@ -183,6 +183,12 @@ router.post('/mark', async (req, res) => {
       data: attendance,
     });
   } catch (error) {
+    if (error?.code === 11000) {
+      return res.status(409).json({
+        success: false,
+        message: 'Attendance has already been marked for today.',
+      });
+    }
     console.error('Mark attendance error:', error);
     return res.status(500).json({
       success: false,
