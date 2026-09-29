@@ -18,6 +18,7 @@ import {
   validateStrongPassword,
 } from '../utils/authSecurity.js';
 import { sendPasswordResetEmail } from '../services/mailService.js';
+import { logAuthEvent } from '../middleware/activityLogger.js';
 
 const router = Router();
 const INVALID_CREDENTIALS = 'Invalid credentials.';
@@ -63,6 +64,15 @@ const otpVerifyLimiter = rateLimit({
 const OTP_LOGIN_ROLES = new Set(['sales_executive']);
 // Generic response so an attacker cannot enumerate which phone numbers exist.
 const OTP_REQUEST_RESPONSE = 'If that number is registered for the field app, an OTP has been sent.';
+// Header the BDMTILES field app sends on every request. An unregistered number is
+// reported honestly ONLY to a caller presenting it, so the field salesperson is told
+// their number is wrong instead of being left on an OTP screen that can never succeed.
+// Callers without the header keep the generic reply, so casual enumeration of staff
+// numbers over the open API is blocked. This is a deterrent, not a hard guarantee:
+// anyone who learns this value could still probe. Treat it as such.
+const FIELD_APP_CLIENT = 'bdmtiles-sales-app';
+const isFieldAppRequest = (req) =>
+  String(req.get('x-bdmtiles-client') || '').trim().toLowerCase() === FIELD_APP_CLIENT;
 const normalizePhone = (value) => String(value || '').replace(/[^\d]/g, '').slice(-15);
 const sixDigitOtp = () => String(crypto.randomInt(0, 1_000_000)).padStart(6, '0');
 const hashOtp = (code, userId) => crypto
@@ -134,6 +144,14 @@ router.post('/login', loginLimiter, async (req, res) => {
     const token = generateToken(user._id, user.role, user.tokenVersion || 0);
     const userObj = await buildAuthUser(user._id);
     setRefreshCookie(res, credential.token);
+    // Fire-and-forget: a logging failure must not fail a valid sign-in.
+    logAuthEvent({
+      action: 'login',
+      user,
+      req,
+      description: `Signed in as ${user.role}`,
+      metadata: { method: 'password' },
+    }).catch(() => {});
     return res.json({ success: true, message: 'Login successful', token, user: userObj });
   } catch (error) {
     console.error('Login error:', error.message);
@@ -155,7 +173,18 @@ router.post('/otp/request', otpRequestLimiter, async (req, res) => {
       role: { $in: [...OTP_LOGIN_ROLES] },
     }).select('_id phone role name');
     const user = candidates.find((candidate) => normalizePhone(candidate.phone) === phone);
-    if (!user) return res.json(response);
+    if (!user) {
+      // Tell the field app the number is not registered so the executive gets a clear
+      // message; keep the generic reply for everyone else (see FIELD_APP_CLIENT).
+      if (isFieldAppRequest(req)) {
+        return res.json({
+          ...response,
+          registered: false,
+          message: 'This mobile number is not registered for the BDMTILES Sales app. Please check the number, or ask your administrator to enable app access for you.',
+        });
+      }
+      return res.json(response);
+    }
 
     const code = sixDigitOtp();
     const ttlMinutes = numberFromEnv('OTP_EXPIRE_MINUTES', 5);
@@ -175,6 +204,13 @@ router.post('/otp/request', otpRequestLimiter, async (req, res) => {
     if (exposeOtpCode()) {
       response.devOtp = code;
       response.expiresInSeconds = ttlMinutes * 60;
+    }
+    // Gated on the app header for the same reason as the `registered: false` branch above:
+    // sending `registered: true` to a caller without the header would let it tell a
+    // registered number from an unregistered one by field presence alone, defeating the
+    // whole point of the generic reply.
+    if (isFieldAppRequest(req)) {
+      response.registered = true;
     }
     return res.json(response);
   } catch (error) {
@@ -228,6 +264,13 @@ router.post('/otp/verify', otpVerifyLimiter, async (req, res) => {
     const token = generateToken(user._id, user.role, user.tokenVersion || 0);
     const userObj = await buildAuthUser(user._id);
     setRefreshCookie(res, credential.token);
+    logAuthEvent({
+      action: 'login',
+      user,
+      req,
+      description: `Signed in via OTP as ${user.role}`,
+      metadata: { method: 'otp' },
+    }).catch(() => {});
     return res.json({ success: true, message: 'Login successful', token, user: userObj });
   } catch (error) {
     console.error('OTP verify error:', error.message);
@@ -364,10 +407,16 @@ router.post('/refresh-token', async (req, res) => {
 router.post('/logout', async (req, res) => {
   const refreshToken = req.cookies?.[REFRESH_COOKIE_NAME];
   if (refreshToken) {
+    // Resolved before the pull below, so the audit row can name the user. /logout has no
+    // auth middleware (it must work with an expired access token), so req.user is absent.
+    const sessionUser = await User.findOne({ 'refreshSessions.tokenHash': sha256(refreshToken) })
+      .select('name userName email role defaultBranch assignedBranches')
+      .catch(() => null);
     await User.updateOne(
       { 'refreshSessions.tokenHash': sha256(refreshToken) },
       { $pull: { refreshSessions: { tokenHash: sha256(refreshToken) } } }
     ).catch(() => undefined);
+    logAuthEvent({ action: 'logout', user: sessionUser, req }).catch(() => {});
   }
   clearRefreshCookie(res);
   return res.json({ success: true, message: 'Logged out.' });
@@ -378,6 +427,13 @@ router.post('/logout-all', authenticateOnly, async (req, res) => {
     { _id: req.user._id },
     { $inc: { tokenVersion: 1 }, $set: { refreshSessions: [] } }
   );
+  logAuthEvent({
+    action: 'logout',
+    user: req.user,
+    req,
+    description: 'Signed out from all devices',
+    metadata: { allDevices: true },
+  }).catch(() => {});
   clearRefreshCookie(res);
   return res.json({ success: true, message: 'Logged out from all devices.' });
 });

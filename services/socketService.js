@@ -38,6 +38,16 @@ let io = null;
 
 export const roomForDealer = (dealerId) => `dealer:${String(dealerId)}`;
 export const SUPPORT_ROOM = 'support';
+// One room PER BRANCH. A single global room would deliver one branch's positions to
+// every other branch's watchers — they would not be rendered, but they would be on the
+// wire, which is still a leak.
+export const roomForMonitoring = (branchId) => `monitoring:${String(branchId)}`;
+// Every authenticated staff member joins their own room, so an event meant for one
+// person — a lead assigned to them, say — reaches them without a branch-wide broadcast
+// that everyone else has to filter out.
+export const roomForUser = (userId) => `user:${String(userId)}`;
+// Managers watching the lead queue for a branch.
+export const roomForLeads = (branchId) => `leads:${String(branchId)}`;
 
 /** How many dealers one executive connection will subscribe to. */
 const MAX_DEALER_ROOMS = 500;
@@ -119,6 +129,29 @@ async function roomsForPrincipal(principal) {
   const rooms = [];
   // The support desk sees every thread; that is the point of the admin screen.
   if (userHasPermission(principal.user, 'support.chat')) rooms.push(SUPPORT_ROOM);
+
+  // Field tracking is likewise a permission, not a given. Gated on the same
+  // permission the REST monitoring endpoints use, so a socket cannot leak a position
+  // that the HTTP API would refuse — and joined per assigned branch, so a watcher in
+  // one branch is never sent another branch's positions at all.
+  if (userHasPermission(principal.user, 'se.attendance.view')) {
+    for (const branch of principal.user.assignedBranches || []) {
+      const id = branch?._id || branch;
+      if (id) rooms.push(roomForMonitoring(id));
+    }
+  }
+
+  // Own room, so targeted events (a lead assigned to this executive) arrive without a
+  // branch-wide fan-out.
+  rooms.push(roomForUser(principal.userId));
+
+  // The lead queue is watched by whoever can assign or view leads, per branch.
+  if (userHasPermission(principal.user, 'lead.assign') || userHasPermission(principal.user, 'lead.view')) {
+    for (const branch of principal.user.assignedBranches || []) {
+      const id = branch?._id || branch;
+      if (id) rooms.push(roomForLeads(id));
+    }
+  }
 
   // An executive only hears about their own dealers.
   const dealers = await Dealer.find({ assignedSalesExecutive: principal.userId })
@@ -272,9 +305,43 @@ export function emitNewMessage(message) {
   io.to(SUPPORT_ROOM).emit('message:new', payload);
 }
 
+/**
+ * Broadcast a field-tracking update to the monitoring board.
+ *
+ * Sent to that branch's room only. A missed emit is not silent here the way it is for
+ * chat: the REST /monitoring/live endpoint is the fallback, so a dropped socket shows
+ * a slightly stale board rather than an empty one.
+ */
+export function emitTrackingUpdate(update) {
+  if (!io || !update?.branch) return;
+  io.to(roomForMonitoring(update.branch)).emit('tracking:update', update);
+}
+
+/**
+ * Broadcast a lead event to the apps as well as the browser.
+ *
+ * The lead routes publish over SSE, which reaches the web but NOT the mobile app —
+ * React Native has no `EventSource`. So an executive was only told about a new lead if
+ * they happened to pull-to-refresh. Same event, second transport.
+ *
+ * Targeted events go to the named users' own rooms; untargeted ones go to the branch's
+ * lead queue, which only `lead.assign` / `lead.view` holders join.
+ */
+export function emitLeadEvent({ branchId, userIds = [], event = 'lead.changed', data = {} }) {
+  if (!io) return;
+  const targets = [...new Set((userIds || []).filter(Boolean).map(String))];
+  if (targets.length) {
+    for (const id of targets) io.to(roomForUser(id)).emit(event, data);
+    return;
+  }
+  if (branchId) io.to(roomForLeads(branchId)).emit(event, data);
+}
+
 export default {
   initSocket,
   emitNewMessage,
+  emitTrackingUpdate,
+  emitLeadEvent,
   getSocket,
   resolveSocketPrincipal,
   disconnectDealerEmployee,

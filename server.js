@@ -14,6 +14,7 @@ import dealerEmployeeTargetRoutes from './routes/dealerEmployeeTargetRoutes.js';
 import dealerAppRoutes from './routes/dealerAppRoutes.js';
 import dealerDownloadRoutes from './routes/dealerDownloadRoutes.js';
 import shopRoutes from './routes/shop/index.js';
+import careerRoutes from './routes/careerRoutes.js';
 import webManagementRoutes from './routes/webManagementRoutes.js';
 import walletRoutes from './routes/walletRoutes.js';
 import userRoutes from './routes/userRoutes.js';
@@ -128,6 +129,10 @@ app.use('/api/v1', autoLogMiddleware);
 
 // Routes
 app.use('/api/v1/shop', shopRoutes); // public customer storefront API
+// Public careers site — job listings + applications from the BDM Tiles website.
+// Unauthenticated by design, so it is deliberately its own router rather than a
+// public branch of recruitmentRoutes (which is protect + requireBranch throughout).
+app.use('/api/v1/careers', careerRoutes);
 app.use('/api/v1/web-management', webManagementRoutes); // storefront CMS (staff)
 app.use('/api/v1/wallets', walletRoutes); // customer BDM Cash wallet management
 app.use('/api/v1/auth', authRoutes);

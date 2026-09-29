@@ -6,9 +6,11 @@ import HrDocumentTemplate from '../models/HrDocumentTemplate.js';
 import Employee from '../models/Employee.js';
 import EmployeeExit from '../models/EmployeeExit.js';
 import { protect, requirePermission } from '../middleware/auth.js';
+import { logDownload } from '../middleware/activityLogger.js';
 import { requireBranch } from '../utils/branchScope.js';
 import { hrGeneratedDocumentDirectory } from '../middleware/upload.js';
 import { renderTemplate, extractVariables, generateHrDocumentPdf } from '../services/hrDocumentService.js';
+import { HR_TEMPLATE_STARTERS } from '../data/hrTemplateStarters.js';
 
 const router = Router();
 router.use(protect);
@@ -49,13 +51,24 @@ router.get('/templates/:id', ...access, async (req, res) => {
   } catch (error) { sendError(res, error); }
 });
 
+// Highest existing TPL number for the branch, so a new code never collides with the
+// unique {branch, templateCode} index. Reads every code rather than trusting the last
+// by createdAt: a template deleted then re-created would otherwise reuse a live code.
+const maxTemplateNumber = async (branchId) => {
+  const rows = await HrDocumentTemplate.find({ branch: branchId }).select('templateCode').lean();
+  return rows.reduce((acc, r) => {
+    const n = parseInt(String(r.templateCode || '').replace(/\D/g, ''), 10);
+    return Number.isFinite(n) && n > acc ? n : acc;
+  }, 0);
+};
+
+const formatTemplateCode = (n) => `TPL${String(n).padStart(4, '0')}`;
+
 router.post('/templates', ...access, async (req, res) => {
   try {
     const { templateName, documentType, content } = req.body;
     if (!templateName || !documentType || !content) throw routeError(422, 'Template name, document type, and content are required.');
-    const last = await HrDocumentTemplate.findOne({ branch: req.branchId }).sort({ createdAt: -1 }).select('templateCode').lean();
-    const num = last?.templateCode ? parseInt(last.templateCode.replace(/\D/g, '')) || 0 : 0;
-    const templateCode = `TPL${String(num + 1).padStart(4, '0')}`;
+    const templateCode = formatTemplateCode((await maxTemplateNumber(req.branchId)) + 1);
     const template = await HrDocumentTemplate.create({
       branch: req.branchId, templateCode, templateName, documentType, content,
       variables: extractVariables(content), createdBy: req.user._id,
@@ -124,6 +137,16 @@ const loadLatestExit = (employeeId, branchId) => EmployeeExit
   .sort({ createdAt: -1 })
   .lean();
 
+/**
+ * Fallback for a field that is commonly left blank on the employee record but must
+ * not appear as a raw {{placeholder}} in a formal letter. `workLocation` in particular
+ * is empty on almost every record, which would otherwise print "based at {{workLocation}}".
+ *
+ * Returns '' when there is genuinely nothing sensible to say — the caller decides
+ * whether to omit the sentence. A blank is less embarrassing than a visible token.
+ */
+const orCompany = (value, fallback) => value || fallback;
+
 const buildEmployeeContext = (employee, exitCase = null) => ({
   employeeName: employee.name || '',
   empId: employee.empId || '',
@@ -137,7 +160,8 @@ const buildEmployeeContext = (employee, exitCase = null) => ({
   employeeEmail: employee.email || '',
   employeeAddress: employee.address || '',
   reportingManager: employee.reportingManager || '',
-  workLocation: employee.workLocation || '',
+  // Frequently blank, so fall back to the registered office rather than leaving a hole.
+  workLocation: orCompany(employee.workLocation, 'our registered office'),
   employmentType: employee.employmentType || '',
   companyName: 'BDM GRANIMARMO PRIVATE LIMITED',
   today: new Date().toLocaleDateString('en-IN', { day: '2-digit', month: 'long', year: 'numeric' }),
@@ -167,6 +191,57 @@ router.get('/field-map', ...access, (req, res) => {
     success: true,
     data: Object.keys(buildEmployeeContext({}, {})).map((key) => ({ variable: `{{${key}}}`, key })),
   });
+});
+
+// Ready-made letter bodies for the "start from a ready template" picker. Served from
+// the API so the wording lives in one place and can be improved without a web deploy.
+router.get('/starters', ...access, (req, res) => {
+  res.json({ success: true, data: HR_TEMPLATE_STARTERS });
+});
+
+// Seed the ready-made letters as real templates for the active branch. Skips any
+// document type the branch already has, so it is safe to press twice and never
+// clobbers an admin's own wording.
+router.post('/templates/seed-starters', ...access, async (req, res) => {
+  try {
+    const existing = await HrDocumentTemplate
+      .find({ branch: req.branchId })
+      .select('documentType templateCode')
+      .lean();
+    const haveType = new Set(existing.map((t) => t.documentType));
+    const wanted = HR_TEMPLATE_STARTERS.filter((s) => !haveType.has(s.documentType));
+
+    if (!wanted.length) {
+      return res.json({ success: true, message: 'All ready-made templates already exist for this branch.', data: { created: [], skipped: HR_TEMPLATE_STARTERS.length } });
+    }
+
+    // Continue the branch's own numbering rather than restarting at TPL0001, so codes
+    // stay unique against the {branch, templateCode} index.
+    const baseNum = await maxTemplateNumber(req.branchId);
+
+    const created = [];
+    for (let i = 0; i < wanted.length; i += 1) {
+      const s = wanted[i];
+      const templateCode = formatTemplateCode(baseNum + i + 1);
+      const doc = await HrDocumentTemplate.create({
+        branch: req.branchId,
+        templateCode,
+        templateName: s.templateName,
+        documentType: s.documentType,
+        content: s.content,
+        variables: extractVariables(s.content),
+        isActive: true,
+        createdBy: req.user._id,
+      });
+      created.push({ _id: doc._id, templateCode, templateName: doc.templateName, documentType: doc.documentType });
+    }
+
+    res.status(201).json({
+      success: true,
+      message: `${created.length} ready-made template${created.length === 1 ? '' : 's'} added.`,
+      data: { created, skipped: HR_TEMPLATE_STARTERS.length - created.length },
+    });
+  } catch (error) { sendError(res, error); }
 });
 
 // Preview: returns the rendered plain text without generating a PDF or touching the employee record.
@@ -239,6 +314,9 @@ router.get('/documents/:fileName', ...access, async (req, res) => {
     if (storedName !== req.params.fileName) throw routeError(400, 'Invalid file reference.');
     const filePath = path.join(hrGeneratedDocumentDirectory, storedName);
     const content = await fs.promises.readFile(filePath);
+    // Logged after the read succeeds, so a 404 never produces a download row.
+    logDownload({ req, module: 'hr_templates', recordTitle: storedName, recordModel: 'HrTemplateDocument' })
+      .catch(() => {});
     res.type('application/pdf');
     res.attachment(storedName);
     res.send(content);

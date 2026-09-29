@@ -118,4 +118,74 @@ function getModuleFromPath(url) {
   return moduleMap[parts[0]] || parts[0] || 'system';
 }
 
-export default { logActivity, autoLogMiddleware };
+/**
+ * Log an auth event (login, logout, failed login).
+ *
+ * Needed because `autoLogMiddleware` derives its action from the HTTP method and reads
+ * `req.user`, neither of which suits auth: every auth route is a POST, and on a *login*
+ * there is no `req.user` yet. Without this the audit trail can never contain a `login`
+ * row at all, which leaves the Login History screen permanently empty.
+ *
+ * @param {object} opts
+ * @param {'login'|'logout'|'access'} opts.action
+ * @param {object} opts.user        the authenticated user document
+ * @param {object} [opts.req]       the express request (for IP / user-agent)
+ * @param {string} [opts.description]
+ * @param {object} [opts.metadata]
+ */
+export const logAuthEvent = async ({ action, user, req, description, metadata }) => {
+  if (!user) return;
+  // Auth routes run before requireBranch, so there is no req.branchId. Resolve the
+  // branch from the user so the row is visible to the branch-scoped log views —
+  // every one of them filters on `branch`, so a branch-less row would be written
+  // but never shown.
+  const branch = user.defaultBranch
+    || (Array.isArray(user.assignedBranches) ? user.assignedBranches[0] : undefined);
+
+  await logActivity({
+    user,
+    action,
+    module: 'auth',
+    recordId: user._id,
+    recordTitle: user.name || user.userName || user.email || '',
+    recordModel: 'User',
+    description: description || `${action === 'login' ? 'Signed in' : 'Signed out'}`,
+    metadata: metadata || null,
+    // logActivity takes `branch`; passing it explicitly avoids depending on req.branchId.
+    branch: branch?._id || branch || undefined,
+    req,
+  });
+};
+
+/**
+ * Log a document/report download.
+ *
+ * The auto-logger ignores GETs, so without this every download is invisible and the
+ * Download Logs screen stays empty. Call it from an endpoint that streams a file, after
+ * the content has been read successfully.
+ *
+ * `req.branchId` is honoured when present; these routes normally sit behind requireBranch.
+ *
+ * @param {object} opts
+ * @param {object} opts.req
+ * @param {string} opts.recordTitle  what was downloaded, e.g. the file name
+ * @param {string} opts.module       e.g. 'hrms', 'recruitment', 'hr_templates'
+ * @param {*} [opts.recordId]
+ * @param {string} [opts.recordModel]
+ * @param {string} [opts.description]
+ */
+export const logDownload = async ({ req, recordTitle, module, recordId, recordModel, description }) => {
+  if (!req?.user) return;
+  await logActivity({
+    user: req.user,
+    action: 'download',
+    module: module || 'document',
+    recordId: recordId || null,
+    recordTitle: recordTitle || '',
+    recordModel: recordModel || '',
+    description: description || `Downloaded ${recordTitle || 'a document'}`,
+    req,
+  });
+};
+
+export default { logActivity, autoLogMiddleware, logAuthEvent, logDownload };

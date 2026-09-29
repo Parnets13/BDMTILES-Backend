@@ -11,6 +11,7 @@ import HrmsSettings from '../models/HrmsSettings.js';
 import EmployeeExit, { EXIT_CLEARANCE_ITEMS } from '../models/EmployeeExit.js';
 import PerformanceReview, { PERFORMANCE_COMPONENTS } from '../models/PerformanceReview.js';
 import { protect, requirePermission } from '../middleware/auth.js';
+import { logDownload } from '../middleware/activityLogger.js';
 import { requireBranch } from '../utils/branchScope.js';
 import { buildSalarySnapshot } from '../utils/salarySnapshot.js';
 import { hrGeneratedDocumentDirectory, candidateResumeDirectory } from '../middleware/upload.js';
@@ -21,6 +22,7 @@ import {
   exitEmployee,
   getAssignableEmployeeRoles,
   getEmployeeWithAccess,
+  linkEmployeeAndUser,
   listEmployeesWithAccess,
   updateEmployeeWithAccess,
 } from '../services/employeeAccessService.js';
@@ -183,6 +185,27 @@ router.post('/employees/:id/exit', ...employeeAccess, async (req, res) => {
   } catch (error) { return sendEmployeeError(res, error); }
 });
 
+/**
+ * Link an existing login to this employee.
+ *
+ * The mirror of `POST /users/:id/link-employee`. Both exist because either admin screen
+ * can be where the operator notices the missing half, and both must land in the same
+ * state — which is why they share one service function rather than each doing its own
+ * field copying.
+ */
+router.post('/employees/:id/link-user', ...employeeAccess, async (req, res) => {
+  try {
+    if (!validEmployeeId(req, res)) return;
+    const employee = await linkEmployeeAndUser({
+      employeeId: req.params.id,
+      userId: req.body?.userId,
+      actor: req.user,
+      selectedBranchId: req.branchId,
+    });
+    return res.json({ success: true, message: 'Login linked to this employee.', data: employee });
+  } catch (error) { return sendEmployeeError(res, error); }
+});
+
 router.delete('/employees/:id', ...employeeAccess, async (req, res) => {
   try {
     if (!validEmployeeId(req, res)) return;
@@ -214,6 +237,14 @@ router.get('/employees/:id/documents/:fileName', ...employeeAccess, async (req, 
       const filePath = path.join(directory, storedName);
       try {
         const content = await fs.promises.readFile(filePath);
+        logDownload({
+          req,
+          module: 'hrms',
+          recordId: employee._id,
+          recordTitle: doc.name || storedName,
+          recordModel: 'Employee',
+          description: `Downloaded employee document ${doc.name || storedName}`,
+        }).catch(() => {});
         res.attachment(doc.name || storedName);
         return res.send(content);
       } catch { /* try the next directory */ }

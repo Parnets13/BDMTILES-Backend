@@ -7,6 +7,8 @@ import Region from '../models/Region.js';
 import Dealer from '../models/Dealer.js';
 import Employee from '../models/Employee.js';
 import { protect, requirePermission, userHasPermission } from '../middleware/auth.js';
+import { linkEmployeeAndUser } from '../services/employeeAccessService.js';
+import { findMobileOwner, MOBILE_OWNER_TYPE } from '../services/mobileIdentityService.js';
 import { logActivity } from '../middleware/activityLogger.js';
 import {
   GLOBAL_BRANCH_ROLES,
@@ -517,6 +519,57 @@ const router = Router();
 router.use(protect);
 router.use(requirePermission('users.manage'));
 
+/**
+ * Who holds a mobile number.
+ *
+ * `mobileIdentityService` deliberately refuses to say who owns a number — a form that
+ * named the owner becomes an enumeration tool, which is why the shared
+ * MOBILE_IN_USE_MESSAGE is written to reveal nothing. This route is the deliberate
+ * exception, and it is safe ONLY because the whole router sits behind `users.manage`:
+ * anyone who can reach it can already list every user and employee in the branch, so it
+ * discloses nothing they could not read directly.
+ *
+ * Do NOT expose this from a dealer or customer surface, and do not let the
+ * MOBILE_IN_USE_MESSAGE callers adopt its richer response.
+ */
+router.get('/mobile-owner', async (req, res) => {
+  try {
+    const mobile = String(req.query.mobile || '').trim();
+    if (!mobile) return res.json({ success: true, data: null });
+    const owner = await findMobileOwner(mobile, {
+      exclude: mongoose.isValidObjectId(req.query.excludeId)
+        ? { type: req.query.excludeType || MOBILE_OWNER_TYPE.STAFF_USER, id: req.query.excludeId }
+        : null,
+    });
+    return res.json({ success: true, data: owner });
+  } catch (error) {
+    return res.status(error.status || 500).json({ success: false, message: error.message });
+  }
+});
+
+/**
+ * Link an existing HRMS employee to this login.
+ *
+ * Mirror of `POST /hrms/employees/:id/link-user`. Both call the same service function
+ * because the two directions must land in exactly the same state — two implementations
+ * would eventually disagree about which fields get copied.
+ */
+router.post('/:id/link-employee', async (req, res) => {
+  try {
+    if (!mongoose.isValidObjectId(req.params.id)) {
+      return res.status(422).json({ success: false, message: 'Invalid login identifier.' });
+    }
+    const employee = await linkEmployeeAndUser({
+      employeeId: req.body?.employeeId,
+      userId: req.params.id,
+      actor: req.user,
+    });
+    return res.json({ success: true, message: 'Employee linked to this login.', data: employee });
+  } catch (error) {
+    return res.status(error.status || 500).json({ success: false, message: error.message });
+  }
+});
+
 router.get('/permissions-config', (req, res) => {
   res.json({
     success: true,
@@ -633,9 +686,23 @@ router.get('/', async (req, res) => {
       User.countDocuments(filter),
     ]);
 
+    // One query for the page, never one per row.
+    const linkedEmployees = await Employee.find({ userId: { $in: users.map((user) => user._id) } })
+      .select('name empId department userId branchId')
+      .lean();
+    const employeeByUser = new Map(
+      linkedEmployees.map((employee) => [String(employee.userId), employee]),
+    );
+
     return res.json({
       success: true,
-      data: users.map((user) => sanitizeUserForActor(user, req.user)),
+      data: users.map((user) => ({
+        ...sanitizeUserForActor(user, req.user),
+        // Which of these logins already has an HRMS employee. The form needs it to show
+        // link state and to decide whether name and mobile are locked; without it the UI
+        // cannot tell a linked login from an unlinked one.
+        employee: employeeByUser.get(String(user._id)) || null,
+      })),
       pagination: { currentPage: p, totalPages: Math.ceil(total / l), totalItems: total, itemsPerPage: l },
     });
   } catch (error) {

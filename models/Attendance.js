@@ -9,8 +9,8 @@ const attendanceSchema = new mongoose.Schema(
     // Punch
     punchIn: { type: Date },
     punchOut: { type: Date },
-    punchInLocation: { lat: Number, lng: Number, accuracy: Number },
-    punchOutLocation: { lat: Number, lng: Number, accuracy: Number },
+    punchInLocation: { lat: Number, lng: Number, accuracy: Number, address: String, mocked: Boolean },
+    punchOutLocation: { lat: Number, lng: Number, accuracy: Number, address: String, mocked: Boolean },
     punchInSelfie: String,
     punchOutSelfie: String,
 

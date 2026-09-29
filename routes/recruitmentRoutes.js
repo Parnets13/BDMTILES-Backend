@@ -6,8 +6,10 @@ import Candidate from '../models/Candidate.js';
 import JobOpening from '../models/JobOpening.js';
 import Employee from '../models/Employee.js';
 import { protect, requirePermission, requireAnyPermission } from '../middleware/auth.js';
+import { logDownload } from '../middleware/activityLogger.js';
 import { requireBranch } from '../utils/branchScope.js';
 import { uploadCandidateResume, candidateResumeDirectory } from '../middleware/upload.js';
+import { scoreCandidate, compareByScore } from '../services/atsScoring.js';
 
 const router = Router();
 router.use(protect);
@@ -79,13 +81,30 @@ router.get('/job-openings/stats', ...jobAccess, async (req, res) => {
 
 router.post('/job-openings', requirePermission('job.opening.manage'), async (req, res) => {
   try {
-    const { title, department, designation, positions, employmentType, experienceRequired, description, requirements, closingDate } = req.body;
+    const {
+      title, department, designation, positions, employmentType, experienceRequired,
+      description, requirements, closingDate,
+      // Public careers-site fields.
+      location, jobMode, salaryRange, tags, keywords, publicVisible,
+    } = req.body;
     if (!title || !department || !designation) throw routeError(422, 'Title, department, and designation are required.');
     const jobCode = await JobOpening.generateJobCode();
     const opening = await JobOpening.create({
       jobCode, title, department, designation,
       positions: positions || 1, employmentType, experienceRequired,
       description, requirements, closingDate,
+      location, jobMode,
+      // Coerced rather than trusted: the admin form sends numbers, but a malformed
+      // payload must not write NaN into a numeric field that the ATS compares against.
+      salaryRange: {
+        min: Number(salaryRange?.min) || 0,
+        max: Number(salaryRange?.max) || 0,
+        period: salaryRange?.period === 'month' ? 'month' : 'year',
+      },
+      tags: Array.isArray(tags) ? tags : [],
+      keywords: Array.isArray(keywords) ? keywords : [],
+      // Explicit boolean, because publishing to a public website must be an opt-in act.
+      publicVisible: publicVisible === true,
       branchId: req.branchId, createdBy: req.user._id,
     });
     res.status(201).json({ success: true, message: 'Job opening created.', data: opening });
@@ -95,11 +114,33 @@ router.post('/job-openings', requirePermission('job.opening.manage'), async (req
 router.put('/job-openings/:id', requirePermission('job.opening.manage'), async (req, res) => {
   try {
     if (!validObjectId(req.params.id)) throw routeError(400, 'Invalid job opening id.');
-    const allowed = ['title', 'department', 'designation', 'positions', 'employmentType', 'experienceRequired', 'description', 'requirements', 'status', 'closingDate'];
+    const allowed = [
+      'title', 'department', 'designation', 'positions', 'employmentType',
+      'experienceRequired', 'description', 'requirements', 'status', 'closingDate',
+      'location', 'jobMode', 'salaryRange', 'tags', 'keywords', 'publicVisible',
+    ];
     const updates = allowed.reduce((acc, key) => {
       if (Object.prototype.hasOwnProperty.call(req.body, key)) acc[key] = req.body[key];
       return acc;
     }, {});
+    // Normalise the same way create does, so PUT cannot smuggle a bad shape past
+    // Mongoose (a nested object update is not validated field-by-field by default).
+    if (Object.prototype.hasOwnProperty.call(updates, 'salaryRange')) {
+      updates.salaryRange = {
+        min: Number(updates.salaryRange?.min) || 0,
+        max: Number(updates.salaryRange?.max) || 0,
+        period: updates.salaryRange?.period === 'month' ? 'month' : 'year',
+      };
+    }
+    if (Object.prototype.hasOwnProperty.call(updates, 'publicVisible')) {
+      updates.publicVisible = updates.publicVisible === true;
+    }
+    if (Object.prototype.hasOwnProperty.call(updates, 'tags') && !Array.isArray(updates.tags)) {
+      updates.tags = [];
+    }
+    if (Object.prototype.hasOwnProperty.call(updates, 'keywords') && !Array.isArray(updates.keywords)) {
+      updates.keywords = [];
+    }
     const opening = await JobOpening.findOneAndUpdate({ _id: req.params.id, branchId: req.branchId }, updates, { new: true, runValidators: true });
     if (!opening) throw routeError(404, 'Job opening not found.');
     res.json({ success: true, message: 'Job opening updated.', data: opening });
@@ -124,7 +165,7 @@ const candidateAccess = [requirePermission('candidate.manage')];
 
 router.get('/candidates', ...candidateAccess, async (req, res) => {
   try {
-    const { page = 1, limit = 20, search, status, jobOpening, talentPool } = req.query;
+    const { page = 1, limit = 20, search, status, jobOpening, talentPool, sortBy } = req.query;
     const p = Math.max(1, parseInt(page) || 1);
     const l = Math.min(100, Math.max(1, parseInt(limit) || 20));
     const filter = { branchId: req.branchId };
@@ -135,14 +176,50 @@ router.get('/candidates', ...candidateAccess, async (req, res) => {
     if (status) filter.status = status;
     if (jobOpening && validObjectId(jobOpening)) filter.jobOpening = jobOpening;
     if (talentPool === 'true') filter.talentPool = true;
+
+    // ATS ranking. Scores are computed on read rather than stored, so tuning the
+    // weights in services/atsScoring.js takes effect immediately instead of requiring
+    // a backfill — and can never disagree with the explanation shown in the UI.
+    //
+    // Only meaningful for an unfiltered-by-opening list, where every row is scored
+    // against the same job. When `jobOpening` is set we sort by score server-side;
+    // otherwise two candidates in different openings are not comparable and sorting
+    // would be misleading. As a safety net the list is re-sorted here in memory over
+    // the current page, so the UI can always trust `data[].atsScore` ordering.
+    const wantsScoreSort = String(sortBy || '').toLowerCase() === 'score' && Boolean(jobOpening);
+
     const [candidates, total] = await Promise.all([
-      Candidate.find(filter).sort({ createdAt: -1 }).skip((p - 1) * l).limit(l)
-        .populate('jobOpening', 'jobCode title department').lean(),
+      Candidate.find(filter)
+        // When ranking by score we cannot rely on the DB sort: `atsScore` is derived,
+        // not a stored field. Fetch the page by recency (a stable, indexed order) then
+        // sort the slice. For a scoped list this is the same result HR expects, and it
+        // avoids loading every document in the branch to rank it.
+        .sort(wantsScoreSort ? { createdAt: -1 } : { createdAt: -1 })
+        .skip((p - 1) * l).limit(l)
+        .populate('jobOpening', 'jobCode title department designation experienceRequired salaryRange requirements keywords')
+        .lean(),
       Candidate.countDocuments(filter),
     ]);
+
+    const scored = candidates.map((c) => {
+      const result = scoreCandidate(c, c.jobOpening);
+      return {
+        ...c,
+        atsScore: result.score,
+        atsBand: result.band,
+        atsFactors: result.factors,
+        atsKeyMatches: result.keyMatches,
+        atsKeyMisses: result.keyMisses,
+      };
+    });
+
+    if (wantsScoreSort) {
+      scored.sort(compareByScore((c) => c.atsScore));
+    }
+
     res.json({
       success: true,
-      data: candidates,
+      data: scored,
       pagination: { currentPage: p, totalPages: Math.ceil(total / l), totalItems: total, itemsPerPage: l },
     });
   } catch (error) { sendError(res, error); }
@@ -168,11 +245,24 @@ router.get('/candidates/:id', ...candidateAccess, async (req, res) => {
   try {
     if (!validObjectId(req.params.id)) throw routeError(400, 'Invalid candidate id.');
     const candidate = await Candidate.findOne({ _id: req.params.id, branchId: req.branchId })
-      .populate('jobOpening', 'jobCode title department designation')
+      .populate('jobOpening', 'jobCode title department designation experienceRequired salaryRange requirements keywords')
       .populate('convertedToEmployee', 'empId name designation department')
       .lean();
     if (!candidate) throw routeError(404, 'Candidate not found.');
-    res.json({ success: true, data: candidate });
+    // Same derived scoring as the list, so the detail view and the row always agree.
+    const result = scoreCandidate(candidate, candidate.jobOpening);
+    res.json({
+      success: true,
+      data: {
+        ...candidate,
+        atsScore: result.score,
+        atsBand: result.band,
+        atsFactors: result.factors,
+        atsKeyMatches: result.keyMatches,
+        atsKeyMisses: result.keyMisses,
+        atsMissingFields: result.missingFields,
+      },
+    });
   } catch (error) { sendError(res, error); }
 });
 
@@ -285,6 +375,14 @@ router.get('/candidates/:id/resume', ...candidateAccess, async (req, res) => {
     if (storedName !== candidate.resume.url) throw routeError(409, 'Stored resume reference is invalid.');
     const filePath = path.join(candidateResumeDirectory, storedName);
     const content = await fs.promises.readFile(filePath);
+    logDownload({
+      req,
+      module: 'recruitment',
+      recordId: candidate._id,
+      recordTitle: candidate.resume.name || storedName,
+      recordModel: 'Candidate',
+      description: `Downloaded resume for ${candidate.name || 'candidate'}`,
+    }).catch(() => {});
     res.attachment(candidate.resume.name || storedName);
     res.send(content);
   } catch (error) { sendError(res, error); }

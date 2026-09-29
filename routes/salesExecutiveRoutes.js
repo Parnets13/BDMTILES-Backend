@@ -14,11 +14,16 @@ import Payment from '../models/Payment.js';
 import Invoice from '../models/Invoice.js';
 import DealerVisit from '../models/DealerVisit.js';
 import DealerMessage from '../models/DealerMessage.js';
+import TrackingPing from '../models/TrackingPing.js';
+import User from '../models/User.js';
 import { protect, requireAnyPermission, requirePermission } from '../middleware/auth.js';
+import { uploadSEFieldImages } from '../middleware/upload.js';
 import { requireBranch } from '../utils/branchScope.js';
 import { getDealerCreditExposure } from '../services/dealerCreditService.js';
 import { generateBranchNumber } from '../utils/branchSequence.js';
 import { listMyTargetProgress } from '../services/targetService.js';
+import { reverseGeocode, geocodeStatus } from '../services/geoService.js';
+import { emitTrackingUpdate } from '../services/socketService.js';
 
 const router = Router();
 router.use(protect);
@@ -44,6 +49,34 @@ async function ledgerOutstanding(branchId, dealerId) {
   ]);
   return round2((row?.debit || 0) - (row?.credit || 0));
 }
+
+/**
+ * One upload endpoint for every field capture the SE app makes — attendance selfie,
+ * dealer-visit photo, collection receipt.
+ *
+ * The app's convention elsewhere (complaint evidence) is upload-then-store-the-URL, so
+ * this returns `{ url }` and the caller sends that string on. It exists because
+ * punch-in already accepted a `selfie` string, DealerVisit already had `attachments`,
+ * and Payment already had `receiptImage` — the app simply had no way to produce a URL
+ * to put in them.
+ */
+router.post('/me/uploads', requirePermission('sales.executive.app'), (req, res) => {
+  uploadSEFieldImages(req, res, (error) => {
+    if (error) return res.status(400).json({ success: false, message: error.message });
+    if (!req.files?.length) {
+      return res.status(400).json({ success: false, message: 'At least one image is required.' });
+    }
+    return res.json({
+      success: true,
+      message: `${req.files.length} image(s) uploaded.`,
+      data: req.files.map((file) => ({
+        url: `/uploads/se/${file.filename}`,
+        originalName: file.originalname,
+        size: file.size,
+      })),
+    });
+  });
+});
 
 router.get('/me/dealers', requirePermission('se.dealer.insights'), async (req, res) => {
   try {
@@ -261,7 +294,23 @@ function normalizeLocation(location) {
   const lng = Number(location.lng ?? location.longitude);
   if (!Number.isFinite(lat) || !Number.isFinite(lng)) return undefined;
   const accuracy = Number(location.accuracy);
-  return { lat, lng, ...(Number.isFinite(accuracy) ? { accuracy } : {}) };
+  // The human-readable address, when the device could resolve one. DealerVisit's
+  // location schema has carried an `address` field all along and this function was
+  // dropping it, which is why attendance and visits only ever stored bare coordinates.
+  // Deliberately provider-agnostic: whatever the device (or a later geocoder) supplies
+  // is what gets stored, so swapping map providers does not invalidate existing rows.
+  const address = String(location.address || '').trim();
+  // Android reports whether the fix came from a mock provider. Recording the flag is the
+  // honest half of "fake GPS detection" — you can detect a mocked fix, not the intent
+  // behind it, so this must never be presented as proof.
+  const mocked = location.mocked === true;
+  return {
+    lat,
+    lng,
+    ...(Number.isFinite(accuracy) ? { accuracy } : {}),
+    ...(address ? { address } : {}),
+    ...(mocked ? { mocked: true } : {}),
+  };
 }
 
 // Minutes a punch-in time is past (shiftStart + grace) in the business timezone,
@@ -736,6 +785,9 @@ const visitView = (visit) => ({
   notes: visit.notes || '',
   outcome: visit.outcome || '',
   nextFollowUpDate: visit.nextFollowUpDate || null,
+  attachments: visit.attachments || [],
+  checklist: visit.checklist || [],
+  missedReason: visit.missedReason || '',
   createdAt: visit.createdAt,
 });
 
@@ -805,7 +857,7 @@ router.post('/me/dealers/:id/visits/check-in', requirePermission('se.route.plan'
       status: 'checked_in',
       purpose,
       checkInAt: now,
-      checkInLocation: { lat: location.lat, lng: location.lng },
+      checkInLocation: location,
       createdBy: req.user._id,
       transitions: [{ to: 'checked_in', at: now, by: req.user._id, byName: req.user.name || '' }],
     });
@@ -841,6 +893,18 @@ router.patch('/me/visits/:id/check-out', requirePermission('se.route.plan'), asy
     const location = normalizeLocation(req.body?.location);
     const notes = String(req.body?.notes || '').trim();
     const outcome = String(req.body?.outcome || '').trim();
+    // SOW 18.2 "Visit photo" — already-uploaded URLs from /me/uploads. DealerVisit has
+    // carried an `attachments` array all along; nothing ever wrote to it.
+    const attachments = Array.isArray(req.body?.attachments)
+      ? req.body.attachments.filter((url) => typeof url === 'string' && url.trim()).map((url) => url.trim()).slice(0, 5)
+      : [];
+    // SOW 18.2 "Dealer visit checklist" — [{ label, done }] snapshot from the device.
+    const checklist = Array.isArray(req.body?.checklist)
+      ? req.body.checklist
+          .filter((row) => row && typeof row.label === 'string' && row.label.trim())
+          .map((row) => ({ label: row.label.trim(), done: row.done === true }))
+          .slice(0, 30)
+      : [];
     let nextFollowUpDate;
     if (req.body?.nextFollowUpDate) {
       nextFollowUpDate = new Date(req.body.nextFollowUpDate);
@@ -852,14 +916,50 @@ router.patch('/me/visits/:id/check-out', requirePermission('se.route.plan'), asy
     const now = new Date();
     visit.status = 'completed';
     visit.checkOutAt = now;
-    if (location) visit.checkOutLocation = { lat: location.lat, lng: location.lng };
+    if (location) visit.checkOutLocation = location;
     visit.durationMinutes = Math.max(0, Math.round((now.getTime() - new Date(visit.checkInAt).getTime()) / 60000));
     if (notes) visit.notes = notes;
     if (outcome) visit.outcome = outcome;
     if (nextFollowUpDate) visit.nextFollowUpDate = nextFollowUpDate;
+    if (attachments.length) visit.attachments = attachments;
+    if (checklist.length) visit.checklist = checklist;
     visit.transitions.push({ from: 'checked_in', to: 'completed', at: now, by: req.user._id, byName: req.user.name || '' });
     await visit.save();
     return res.json({ success: true, message: 'Checked out.', data: visitView(visit.toObject()) });
+  } catch (error) {
+    return res.status(error.name === 'ValidationError' ? 422 : 500).json({ success: false, message: error.message });
+  }
+});
+
+/**
+ * SOW 18.2 "Missed visit reason".
+ *
+ * A visit that never happened has nothing to check out of, so it cannot go through the
+ * check-out route. `cancelled` was the only alternative and it discards the reason —
+ * which is the one thing a manager actually needs from a missed visit.
+ */
+router.patch('/me/visits/:id/miss', requirePermission('se.route.plan'), async (req, res) => {
+  try {
+    if (!mongoose.isValidObjectId(req.params.id)) {
+      return res.status(422).json({ success: false, message: 'Invalid visit id.' });
+    }
+    const reason = String(req.body?.reason || '').trim();
+    if (!reason) {
+      return res.status(422).json({ success: false, message: 'A reason is required for a missed visit.' });
+    }
+    const visit = await DealerVisit.findOne({ _id: req.params.id, salesExecutive: req.user._id });
+    if (!visit) return res.status(404).json({ success: false, message: 'Visit not found.' });
+    if (visit.status !== 'checked_in') {
+      return res.status(409).json({ success: false, message: `This visit is already ${visit.status}.` });
+    }
+
+    const now = new Date();
+    visit.status = 'missed';
+    visit.missedReason = reason;
+    visit.missedAt = now;
+    visit.transitions.push({ from: 'checked_in', to: 'missed', at: now, by: req.user._id, byName: req.user.name || '' });
+    await visit.save();
+    return res.json({ success: true, message: 'Visit marked as missed.', data: visitView(visit.toObject()) });
   } catch (error) {
     return res.status(error.name === 'ValidationError' ? 422 : 500).json({ success: false, message: error.message });
   }
@@ -871,7 +971,7 @@ router.patch('/me/visits/:id/check-out', requirePermission('se.route.plan'), asy
 // visits the app records. Read-only by design: a visit is field evidence and is
 // only ever written by the executive who made it.
 
-const VISIT_STATUSES = ['checked_in', 'completed', 'cancelled'];
+const VISIT_STATUSES = ['checked_in', 'completed', 'cancelled', 'missed'];
 
 /** Inclusive day window from optional from/to query dates, in local time. */
 function visitDateWindow({ from, to }) {
@@ -969,12 +1069,457 @@ router.get('/visits/summary', requirePermission('se.attendance.view'), async (re
         checkedIn: statusCounts.checked_in || 0,
         completed: statusCounts.completed || 0,
         cancelled: statusCounts.cancelled || 0,
+        missed: statusCounts.missed || 0,
         today,
         activeExecutives: executives.filter(Boolean).length,
         avgDurationMinutes: Math.round(duration[0]?.avgMinutes || 0),
         byPurpose: Object.fromEntries(byPurpose.map((row) => [row._id, row.count])),
       },
     });
+  } catch (error) {
+    return res.status(500).json({ success: false, message: error.message });
+  }
+});
+
+// ── Admin monitoring (SOW 18.10) ─────────────────────────────────────────────
+//
+// Deliberately map-agnostic. Everything below returns coordinates, addresses and
+// timestamps rather than tiles, so these views work today and a map layer can be drawn
+// over them later without touching any of this. That matters while no compliant map
+// provider is wired up — and it means "attendance with address" needs no provider at all
+// once the device supplies one.
+
+const MONITOR_PERMISSION = 'se.attendance.view';
+
+/**
+ * Where each executive was last seen.
+ *
+ * An active check-in is the best answer — they are standing at a dealer right now.
+ * Failing that, the day's latest punch, which at least says where the day started.
+ *
+ * Attendance keys on Employee and DealerVisit on User, so the two are joined through
+ * Employee.userId. Assuming one id space here would have silently dropped every row.
+ */
+router.get('/monitoring/live', requirePermission(MONITOR_PERMISSION), async (req, res) => {
+  try {
+    const branch = new mongoose.Types.ObjectId(String(req.branchId));
+    const [activeVisits, employees, punches, latestFixes] = await Promise.all([
+      DealerVisit.find({ branch, status: 'checked_in' })
+        .select('salesExecutive dealerName checkInAt checkInLocation purpose')
+        .populate('salesExecutive', 'name phone')
+        .lean(),
+      Employee.find({ branchId: req.branchId }).select('_id name empId userId').lean(),
+      Attendance.find({ branch, date: { $gte: startOfToday() } })
+        .select('employee punchIn punchOut punchInLocation punchOutLocation status')
+        .lean(),
+      // Newest tracking row per executive. Aggregated rather than queried per person
+      // so this stays one round trip however many executives a branch has.
+      TrackingPing.aggregate([
+        { $match: { branch } },
+        { $sort: { at: -1 } },
+        { $group: { _id: '$executive', doc: { $first: '$$ROOT' } } },
+      ]),
+    ]);
+
+    const employeeById = new Map(employees.map((row) => [String(row._id), row]));
+    const rows = new Map();
+
+    // Punches first — they cover everyone who turned up, visited or not.
+    for (const punch of punches) {
+      const employee = employeeById.get(String(punch.employee));
+      if (!employee) continue;
+      const key = String(employee.userId || employee._id);
+      const place = punch.punchOut ? punch.punchOutLocation : punch.punchInLocation;
+      rows.set(key, {
+        executiveId: employee.userId || null,
+        employeeId: employee._id,
+        name: employee.name || '',
+        empId: employee.empId || '',
+        status: punch.status || '',
+        lastSeenAt: punch.punchOut || punch.punchIn || null,
+        location: place || null,
+        onSite: false,
+        dealerName: '',
+        purpose: '',
+        checkedInAt: null,
+      });
+    }
+
+    // An active visit overrides it: that is where they actually are.
+    for (const visit of activeVisits) {
+      const executive = visit.salesExecutive;
+      const key = String(executive?._id || visit.salesExecutive);
+      const existing = rows.get(key) || {};
+      rows.set(key, {
+        ...existing,
+        executiveId: executive?._id || visit.salesExecutive,
+        name: executive?.name || existing.name || '',
+        phone: executive?.phone || '',
+        lastSeenAt: visit.checkInAt,
+        location: visit.checkInLocation || existing.location || null,
+        onSite: true,
+        dealerName: visit.dealerName || '',
+        purpose: visit.purpose || '',
+        checkedInAt: visit.checkInAt,
+      });
+    }
+
+    // The tracking fix is the freshest source, so it wins where it exists. A stale fix
+    // is still shown but flagged — a phone that died at 11am must not read "at Dealer X"
+    // at 6pm as though it were current.
+    const staleAfterMs = staleMinutes() * 60000;
+    for (const row of latestFixes) {
+      const key = String(row._id);
+      const existing = rows.get(key) || {};
+      const fix = row.doc || {};
+      rows.set(key, {
+        ...existing,
+        executiveId: row._id,
+        name: existing.name || fix.executiveName || '',
+        lastSeenAt: fix.at,
+        location: fix.lat != null
+          ? { lat: fix.lat, lng: fix.lng, accuracy: fix.accuracy, address: fix.address, mocked: fix.mocked }
+          : existing.location || null,
+        trackingStatus: fix.status || 'active',
+        battery: fix.battery ?? null,
+        charging: fix.charging === true,
+        stale: !fix.at || Date.now() - new Date(fix.at).getTime() > staleAfterMs,
+        // Reported by the device. Surfaced as information to check, never as an
+        // accusation — see the productivity view.
+        mocked: fix.mocked === true,
+      });
+    }
+
+    const data = [...rows.values()].sort((a, b) => {
+      if (a.onSite !== b.onSite) return a.onSite ? -1 : 1;
+      return new Date(b.lastSeenAt || 0) - new Date(a.lastSeenAt || 0);
+    });
+    return res.json({ success: true, data });
+  } catch (error) {
+    return res.status(500).json({ success: false, message: error.message });
+  }
+});
+
+/** One executive's day in order — every visit with its times, place and duration. */
+router.get('/monitoring/route-history', requirePermission(MONITOR_PERMISSION), async (req, res) => {
+  try {
+    const filter = { branch: req.branchId };
+    if (req.query.executive) filter.salesExecutive = req.query.executive;
+    const window = visitDateWindow(req.query);
+    if (window) filter.checkInAt = window;
+
+    const visits = await DealerVisit.find(filter)
+      .select('dealer dealerName salesExecutive status purpose checkInAt checkOutAt durationMinutes checkInLocation checkOutLocation notes outcome attachments checklist missedReason')
+      .populate('dealer', 'businessName dealerCode')
+      .populate('salesExecutive', 'name')
+      .sort({ checkInAt: 1 })
+      .limit(500)
+      .lean();
+
+    return res.json({
+      success: true,
+      data: visits.map((visit) => ({
+        _id: visit._id,
+        dealerName: visit.dealerName || visit.dealer?.businessName || '',
+        dealerCode: visit.dealer?.dealerCode || '',
+        executiveName: visit.salesExecutive?.name || '',
+        status: visit.status,
+        purpose: visit.purpose,
+        checkInAt: visit.checkInAt,
+        checkOutAt: visit.checkOutAt || null,
+        durationMinutes: visit.durationMinutes || 0,
+        checkInLocation: visit.checkInLocation || null,
+        checkOutLocation: visit.checkOutLocation || null,
+        notes: visit.notes || '',
+        outcome: visit.outcome || '',
+        photoCount: (visit.attachments || []).length,
+        checklist: visit.checklist || [],
+        missedReason: visit.missedReason || '',
+      })),
+    });
+  } catch (error) {
+    return res.status(500).json({ success: false, message: error.message });
+  }
+});
+
+/** Visits that were closed as missed, with the reason the executive gave. */
+router.get('/monitoring/missed-visits', requirePermission(MONITOR_PERMISSION), async (req, res) => {
+  try {
+    const filter = { branch: req.branchId, status: 'missed' };
+    const window = visitDateWindow(req.query);
+    if (window) filter.checkInAt = window;
+
+    const visits = await DealerVisit.find(filter)
+      .select('dealerName salesExecutive missedReason missedAt checkInAt purpose')
+      .populate('salesExecutive', 'name')
+      .sort({ missedAt: -1 })
+      .limit(200)
+      .lean();
+
+    return res.json({
+      success: true,
+      data: visits.map((visit) => ({
+        _id: visit._id,
+        dealerName: visit.dealerName || '',
+        executiveName: visit.salesExecutive?.name || '',
+        purpose: visit.purpose,
+        missedReason: visit.missedReason || '',
+        missedAt: visit.missedAt || visit.checkInAt || null,
+      })),
+    });
+  } catch (error) {
+    return res.status(500).json({ success: false, message: error.message });
+  }
+});
+
+/**
+ * Per-executive productivity for a window: visits, time at dealers, outcomes, and how
+ * much of it was verified (a photo, a checklist, a non-mocked fix).
+ */
+router.get('/monitoring/productivity', requirePermission(MONITOR_PERMISSION), async (req, res) => {
+  try {
+    const filter = { branch: req.branchId };
+    const window = visitDateWindow(req.query);
+    if (window) filter.checkInAt = window;
+
+    const [rows] = await Promise.all([
+      DealerVisit.aggregate([
+        { $match: { ...filter, branch: new mongoose.Types.ObjectId(String(req.branchId)) } },
+        {
+          $group: {
+            _id: '$salesExecutive',
+            visits: { $sum: 1 },
+            completed: { $sum: { $cond: [{ $eq: ['$status', 'completed'] }, 1, 0] } },
+            missed: { $sum: { $cond: [{ $eq: ['$status', 'missed'] }, 1, 0] } },
+            inProgress: { $sum: { $cond: [{ $eq: ['$status', 'checked_in'] }, 1, 0] } },
+            totalMinutes: { $sum: '$durationMinutes' },
+            withPhoto: { $sum: { $cond: [{ $gt: [{ $size: { $ifNull: ['$attachments', []] } }, 0] }, 1, 0] } },
+            mockedFixes: {
+              $sum: { $cond: [{ $eq: ['$checkInLocation.mocked', true] }, 1, 0] },
+            },
+          },
+        },
+      ]),
+    ]);
+
+    const executives = await User.find({ _id: { $in: rows.map((row) => row._id).filter(Boolean) } })
+      .select('name phone')
+      .lean();
+    const nameById = new Map(executives.map((row) => [String(row._id), row]));
+
+    const data = rows
+      .map((row) => ({
+        executiveId: row._id,
+        name: nameById.get(String(row._id))?.name || 'Unknown',
+        phone: nameById.get(String(row._id))?.phone || '',
+        visits: row.visits,
+        completed: row.completed,
+        missed: row.missed,
+        inProgress: row.inProgress,
+        totalMinutes: row.totalMinutes,
+        avgMinutes: row.completed ? Math.round(row.totalMinutes / row.completed) : 0,
+        withPhoto: row.withPhoto,
+        // Surfaced as a count to look into, never as an accusation — a mocked fix is
+        // evidence that the device reported one, not proof of intent.
+        mockedFixes: row.mockedFixes,
+      }))
+      .sort((a, b) => b.completed - a.completed || b.visits - a.visits);
+
+    return res.json({ success: true, data });
+  } catch (error) {
+    return res.status(500).json({ success: false, message: error.message });
+  }
+});
+
+// ── Field tracking (SOW 18.10 "Live GPS tracking") ───────────────────────────
+//
+// Privacy-first, following the pattern the client's reference app already uses:
+// an executive is tracked ONLY between check-in and check-out, and never after
+// 23:59 business time. The gate is enforced here on every write, not just in the
+// app, so a modified client cannot keep reporting after hours.
+//
+// No Firebase, no second vendor. The client already runs socket.io, so the live
+// view is pushed over that and the trail is stored in MongoDB.
+
+const BUSINESS_OFFSET_MINUTES = 330; // IST (UTC+5:30)
+const businessNow = () => new Date(Date.now() + BUSINESS_OFFSET_MINUTES * 60000);
+const businessDayKey = (date = new Date()) =>
+  new Date(date.getTime() + BUSINESS_OFFSET_MINUTES * 60000).toISOString().slice(0, 10);
+const isPastBusinessMidnight = () => {
+  const now = businessNow();
+  return now.getUTCHours() >= 23 && now.getUTCMinutes() >= 59;
+};
+
+const staleMinutes = () => {
+  const parsed = Number.parseInt(process.env.TRACKING_STALE_MINUTES, 10);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : 10;
+};
+const retentionDays = () => {
+  const parsed = Number.parseInt(process.env.TRACKING_HISTORY_RETENTION_DAYS, 10);
+  return Number.isFinite(parsed) && parsed >= 0 ? parsed : 90;
+};
+const minPingSeconds = () => {
+  const parsed = Number.parseInt(process.env.TRACKING_MIN_PING_SECONDS, 10);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : 30;
+};
+
+/** Metres between two fixes — used to skip storing a stationary phone's jitter. */
+const distanceMeters = (a, b) => {
+  if (!a || !b) return Infinity;
+  const R = 6371000;
+  const toRad = (d) => (d * Math.PI) / 180;
+  const dLat = toRad(b.lat - a.lat);
+  const dLng = toRad(b.lng - a.lng);
+  const h = Math.sin(dLat / 2) ** 2
+    + Math.cos(toRad(a.lat)) * Math.cos(toRad(b.lat)) * Math.sin(dLng / 2) ** 2;
+  return 2 * R * Math.asin(Math.sqrt(h));
+};
+
+/**
+ * Whether this executive may be tracked right now — and why not, when not.
+ *
+ * Returns a reason rather than a bare boolean so the app can tell the user something
+ * useful ("you have checked out") instead of silently stopping.
+ */
+async function trackingDecision(req) {
+  const employee = await resolveEmployee(req);
+  if (!employee) return { shouldTrack: false, reason: 'no_employee_profile' };
+  const attendance = await Attendance.findOne({
+    branch: req.branchId,
+    employee: employee._id,
+    date: startOfToday(),
+  }).lean();
+  if (!attendance?.punchIn) return { shouldTrack: false, reason: 'not_checked_in' };
+  if (attendance.punchOut) return { shouldTrack: false, reason: 'checked_out' };
+  if (isPastBusinessMidnight()) return { shouldTrack: false, reason: 'past_midnight' };
+  return { shouldTrack: true, reason: 'active', employee, attendance };
+}
+
+router.get('/me/tracking/status', requirePermission('se.attendance.view'), async (req, res) => {
+  try {
+    const decision = await trackingDecision(req);
+    return res.json({
+      success: true,
+      data: {
+        shouldTrack: decision.shouldTrack,
+        reason: decision.reason,
+        minPingSeconds: minPingSeconds(),
+        geocoding: geocodeStatus(),
+      },
+    });
+  } catch (error) {
+    return res.status(500).json({ success: false, message: error.message });
+  }
+});
+
+/**
+ * Record a fix, or a status change with no fix.
+ *
+ * `status: 'gps_off'` is a first-class report, not an error — when an executive's dot
+ * stops moving, "location is switched off" and "the phone is dead" are very different
+ * answers for whoever is watching.
+ */
+router.post('/me/tracking/ping', requirePermission('se.attendance.view'), async (req, res) => {
+  try {
+    const decision = await trackingDecision(req);
+    if (!decision.shouldTrack) {
+      return res.status(409).json({
+        success: false,
+        code: 'TRACKING_NOT_ALLOWED',
+        message: `Tracking is not active (${decision.reason}).`,
+        data: { reason: decision.reason },
+      });
+    }
+
+    const status = req.body?.status === 'gps_off' ? 'gps_off' : 'active';
+    const location = status === 'active' ? normalizeLocation(req.body?.location) : undefined;
+    if (status === 'active' && !location) {
+      return res.status(422).json({ success: false, message: 'A valid location is required to report a fix.' });
+    }
+
+    const previous = await TrackingPing.findOne({ executive: req.user._id })
+      .sort({ at: -1 })
+      .select('at lat lng status')
+      .lean();
+
+    // Throttle server-side as well as in the app. The app's own throttle is a courtesy;
+    // this is the one a modified client cannot skip.
+    const moved = distanceMeters(previous, location);
+    const sinceMs = previous ? Date.now() - new Date(previous.at).getTime() : Infinity;
+    const statusChanged = !previous || previous.status !== status;
+    if (!statusChanged && moved < 20 && sinceMs < minPingSeconds() * 1000) {
+      return res.json({ success: true, message: 'Throttled.', data: { stored: false, reason: 'active' } });
+    }
+
+    // Reverse geocoded once per distinct spot (the service caches), so repeated pings
+    // from a dealer's yard do not spend provider quota.
+    const address = location ? await reverseGeocode(location) : '';
+
+    const days = retentionDays();
+    const ping = await TrackingPing.create({
+      branch: req.branchId,
+      executive: req.user._id,
+      employee: decision.employee?._id,
+      executiveName: req.user.name || '',
+      at: new Date(),
+      day: businessDayKey(),
+      status,
+      lat: location?.lat,
+      lng: location?.lng,
+      accuracy: location?.accuracy,
+      speed: Number.isFinite(Number(req.body?.speed)) ? Number(req.body.speed) : undefined,
+      address,
+      mocked: location?.mocked === true,
+      battery: Number.isFinite(Number(req.body?.battery)) ? Number(req.body.battery) : undefined,
+      charging: req.body?.charging === true,
+      context: req.body?.context === 'visit' ? 'visit' : 'duty',
+      dealer: req.body?.dealer || undefined,
+      // TTL handles pruning; a cron job is one more thing that can silently stop.
+      expiresAt: days > 0 ? new Date(Date.now() + days * 86400000) : undefined,
+    });
+
+    emitTrackingUpdate({
+      branch: String(req.branchId),
+      executiveId: String(req.user._id),
+      name: req.user.name || '',
+      status,
+      at: ping.at,
+      lat: ping.lat,
+      lng: ping.lng,
+      address: ping.address,
+      battery: ping.battery,
+      charging: ping.charging,
+      context: ping.context,
+      dealer: ping.dealer ? String(ping.dealer) : null,
+      mocked: ping.mocked,
+    });
+
+    return res.json({ success: true, data: { stored: true, reason: 'active' } });
+  } catch (error) {
+    return res.status(error.name === 'ValidationError' ? 422 : 500).json({ success: false, message: error.message });
+  }
+});
+
+/** One executive's breadcrumb trail for a day — what the route replay is drawn from. */
+router.get('/monitoring/trail', requirePermission(MONITOR_PERMISSION), async (req, res) => {
+  try {
+    const executive = req.query.executive;
+    if (!executive || !mongoose.isValidObjectId(executive)) {
+      return res.status(422).json({ success: false, message: 'A valid executive is required.' });
+    }
+    const day = String(req.query.day || businessDayKey()).slice(0, 10);
+    const points = await TrackingPing.find({
+      branch: req.branchId,
+      executive,
+      day,
+      status: 'active',
+      lat: { $ne: null },
+    })
+      .select('at lat lng accuracy speed address battery charging mocked context')
+      .sort({ at: 1 })
+      .limit(2000)
+      .lean();
+    return res.json({ success: true, data: { day, points } });
   } catch (error) {
     return res.status(500).json({ success: false, message: error.message });
   }

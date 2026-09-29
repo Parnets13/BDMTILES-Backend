@@ -277,16 +277,48 @@ router.get('/', requirePermission('lead.view'), asyncRoute(async (req, res) => {
 }));
 
 router.post('/', requirePermission('lead.create'), asyncRoute(async (req, res) => {
-  if (req.body.assignedTo || req.body.assignmentStatus || req.body.assignmentHistory) {
-    return res.status(422).json({ success: false, message: 'Create-time assignment is not supported. Create the lead, then use the validated assignment action.' });
+  const assignToSelf = req.body.assignToSelf === true || req.body.assignToMe === true;
+  if (!assignToSelf && (req.body.assignedTo || req.body.assignmentStatus || req.body.assignmentHistory)) {
+    return res.status(422).json({ success: false, message: 'Create-time assignment is not supported. Use assignToSelf or create the lead first.' });
   }
   const data = { ...pick(req.body, CREATE_FIELDS), ...getLeadCreateScope(req) };
   data.leadChannel = data.leadChannel || CHANNEL_BY_LEGACY_TYPE[data.customerType] || 'other';
   data.leadSource = data.leadSource || data.customerType || '';
   const { generateUniqueCode } = await import('../utils/codeGenerator.js');
   data.leadNumber = await generateUniqueCode(Lead, 'leadNumber', 'LD-', 5);
+
+  const now = new Date();
+  if (assignToSelf) {
+    data.assignedTo = req.user._id;
+    data.assignedToName = req.user.name;
+    data.assignmentStatus = 'accepted';
+    data.status = 'contacted';
+    data.assignedAt = now;
+    data.acceptedAt = now;
+    data.assignmentVersion = 1;
+    data.assignmentHistory = [{
+      assignedTo: req.user._id,
+      assignedToName: req.user.name,
+      assignedBy: req.user._id,
+      assignedByName: req.user.name,
+      assignedAt: now,
+      response: 'accepted',
+      respondedAt: now,
+    }];
+  }
+
   const lead = await Lead.create(data);
-  await appendLeadActivity({ branch: req.branchId, lead, type: 'created', summary: `Lead ${lead.leadNumber} created`, actor: req.user });
+
+  if (assignToSelf) {
+    await LeadExecutiveAvailability.findOneAndUpdate(
+      { branch: req.branchId, user: req.user._id },
+      { $set: { status: 'attending', currentLead: lead._id, updatedBy: req.user._id, statusUpdatedAt: now, lastSeenAt: now }, $setOnInsert: { branch: req.branchId, user: req.user._id } },
+      { upsert: true }
+    );
+    publishLeadEvent({ branchId: req.branchId, event: 'availability.changed', data: { userId: req.user._id, status: 'attending' } });
+  }
+
+  await appendLeadActivity({ branch: req.branchId, lead, type: 'created', summary: `Lead ${lead.leadNumber} created${assignToSelf ? ' and assigned to self' : ''}`, actor: req.user });
   await emitNotification({
     branch: req.branchId, module: 'lead', event: 'lead_created', eventKey: `lead:${lead._id}:created`,
     title: `Lead ${lead.leadNumber} created`, body: `${lead.name} was added as a new lead.`,
@@ -421,6 +453,13 @@ router.patch('/:id/assign', requirePermission('lead.assign'), asyncRoute(async (
 router.patch('/:id/accept', requirePermission('lead.respond'), asyncRoute(async (req, res) => {
   const scope = await getLeadRecordPredicate(req, 'respond');
   const lead = await respondToAssignment({ leadId: req.params.id, scope, branchId: req.branchId, actor: req.user, action: 'accepted', expectedVersion: Number(req.body.expectedVersion) });
+  const now = new Date();
+  await LeadExecutiveAvailability.findOneAndUpdate(
+    { branch: req.branchId, user: req.user._id },
+    { $set: { status: 'attending', currentLead: lead._id, updatedBy: req.user._id, statusUpdatedAt: now, lastSeenAt: now }, $setOnInsert: { branch: req.branchId, user: req.user._id } },
+    { upsert: true }
+  );
+  publishLeadEvent({ branchId: req.branchId, event: 'availability.changed', data: { userId: req.user._id, status: 'attending' } });
   res.json({ success: true, message: 'Lead accepted.', data: lead });
 }));
 
@@ -449,12 +488,23 @@ router.patch('/:id/followup', requirePermission('lead.followup'), asyncRoute(asy
   if (req.body.outcome === 'not_interested') lead.status = 'lost';
   else if (req.body.outcome === 'interested' && lead.status === 'contacted') lead.status = 'qualified';
 
+  const now = new Date();
   if (req.body.outcome === 'converted') {
     const result = await markLeadWon({ lead, actor: req.user, branchId: req.branchId, conversionValue: req.body.conversionValue, source: 'followup' });
     await appendLeadActivity({ branch: req.branchId, lead: result.lead, type: 'followup', summary: 'Follow-up: converted', actor: req.user, fromStatus: previous, toStatus: 'won', data: { notes: req.body.notes || '', nextFollowupDate: result.lead.nextFollowupDate } });
+    await LeadExecutiveAvailability.updateOne(
+      { branch: req.branchId, user: req.user._id, status: { $in: ['attending', 'busy'] } },
+      { $set: { status: 'available', currentLead: null, updatedBy: req.user._id, statusUpdatedAt: now, lastSeenAt: now } }
+    );
+    publishLeadEvent({ branchId: req.branchId, event: 'availability.changed', data: { userId: req.user._id, status: 'available' } });
     return res.json({ success: true, message: 'Follow-up recorded and lead converted.', data: result.lead, incentiveStatus: result.incentiveStatus });
   }
   await lead.save();
+  await LeadExecutiveAvailability.updateOne(
+    { branch: req.branchId, user: req.user._id, status: { $in: ['attending', 'busy'] } },
+    { $set: { status: 'available', currentLead: null, updatedBy: req.user._id, statusUpdatedAt: now, lastSeenAt: now } }
+  );
+  publishLeadEvent({ branchId: req.branchId, event: 'availability.changed', data: { userId: req.user._id, status: 'available' } });
   await appendLeadActivity({ branch: req.branchId, lead, type: 'followup', summary: `Follow-up: ${req.body.outcome || 'callback'}`, actor: req.user, fromStatus: previous, toStatus: lead.status, data: { notes: req.body.notes || '', nextFollowupDate: lead.nextFollowupDate } });
   emitChange({ req, lead, action: 'followup', recipients: lead.assignedTo ? [lead.assignedTo] : [] });
   res.json({ success: true, message: 'Follow-up recorded.', data: lead });

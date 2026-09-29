@@ -424,6 +424,109 @@ export const createEmployeeWithAccess = async ({ input, actor, selectedBranchId 
   return serializeEmployee(employeeId, selectedBranchId);
 };
 
+/**
+ * Link an existing login to an existing employee, from either side.
+ *
+ * The two admin surfaces each create half a person: User Management makes a login with no
+ * employee record, HRMS makes an employee with no login. Attendance, GPS punch-in and
+ * field tracking all resolve the signed-in user through `Employee.userId`, so a
+ * login-only user signs in successfully and then cannot load attendance at all. This is
+ * the repair path for exactly that.
+ *
+ * One function rather than two, because both directions must land in precisely the same
+ * state — two functions would eventually disagree about which fields get synced.
+ *
+ * Identity ownership follows what `syncLinkedUser` already does: the **employee owns
+ * name, email and mobile**; the **login owns username, role and permissions**. Syncing
+ * the other way would let a login rename someone's HR record.
+ */
+export const linkEmployeeAndUser = async ({ employeeId, userId, actor, selectedBranchId = null }) => {
+  if (!mongoose.isValidObjectId(employeeId) || !mongoose.isValidObjectId(userId)) {
+    throw serviceError(422, 'A valid employee and login are both required.', 'LINK_INPUT_INVALID');
+  }
+
+  let linkedBranchId = selectedBranchId;
+  await runInTransaction(async (session) => {
+    // The branch is optional because the two callers differ: hrmsRoutes runs behind
+    // requireBranch and can scope the lookup, while userRoutes does not and has no
+    // req.branchId at all. Resolving it from the employee covers both, and the access
+    // check below is what actually protects it.
+    const employee = await Employee.findOne(
+      selectedBranchId ? { _id: employeeId, branchId: selectedBranchId } : { _id: employeeId },
+    ).session(session);
+    if (!employee) throw serviceError(404, 'Employee not found.', 'EMPLOYEE_NOT_FOUND');
+    await assertBranchAccess(actor, employee.branchId, session);
+    linkedBranchId = employee.branchId;
+
+    const user = await User.findById(userId).session(session);
+    if (!user) throw serviceError(404, 'Login not found.', 'USER_NOT_FOUND');
+
+    if (employee.userId && idString(employee.userId) !== idString(user._id)) {
+      throw serviceError(409, 'This employee is already linked to another login.', 'EMPLOYEE_ALREADY_LINKED');
+    }
+
+    // One login, one employee. The unique index on Employee.userId would catch this
+    // anyway, but as a raw duplicate-key error — the operator needs to be told which
+    // employee already holds it, not handed a 500.
+    const holder = await Employee.findOne({ userId: user._id }).select('name empId').session(session).lean();
+    if (holder && idString(holder._id) !== idString(employee._id)) {
+      throw serviceError(
+        409,
+        `That login is already linked to ${holder.name}${holder.empId ? ` (${holder.empId})` : ''}.`,
+        'USER_ALREADY_LINKED',
+      );
+    }
+
+    // The login must already be allowed in this branch. syncUserBranch would otherwise
+    // silently MOVE it, which is a much bigger change than the operator asked for and
+    // would quietly revoke access to wherever it used to be.
+    const assigned = getAssignedBranchIds(user);
+    if (!hasGlobalBranchAccess(user) && assigned.length && !assigned.includes(idString(employee.branchId))) {
+      throw serviceError(
+        409,
+        'This login is not assigned to the employee\'s branch. Add that branch to the login first, then link.',
+        'LINK_BRANCH_MISMATCH',
+      );
+    }
+
+    // The mobile is the shared identity key across Dealer, DealerEmployee, User and
+    // Employee. Linking two records whose numbers disagree would create a person whose
+    // login and HR record can never be reconciled.
+    const employeeMobile = normalizePhone(employee.mobile);
+    const userMobile = normalizePhone(user.phone);
+    if (employeeMobile && userMobile && employeeMobile !== userMobile) {
+      throw serviceError(
+        409,
+        `The mobile numbers do not match — the employee has ${employeeMobile} and the login has ${userMobile}. Correct one of them, then link.`,
+        'LINK_MOBILE_MISMATCH',
+      );
+    }
+
+    employee.userId = user._id;
+    // Fill a blank from the other side rather than refusing: a half-populated HR record
+    // is the common case, and making the operator retype what already exists is how you
+    // end up with two slightly different records.
+    if (!employeeMobile && userMobile) employee.mobile = userMobile;
+    if (!employee.email && user.email) employee.email = user.email;
+
+    user.name = employee.name;
+    user.username = user.username || normalizeLogin(user.email);
+    user.email = normalizeLogin(employee.email || user.email);
+    user.phone = normalizePhone(employee.mobile || user.phone);
+    await syncUserBranch(user, employee.branchId, session);
+    // Deliberately does NOT force the login active. Enabling a login is a separate
+    // security decision; linking only records that the two are the same person. An
+    // Inactive or Terminated employee still revokes access, which is the part that
+    // must happen automatically.
+    applyAccessState(user, employee.status, {});
+
+    await user.save({ session });
+    await employee.save({ session });
+  });
+
+  return serializeEmployee(employeeId, linkedBranchId);
+};
+
 export const updateEmployeeWithAccess = async ({ employeeId, input, actor, selectedBranchId }) => {
   assertNoUserIdTampering(input);
   const appAccess = input.appAccess || {};

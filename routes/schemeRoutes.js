@@ -9,6 +9,7 @@ import SchemeSettlement from '../models/SchemeSettlement.js';
 import Supplier from '../models/Supplier.js';
 import Dealer from '../models/Dealer.js';
 import { protect, requireAnyPermission, requirePermission } from '../middleware/auth.js';
+import { logDownload } from '../middleware/activityLogger.js';
 import { requireBranch } from '../utils/branchScope.js';
 import { generateBranchNumber } from '../utils/branchSequence.js';
 import { postSubledgerEntry } from '../utils/subledgerPosting.js';
@@ -814,6 +815,14 @@ router.get('/settlements/:id/supplier-credit-note/document', canView, async (req
       ? supplierCreditNoteDirectory
       : legacySupplierCreditNoteDirectory;
     const content = await fs.promises.readFile(path.join(directory, storedName));
+    logDownload({
+      req,
+      module: 'scheme',
+      recordId: settlement._id,
+      recordTitle: settlement.supplierCreditNote.originalName || storedName,
+      recordModel: 'SchemeSettlement',
+      description: 'Downloaded supplier credit-note evidence',
+    }).catch(() => {});
     res.type(settlement.supplierCreditNote.mimeType || 'application/octet-stream');
     res.attachment(settlement.supplierCreditNote.originalName || storedName);
     return res.send(content);

@@ -1,3 +1,5 @@
+import { emitLeadEvent } from './socketService.js';
+
 const clients = new Map();
 
 const keyFor = (branchId) => String(branchId);
@@ -26,11 +28,18 @@ export const addLeadEventClient = ({ branchId, userId, role, response }) => {
 };
 
 export const publishLeadEvent = ({ branchId, userIds = [], event = 'lead.changed', data = {} }) => {
+  const payload = { ...data, emittedAt: new Date().toISOString() };
+
+  // Two transports on purpose. SSE reaches the browser; the socket reaches the mobile
+  // app, which cannot consume SSE at all. Keeping them in one function means a new
+  // event type cannot be added to one and silently forgotten on the other.
+  emitLeadEvent({ branchId, userIds, event, data: payload });
+
   const targets = new Set((userIds || []).filter(Boolean).map(String));
   for (const client of clients.get(keyFor(branchId)) || []) {
     if (targets.size && !targets.has(client.userId)) continue;
     if (!targets.size && client.role === 'sales_executive') continue;
-    try { send(client.response, event, { ...data, emittedAt: new Date().toISOString() }); } catch { /* request cleanup removes it */ }
+    try { send(client.response, event, payload); } catch { /* request cleanup removes it */ }
   }
 };
 

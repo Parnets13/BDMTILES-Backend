@@ -9,6 +9,8 @@ const locationSchema = new mongoose.Schema({
   address: { type: String, trim: true, default: '' },
   lat: { type: Number, min: -90, max: 90 },
   lng: { type: Number, min: -180, max: 180 },
+  // Set when the device reports the fix came from a mock provider. Evidence, not proof.
+  mocked: { type: Boolean, default: false },
 }, { _id: false });
 
 const transitionSchema = new mongoose.Schema({
@@ -29,7 +31,10 @@ const dealerVisitSchema = new mongoose.Schema(
 
     status: {
       type: String,
-      enum: ['checked_in', 'completed', 'cancelled'],
+      // `missed` covers SOW 18.2 "Missed visit reason": the dealer was on the day's
+      // route but the visit never happened, so there is no check-in to complete. Without
+      // it the only way to close such a visit was `cancelled`, which loses the reason.
+      enum: ['checked_in', 'completed', 'cancelled', 'missed'],
       default: 'checked_in',
     },
 
@@ -51,6 +56,21 @@ const dealerVisitSchema = new mongoose.Schema(
     outcome: { type: String, trim: true, default: '' },
     nextFollowUpDate: Date,
     attachments: [{ type: String, trim: true }],
+
+    // SOW 18.2 "Dealer visit checklist" — the manager defines the steps, the executive
+    // ticks them off. Stored as a snapshot rather than a reference to a template, so a
+    // later change to the template cannot rewrite what was actually done on the day.
+    checklist: [
+      {
+        _id: false,
+        label: { type: String, trim: true },
+        done: { type: Boolean, default: false },
+      },
+    ],
+
+    // SOW 18.2 "Missed visit reason" — only meaningful when status is `missed`.
+    missedReason: { type: String, trim: true, default: '' },
+    missedAt: Date,
 
     createdBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true },
     transitions: { type: [transitionSchema], default: [] },

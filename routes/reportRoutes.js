@@ -8,6 +8,7 @@ import Payment from '../models/Payment.js';
 import DealerLedger from '../models/DealerLedger.js';
 import SupplierLedger from '../models/SupplierLedger.js';
 import Expense from '../models/Expense.js';
+import Voucher from '../models/Voucher.js';
 import Invoice from '../models/Invoice.js';
 import Employee from '../models/Employee.js';
 import Attendance from '../models/Attendance.js';
@@ -20,6 +21,8 @@ import { getDashboardReport } from '../services/dashboardReport.js';
 const router = Router();
 router.use(protect);
 router.use(requireBranch);
+
+const round2 = (value) => Math.round((Number(value) || 0) * 100) / 100;
 
 const dateFilter = (from, to, field = 'createdAt') => {
   const f = {};
@@ -357,6 +360,145 @@ router.get('/profit', requirePermission('reports.sales'), async (req, res) => {
 });
 
 // ═══════════════════════════════════════════════════════
+// DEVIATION REPORT
+// ═══════════════════════════════════════════════════════
+//
+// Deviation = actual margin vs the margin the order SHOULD have carried.
+//
+// "Expected" is a target gross margin applied to each order's own revenue. There is no
+// budget or forecast table in the system to compare against, so rather than invent one we
+// state the expectation explicitly (returned as `basis` and `targetMarginPercent`) and let
+// the reader judge it. Discount is carried on each row so a falling margin can be traced
+// to the discounting that caused it.
+//
+// deviation = actualProfit − expectedProfit
+//   positive → the order beat its expected margin (favourable)
+//   negative → the order fell short (adverse)
+router.get('/deviation', requirePermission('reports.profit'), async (req, res) => {
+  try {
+    const { dateFrom, dateTo } = req.query;
+    const match = { branch: req.branchId, status: { $nin: ['cancelled', 'draft'] }, ...dateFilter(dateFrom, dateTo, 'orderDate') };
+
+    // A business-wide target gross margin. Kept as a named constant so the expectation is
+    // auditable rather than a number buried in a formula.
+    const TARGET_MARGIN_PERCENT = 15;
+
+    const orders = await SalesOrder.aggregate([
+      { $match: match },
+      { $unwind: '$items' },
+      // Cost is not stored on the order line, so it is resolved from the branch's stock
+      // record — the same lookup the bill-wise profit report uses, so the two agree.
+      {
+        $lookup: {
+          from: 'stocks',
+          let: { productId: '$items.product', orderBranch: '$branch' },
+          pipeline: [
+            {
+              $match: {
+                $expr: {
+                  $and: [
+                    { $eq: ['$product', '$$productId'] },
+                    { $eq: ['$branch', '$$orderBranch'] },
+                  ],
+                },
+              },
+            },
+            { $sort: { updatedAt: -1 } },
+            { $limit: 1 },
+          ],
+          as: 'stockInfo',
+        },
+      },
+      {
+        $group: {
+          _id: '$_id',
+          orderNumber: { $first: '$orderNumber' },
+          orderDate: { $first: '$orderDate' },
+          dealerName: { $first: { $ifNull: ['$dealerName', '$customerName'] } },
+          revenue: { $sum: '$items.taxableAmount' },
+          discount: { $sum: { $ifNull: ['$items.discountAmount', 0] } },
+          cost: { $sum: { $multiply: ['$items.quantity', { $ifNull: [{ $first: '$stockInfo.purchaseRate' }, 0] }] } },
+          pricedLines: { $sum: { $cond: [{ $gt: [{ $first: '$stockInfo.purchaseRate' }, 0] }, 1, 0] } },
+          lineCount: { $sum: 1 },
+        },
+      },
+      { $addFields: { actualProfit: { $subtract: ['$revenue', '$cost'] } } },
+      {
+        $addFields: {
+          // What the order would have earned at the target margin on the same revenue.
+          expectedProfit: { $multiply: ['$revenue', TARGET_MARGIN_PERCENT / 100] },
+        },
+      },
+      {
+        $addFields: {
+          deviation: { $subtract: ['$actualProfit', '$expectedProfit'] },
+        },
+      },
+      {
+        $addFields: {
+          deviationPercent: {
+            $cond: [{ $gt: ['$expectedProfit', 0] }, { $multiply: [{ $divide: ['$deviation', '$expectedProfit'] }, 100] }, null],
+          },
+          actualMarginPercent: {
+            $cond: [{ $gt: ['$revenue', 0] }, { $multiply: [{ $divide: ['$actualProfit', '$revenue'] }, 100] }, null],
+          },
+        },
+      },
+      { $sort: { deviation: 1 } },
+      { $limit: 100 },
+    ]);
+
+    // An order whose lines all failed to resolve a purchase rate carries a cost of 0, which
+    // would read as a 100% margin and swamp the report. Those are held back and counted so
+    // the omission is stated rather than silently averaged in.
+    const priced = orders.filter((o) => o.pricedLines > 0);
+    const unpriced = orders.length - priced.length;
+
+    const rows = priced.map((o) => ({
+      orderId: o._id,
+      orderNumber: o.orderNumber || '—',
+      orderDate: o.orderDate,
+      dealerName: o.dealerName || '—',
+      revenue: round2(o.revenue),
+      cost: round2(o.cost),
+      discount: round2(o.discount),
+      actualProfit: round2(o.actualProfit),
+      expectedProfit: round2(o.expectedProfit),
+      deviation: round2(o.deviation),
+      deviationPercent: o.deviationPercent === null ? null : round2(o.deviationPercent),
+      actualMarginPercent: o.actualMarginPercent === null ? null : round2(o.actualMarginPercent),
+      status: o.deviation >= 0 ? 'favourable' : 'adverse',
+    }));
+
+    const totalActual = round2(rows.reduce((s, r) => s + r.actualProfit, 0));
+    const totalExpected = round2(rows.reduce((s, r) => s + r.expectedProfit, 0));
+    const totalDeviation = round2(totalActual - totalExpected);
+    const adverse = rows.filter((r) => r.deviation < 0);
+    const favourable = rows.filter((r) => r.deviation >= 0);
+
+    res.json({ success: true, data: {
+      basis: `Actual gross profit vs a ${TARGET_MARGIN_PERCENT}% target margin on the same revenue`,
+      targetMarginPercent: TARGET_MARGIN_PERCENT,
+      summary: {
+        orders: rows.length,
+        // Orders held out because no purchase rate could be resolved for any of their lines.
+        excludedNoCost: unpriced,
+        totalRevenue: round2(rows.reduce((s, r) => s + r.revenue, 0)),
+        totalActualProfit: totalActual,
+        totalExpectedProfit: totalExpected,
+        totalDeviation,
+        totalDeviationPercent: totalExpected ? round2((totalDeviation / totalExpected) * 100) : 0,
+        favourableCount: favourable.length,
+        adverseCount: adverse.length,
+        // The number worth acting on: how much margin the adverse orders cost.
+        adverseDeviation: round2(adverse.reduce((s, r) => s + r.deviation, 0)),
+      },
+      rows,
+    }});
+  } catch (e) { res.status(500).json({ success: false, message: e.message }); }
+});
+
+// ═══════════════════════════════════════════════════════
 // HR REPORTS
 // ═══════════════════════════════════════════════════════
 router.get('/hr', requirePermission('reports.sales'), async (req, res) => {
@@ -409,20 +551,69 @@ router.get('/dealer-performance', requirePermission('reports.sales'), async (req
 });
 
 // ═══════════════════════════════════════════════════════
-// FINANCE STATEMENTS (Balance Sheet / P&L / Trial Balance stubs)
+// FINANCE STATEMENTS (Balance Sheet / P&L / Cash Flow / Trial Balance)
 // ═══════════════════════════════════════════════════════
+//
+// Two different kinds of figure live here and they must not be conflated:
+//
+//   PERIOD figures (P&L, cash flow, expenses) are bounded at both ends — what happened
+//   between dateFrom and dateTo.
+//
+//   AS-OF figures (receivables, payables, trial balance) have no lower bound. A receivable
+//   does not stop existing because the reporting period ended, so filtering it by dateFrom
+//   would silently understate it. Only the upper bound applies.
 router.get('/finance-summary', requirePermission('reports.sales'), async (req, res) => {
   try {
     const { dateFrom, dateTo } = req.query;
     const salesMatch = { branch: req.branchId, status: { $nin: ['cancelled','draft'] }, ...dateFilter(dateFrom, dateTo, 'orderDate') };
     const purchaseMatch = { branch: req.branchId, status: { $nin: ['cancelled'] }, ...dateFilter(dateFrom, dateTo, 'poDate') };
 
-    const [totalSales, totalPurchase, totalReceipts, totalPayments, stockValue] = await Promise.all([
+    // Cumulative up to the end of the requested window, or everything if no window given.
+    // Local end-of-day, matching dateFilter above — mixing local and UTC bounds here would
+    // shift the cut-off by a day for any request made before 05:30 IST.
+    const asOfEnd = dateTo
+      ? (() => { const d = new Date(dateTo); d.setHours(23, 59, 59, 999); return d; })()
+      : null;
+    const ledgerAsOf = asOfEnd ? { entryDate: { $lte: asOfEnd } } : {};
+    const voucherAsOf = asOfEnd ? { voucherDate: { $lte: asOfEnd } } : {};
+
+    const [
+      totalSales, totalPurchase, totalReceipts, totalPayments, stockValue,
+      dealerLedger, supplierLedger, expenseTotals, trialRows,
+    ] = await Promise.all([
       SalesOrder.aggregate([{ $match: salesMatch }, { $group: { _id: null, total: { $sum: '$grandTotal' }, tax: { $sum: '$totalTax' } } }]),
       PurchaseOrder.aggregate([{ $match: purchaseMatch }, { $group: { _id: null, total: { $sum: '$grandTotal' }, tax: { $sum: '$totalTax' } } }]),
       Payment.aggregate([{ $match: { branch: req.branchId, paymentType: 'dealer_receipt', status: 'confirmed', ...dateFilter(dateFrom, dateTo, 'paymentDate') } }, { $group: { _id: null, total: { $sum: '$amount' } } }]),
       Payment.aggregate([{ $match: { branch: req.branchId, paymentType: 'supplier_payment', status: 'confirmed', ...dateFilter(dateFrom, dateTo, 'paymentDate') } }, { $group: { _id: null, total: { $sum: '$amount' } } }]),
       Stock.aggregate([{ $match: { branch: req.branchId } }, { $group: { _id: null, value: { $sum: { $multiply: ['$availableQty','$purchaseRate'] } } } }]),
+      // What dealers owe us. A dealer is debited when they buy and credited when they pay,
+      // so the balance is debit − credit.
+      DealerLedger.aggregate([{ $match: { branch: req.branchId, ...ledgerAsOf } }, { $group: { _id: null, debit: { $sum: '$debit' }, credit: { $sum: '$credit' } } }]),
+      // What we owe suppliers — the opposite sign: credited when invoiced, debited when paid.
+      SupplierLedger.aggregate([{ $match: { branch: req.branchId, ...ledgerAsOf } }, { $group: { _id: null, debit: { $sum: '$debit' }, credit: { $sum: '$credit' } } }]),
+      // Only settled claims count as cost. Pending and rejected ones are not yet a cost.
+      Expense.aggregate([
+        { $match: { branch: req.branchId, status: { $in: ['approved', 'reimbursed'] }, ...dateFilter(dateFrom, dateTo, 'expenseDate') } },
+        { $group: { _id: null, total: { $sum: '$amount' } } },
+      ]),
+      // Trial balance, from the double-entry vouchers. Only POSTED vouchers — drafts are
+      // working papers and cancelled ones were reversed. Note this is COMPANY-WIDE:
+      // Voucher carries no branch field, so it cannot be scoped and is not pretending to be.
+      Voucher.aggregate([
+        { $match: { status: 'posted', ...voucherAsOf } },
+        { $unwind: '$entries' },
+        {
+          $group: {
+            _id: '$entries.accountName',
+            // Carried so the statement can group by cash / bank / dealer / supplier /
+            // expense / income / capital rather than showing a flat list of names.
+            accountType: { $first: '$entries.accountType' },
+            debit: { $sum: '$entries.debit' },
+            credit: { $sum: '$entries.credit' },
+          },
+        },
+        { $sort: { _id: 1 } },
+      ]),
     ]);
 
     const revenue = totalSales[0]?.total || 0;
@@ -430,12 +621,57 @@ router.get('/finance-summary', requirePermission('reports.sales'), async (req, r
     const grossProfit = revenue - purchases;
     const receipts = totalReceipts[0]?.total || 0;
     const payments = totalPayments[0]?.total || 0;
+    const expenses = expenseTotals[0]?.total || 0;
+    // Net, not gross. The old figure stopped at revenue − purchases and called it profit,
+    // which flatters every period by exactly the amount the business spent to earn it.
+    const netProfit = grossProfit - expenses;
+
+    const totalReceivables = round2((dealerLedger[0]?.debit || 0) - (dealerLedger[0]?.credit || 0));
+    const totalPayables = round2((supplierLedger[0]?.credit || 0) - (supplierLedger[0]?.debit || 0));
+
+    const trialBalance = trialRows.map((row) => ({
+      account: row._id || 'Unnamed account',
+      accountType: row.accountType || 'other',
+      debit: round2(row.debit || 0),
+      credit: round2(row.credit || 0),
+      // Signed balance, debit-positive. Accounts are one side or the other in practice,
+      // so this is what a reader wants to see rather than two columns to subtract.
+      balance: round2((row.debit || 0) - (row.credit || 0)),
+    }));
+    const trialDebitTotal = round2(trialBalance.reduce((sum, row) => sum + row.debit, 0));
+    const trialCreditTotal = round2(trialBalance.reduce((sum, row) => sum + row.credit, 0));
 
     res.json({ success: true, data: {
-      profitLoss: { revenue, purchases, grossProfit, grossMargin: revenue ? ((grossProfit / revenue) * 100).toFixed(1) : 0,
-        totalTaxCollected: totalSales[0]?.tax || 0, totalTaxPaid: totalPurchase[0]?.tax || 0 },
-      cashFlow: { receipts, payments, netCashFlow: receipts - payments },
-      balanceSheet: { stockValue: stockValue[0]?.value || 0, totalReceivables: 0, totalPayables: 0 },
+      profitLoss: {
+        revenue,
+        purchases,
+        grossProfit,
+        grossMargin: revenue ? round2((grossProfit / revenue) * 100) : 0,
+        expenses,
+        netProfit,
+        netMargin: revenue ? round2((netProfit / revenue) * 100) : 0,
+        totalTaxCollected: totalSales[0]?.tax || 0,
+        totalTaxPaid: totalPurchase[0]?.tax || 0,
+      },
+      cashFlow: { receipts, payments, netCashFlow: round2(receipts - payments) },
+      balanceSheet: {
+        stockValue: round2(stockValue[0]?.value || 0),
+        totalReceivables,
+        totalPayables,
+        // Working capital, the one derived figure that is meaningful with only these lines.
+        netWorkingCapital: round2((stockValue[0]?.value || 0) + totalReceivables - totalPayables),
+      },
+      trialBalance: {
+        rows: trialBalance,
+        totalDebit: trialDebitTotal,
+        totalCredit: trialCreditTotal,
+        // A trial balance that does not balance is a data problem, and the statement is
+        // the only place it becomes visible. Surfaced rather than hidden behind rounding.
+        balanced: Math.abs(trialDebitTotal - trialCreditTotal) < 0.01,
+        // Voucher has no branch field, so this cannot be branch-scoped. Stated so the
+        // figure is not mistaken for a branch-level one.
+        scope: 'company',
+      },
     }});
   } catch (e) { res.status(500).json({ success: false, message: e.message }); }
 });
