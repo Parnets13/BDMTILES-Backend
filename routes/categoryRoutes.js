@@ -3,6 +3,7 @@ import Brand from '../models/Brand.js';
 import Category from '../models/Category.js';
 import Subcategory from '../models/Subcategory.js';
 import { protect, requirePermission } from '../middleware/auth.js';
+import { uploadBrandImage } from '../middleware/upload.js';
 
 const router = Router();
 router.use(protect);
@@ -44,6 +45,15 @@ router.get('/brands', async (req, res) => {
   } catch (error) {
     res.status(500).json({ success: false, message: error.message });
   }
+});
+
+// POST upload a brand logo. The returned path is stored in Brand.image.
+router.post('/brands/upload-image', (req, res) => {
+  uploadBrandImage(req, res, (err) => {
+    if (err) return res.status(400).json({ success: false, message: err.message });
+    if (!req.file) return res.status(400).json({ success: false, message: 'No image uploaded.' });
+    res.json({ success: true, message: 'Brand logo uploaded.', data: `/uploads/brands/${req.file.filename}` });
+  });
 });
 
 // POST create brand

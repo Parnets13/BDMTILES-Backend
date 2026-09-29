@@ -10,6 +10,7 @@ const productUploadDirectory = path.join(uploadRoot, 'products');
 const complaintUploadDirectory = path.join(uploadRoot, 'complaints');
 const webUploadDirectory = path.join(uploadRoot, 'web');
 const webVideoDirectory = path.join(uploadRoot, 'web-videos');
+const brandUploadDirectory = path.join(uploadRoot, 'brands');
 export const legacySupplierCreditNoteDirectory = path.join(uploadRoot, 'supplier-credit-notes');
 export const supplierCreditNoteDirectory = path.join(privateUploadRoot, 'supplier-credit-notes');
 // Candidate resumes are personal/sensitive — private-uploads, never statically served.
@@ -20,6 +21,7 @@ fs.mkdirSync(productUploadDirectory, { recursive: true });
 fs.mkdirSync(complaintUploadDirectory, { recursive: true });
 fs.mkdirSync(webUploadDirectory, { recursive: true });
 fs.mkdirSync(webVideoDirectory, { recursive: true });
+fs.mkdirSync(brandUploadDirectory, { recursive: true });
 fs.mkdirSync(supplierCreditNoteDirectory, { recursive: true });
 fs.mkdirSync(candidateResumeDirectory, { recursive: true });
 fs.mkdirSync(hrGeneratedDocumentDirectory, { recursive: true });
@@ -48,6 +50,13 @@ export const uploadProductImages = multer({
   fileFilter,
   limits: { fileSize: 5 * 1024 * 1024 }, // 5MB per file
 }).array('images', 10); // max 10 images
+
+// Brand logos are uploaded through the category-setup permission boundary.
+export const uploadBrandImage = multer({
+  storage: storageFor(brandUploadDirectory),
+  fileFilter,
+  limits: { fileSize: 5 * 1024 * 1024 },
+}).single('image');
 
 // Complaint evidence accepts short videos as well as photos (SOW 17.8
 // "Image and video upload"). Videos get a larger ceiling than stills.
