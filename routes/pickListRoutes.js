@@ -29,6 +29,14 @@ const requireAssignedPickList = async (req, res, next) => {
   try {
     if (canViewUnassignedWorkflowOrders(req.user)) return next();
     if (!mongoose.isValidObjectId(req.params.id)) {
+      const staticPaths = new Set([
+        'stats',
+        'generatable-orders',
+        'assignable-staff',
+        'delivery-executives',
+        'available-vehicles',
+      ]);
+      if (staticPaths.has(req.params.id)) return next();
       return res.status(400).json({ success: false, message: 'Invalid _id' });
     }
     const assigned = await PickList.exists({ _id: req.params.id, branch: req.branchId, assignedTo: req.user._id });
