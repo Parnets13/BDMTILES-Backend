@@ -18,7 +18,7 @@ const router = Router();
 router.use(protect);
 router.use(requireBranch);
 
-const canViewUnassignedWorkflowOrders = (user) => user?.role === 'supervisor';
+const canViewUnassignedWorkflowOrders = (user) => String(user?.role ?? '').toLowerCase() === 'supervisor';
 const requireWorkflowManager = (req, res, next) => (
   canViewUnassignedWorkflowOrders(req.user)
     ? next()
