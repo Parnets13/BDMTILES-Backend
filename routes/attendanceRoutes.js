@@ -182,6 +182,41 @@ router.post('/mark', async (req, res) => {
 });
 
 /**
+ * POST /attendance/checkout
+ * Record today's punch-out and elapsed attendance hours.
+ */
+router.post('/checkout', async (req, res) => {
+  try {
+    const employee = await findOrCreateEmployee(req.user._id, req.branchId, req.user);
+    const today = new Date();
+    today.setHours(0, 0, 0, 0);
+    const attendance = await Attendance.findOne({
+      branch: req.branchId,
+      employee: employee._id,
+      date: today,
+    });
+
+    if (!attendance?.punchIn) {
+      return res.status(400).json({success: false, message: 'Mark attendance before checking out.'});
+    }
+    if (attendance.punchOut) {
+      return res.status(400).json({success: false, message: 'Attendance is already checked out.', data: attendance});
+    }
+
+    const punchOut = new Date();
+    attendance.punchOut = punchOut;
+    attendance.punchOutLocation = req.body.location || undefined;
+    attendance.totalHours = Math.max(0, Math.round(((punchOut.getTime() - attendance.punchIn.getTime()) / 3600000) * 100) / 100);
+    await attendance.save();
+
+    return res.json({success: true, message: 'Checked out successfully.', data: attendance});
+  } catch (error) {
+    console.error('Check out attendance error:', error);
+    return res.status(500).json({success: false, message: error.message || 'Failed to check out'});
+  }
+});
+
+/**
  * GET /attendance/today
  * Get today's attendance status
  */
