@@ -3,6 +3,7 @@ import HeroSection from '../../models/webContent/HeroSection.js';
 import HomeBanner from '../../models/webContent/HomeBanner.js';
 import HomeCategory from '../../models/webContent/HomeCategory.js';
 import Category from '../../models/Category.js';
+import Product from '../../models/Product.js';
 import Testimonial from '../../models/webContent/Testimonial.js';
 import MarqueeItem from '../../models/webContent/MarqueeItem.js';
 import SiteSettings from '../../models/webContent/SiteSettings.js';
@@ -71,7 +72,57 @@ router.get('/pincode/:pincode', async (req, res) => {
 });
 
 const ACTIVE = { status: 'active' };
+// Same visibility rule as the product listing, so a count matches what a customer can buy.
+const ONLY_ONLINE = { status: 'active', onlineVisible: true };
 const bySort = { sortOrder: 1, createdAt: -1 };
+
+/**
+ * Product counts for the storefront category list.
+ *
+ * Returns `{ perNode, perDepartment }`.
+ *
+ * `perNode` — how many products are filed ON each node. Counted across BOTH `category` (level 1)
+ * and `subcategory` (level 2), because a product files its taxonomy in two fields; counting only
+ * the first reports 0 for every subcategory.
+ *
+ * `perDepartment` — the DISTINCT total beneath a department. This deliberately is NOT the sum of
+ * the department's own count plus its children's: a product carries its level-1 and level-2 node
+ * AT THE SAME TIME, so that sum counted the same product twice (Tiles reported 8 for 4 products).
+ * `countDocuments` over a single `$or` counts each product once.
+ *
+ * Same visibility rule as the product listing, so the number shown is the number a customer can
+ * actually buy.
+ */
+async function productCounts(departments = []) {
+  const [byCategory, bySubcategory] = await Promise.all([
+    Product.aggregate([
+      { $match: { ...ONLY_ONLINE, category: { $ne: null } } },
+      { $group: { _id: '$category', n: { $sum: 1 } } },
+    ]),
+    Product.aggregate([
+      { $match: { ...ONLY_ONLINE, subcategory: { $ne: null } } },
+      { $group: { _id: '$subcategory', n: { $sum: 1 } } },
+    ]),
+  ]);
+
+  const perNode = new Map();
+  for (const row of [...byCategory, ...bySubcategory]) {
+    const key = String(row._id);
+    perNode.set(key, (perNode.get(key) || 0) + row.n);
+  }
+
+  const perDepartment = new Map();
+  await Promise.all(departments.map(async (dept) => {
+    const ids = [String(dept.id), ...(dept.childIds || [])];
+    const n = await Product.countDocuments({
+      ...ONLY_ONLINE,
+      $or: [{ category: { $in: ids } }, { subcategory: { $in: ids } }],
+    });
+    perDepartment.set(String(dept.id), n);
+  }));
+
+  return { perNode, perDepartment };
+}
 
 // GET /api/v1/shop/content/categories — the taxonomy the storefront navigates by.
 //
@@ -132,7 +183,25 @@ router.get('/categories', async (_req, res) => {
       };
     }
 
-    return res.json({ success: true, data: { departments, bySlug } });
+    // Real product counts, so the client never has to invent one.
+    const { perNode, perDepartment } = await productCounts(
+      departments.map((dept) => ({ id: dept.id, childIds: dept.categories.map((c) => c.id) })),
+    );
+
+    return res.json({
+      success: true,
+      data: {
+        departments: departments.map((dept) => ({
+          ...dept,
+          productCount: perDepartment.get(String(dept.id)) || 0,
+          categories: dept.categories.map((cat) => ({
+            ...cat,
+            productCount: perNode.get(String(cat.id)) || 0,
+          })),
+        })),
+        bySlug,
+      },
+    });
   } catch (error) {
     return res.status(500).json({ success: false, message: error.message });
   }
@@ -160,7 +229,38 @@ router.get('/', async (_req, res) => {
     ]);
 
     // Prefer the tree once it has anything to show; otherwise keep serving the legacy list.
-    const categories = treeDepartments.length ? treeDepartments : legacyCategories;
+    //
+    // Tree rows carry a REAL product count. The legacy HomeCategory rows have no taxonomy id to
+    // count against, so they get none rather than a misleading zero — and the client falls back
+    // to hiding the badge.
+    const usingTree = treeDepartments.length > 0;
+    let categories = legacyCategories;
+    if (usingTree) {
+      // A department's total covers its children too, so they have to be loaded to count them.
+      const children = await Category.find({
+        parent: { $in: treeDepartments.map((d) => d._id) },
+        status: 'active',
+      }).select('_id parent').lean();
+
+      const childIdsByParent = new Map();
+      for (const child of children) {
+        const key = String(child.parent);
+        if (!childIdsByParent.has(key)) childIdsByParent.set(key, []);
+        childIdsByParent.get(key).push(String(child._id));
+      }
+
+      const { perDepartment } = await productCounts(
+        treeDepartments.map((dept) => ({
+          id: dept._id,
+          childIds: childIdsByParent.get(String(dept._id)) || [],
+        })),
+      );
+
+      categories = treeDepartments.map((dept) => ({
+        ...dept,
+        productCount: perDepartment.get(String(dept._id)) || 0,
+      }));
+    }
 
     res.json({
       success: true,
@@ -207,6 +307,10 @@ router.get('/', async (_req, res) => {
           slug: c.slug || '',
           image: c.image || '',
           badge: c.badge || '',
+          // Real count of purchasable products. Absent on the legacy HomeCategory rows, which
+          // have no taxonomy id to count against — the client hides the badge rather than
+          // showing a wrong zero.
+          productCount: typeof c.productCount === 'number' ? c.productCount : undefined,
         })),
         testimonials: testimonials.map((t) => ({
           id: t._id,

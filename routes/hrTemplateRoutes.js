@@ -64,13 +64,29 @@ const maxTemplateNumber = async (branchId) => {
 
 const formatTemplateCode = (n) => `TPL${String(n).padStart(4, '0')}`;
 
+// Create with retry on templateCode collision. Two concurrent POSTs can compute
+// the same max+1; the unique {branch, templateCode} index rejects the second, so
+// re-read the max and try again instead of surfacing a 500 to the user.
+const createWithUniqueCode = async (branchId, fields) => {
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    const templateCode = formatTemplateCode((await maxTemplateNumber(branchId)) + 1);
+    try {
+      return await HrDocumentTemplate.create({
+        branch: branchId, templateCode, ...fields,
+      });
+    } catch (error) {
+      if (error.code === 11000 && attempt < 2) continue;
+      throw error;
+    }
+  }
+};
+
 router.post('/templates', ...access, async (req, res) => {
   try {
     const { templateName, documentType, content } = req.body;
     if (!templateName || !documentType || !content) throw routeError(422, 'Template name, document type, and content are required.');
-    const templateCode = formatTemplateCode((await maxTemplateNumber(req.branchId)) + 1);
-    const template = await HrDocumentTemplate.create({
-      branch: req.branchId, templateCode, templateName, documentType, content,
+    const template = await createWithUniqueCode(req.branchId, {
+      templateName, documentType, content,
       variables: extractVariables(content), createdBy: req.user._id,
     });
     res.status(201).json({ success: true, message: 'Template created.', data: template });
@@ -215,17 +231,12 @@ router.post('/templates/seed-starters', ...access, async (req, res) => {
       return res.json({ success: true, message: 'All ready-made templates already exist for this branch.', data: { created: [], skipped: HR_TEMPLATE_STARTERS.length } });
     }
 
-    // Continue the branch's own numbering rather than restarting at TPL0001, so codes
-    // stay unique against the {branch, templateCode} index.
-    const baseNum = await maxTemplateNumber(req.branchId);
-
+    // Continue the branch's own numbering. Uses createWithUniqueCode so a race
+    // between the seed endpoint and a manual create can't produce a 500.
     const created = [];
     for (let i = 0; i < wanted.length; i += 1) {
       const s = wanted[i];
-      const templateCode = formatTemplateCode(baseNum + i + 1);
-      const doc = await HrDocumentTemplate.create({
-        branch: req.branchId,
-        templateCode,
+      const doc = await createWithUniqueCode(req.branchId, {
         templateName: s.templateName,
         documentType: s.documentType,
         content: s.content,
@@ -233,7 +244,7 @@ router.post('/templates/seed-starters', ...access, async (req, res) => {
         isActive: true,
         createdBy: req.user._id,
       });
-      created.push({ _id: doc._id, templateCode, templateName: doc.templateName, documentType: doc.documentType });
+      created.push({ _id: doc._id, templateCode: doc.templateCode, templateName: doc.templateName, documentType: doc.documentType });
     }
 
     res.status(201).json({

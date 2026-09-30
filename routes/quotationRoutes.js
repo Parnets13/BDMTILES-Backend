@@ -17,6 +17,7 @@ import { assertQuotationMatchesRequest, refreshAndFingerprintRequest } from '../
 import { syncAutomaticApprovalRequest } from '../services/approvalRequestService.js';
 import { protect, requireAnyPermission, requirePermission, userHasPermission } from '../middleware/auth.js';
 import { assertQuotationTypeAllowed, assertSalesOrderTypeAllowed, resolveCustomerType } from '../services/customerTypeAccess.js';
+import Warehouse from '../models/Warehouse.js';
 import { assertWarehousesInBranch, requireBranch } from '../utils/branchScope.js';
 import { computeSplitPlan, executeSplit, loadSplitFamily } from '../services/quotationSplitService.js';
 import {
@@ -154,6 +155,51 @@ async function quotationDto(quotation, options = {}) {
     ...(options.conversionHistory ? { conversionHistory: options.conversionHistory } : {}),
   };
 }
+
+/**
+ * Warehouses a quotation author may fulfil from.
+ *
+ * Exists because the fulfilment-warehouse picker used to read `/masters/warehouses`,
+ * which is gated on `warehouse.master` — a permission no sales executive holds. The
+ * picker therefore came back empty for every SE, and the caption in the app had to
+ * admit as much. Listing from the quotation side keeps the gate aligned with the
+ * feature: anyone who can author a quotation can see the active warehouses in their
+ * own branch, and nothing else.
+ *
+ * Scoped to `req.branchId` (not the role) so a global-access user still only sees
+ * the branch they are actually working in.
+ */
+router.get('/warehouses', requirePermission('quotation.management'), requireBranch, async (req, res) => {
+  try {
+    const { search, page = 1, limit = 50 } = req.query;
+    const p = Math.max(1, Number.parseInt(page, 10) || 1);
+    const l = Math.min(100, Math.max(1, Number.parseInt(limit, 10) || 50));
+
+    const filter = { branch: req.branchId, status: 'active' };
+    if (search) {
+      const regex = new RegExp(String(search).replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'i');
+      filter.$or = [{ name: regex }, { warehouseCode: regex }];
+    }
+
+    const [rows, total] = await Promise.all([
+      Warehouse.find(filter)
+        .select('name warehouseCode address region')
+        .sort({ name: 1 })
+        .skip((p - 1) * l)
+        .limit(l)
+        .lean(),
+      Warehouse.countDocuments(filter),
+    ]);
+
+    return res.json({
+      success: true,
+      data: rows,
+      pagination: { page: p, limit: l, total, pages: Math.ceil(total / l) || 1 },
+    });
+  } catch (error) {
+    return res.status(error.status || 500).json({ success: false, message: error.message });
+  }
+});
 
 router.get('/', requirePermission('quotation.management'), async (req, res) => {
   try {

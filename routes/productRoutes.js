@@ -263,7 +263,14 @@ router.get('/:id', async (req, res) => {
       .select('-imageEmbedding') // exclude heavy vector; status shown via imageEmbeddingUpdatedAt
       .lean();
     if (!product) return res.status(404).json({ success: false, message: 'Product not found.' });
-    res.json({ success: true, data: product });
+
+    // The raw `attributes` map is included with the document, but a client cannot label it
+    // without the definitions. Resolving them here means the SE app shows "Slab Length: 8 ft"
+    // rather than "slabLength: 8", and a new attribute needs no app change.
+    const { describeProductAttributes } = await import('../services/attributeService.js');
+    const attributeSpecs = await describeProductAttributes(product.category?._id, product.attributes);
+
+    res.json({ success: true, data: { ...product, attributeSpecs } });
   } catch (error) {
     res.status(500).json({ success: false, message: error.message });
   }

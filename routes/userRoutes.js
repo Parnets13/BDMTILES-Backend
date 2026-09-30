@@ -1093,13 +1093,42 @@ router.put('/:id/permissions', async (req, res) => {
     if (!target) return res.status(404).json({ success: false, message: 'User not found.' });
     assertCanManageTarget(req.user, target);
     const before = permissionSnapshot(target);
-    target.permissionMode = 'custom';
-    target.permissions = validatePermissionGrant(req.user, req.body.permissions);
+
+    // Callers may ask for either mode explicitly. Omitting the field keeps the old
+    // behaviour (custom), because the overwhelmingly common call is "save this
+    // granular list". Silently forcing custom when a caller asked for role_default
+    // used to leave the account with whatever array was sent — including an empty
+    // one, i.e. a user who can do nothing.
+    const requestedMode = req.body.permissionMode ?? 'custom';
+    if (!['role_default', 'custom'].includes(requestedMode)) {
+      return res.status(422).json({
+        success: false,
+        message: "permissionMode must be 'role_default' or 'custom'.",
+      });
+    }
+    target.permissionMode = requestedMode;
+
+    // Under role_default the stored array is ignored every request, so seed it from
+    // the role preset instead of persisting whatever the caller happened to send.
+    target.permissions = requestedMode === 'role_default'
+      ? validatePermissionGrant(req.user, roleDefaultPermissions(target.role))
+      : validatePermissionGrant(req.user, req.body.permissions);
+
     await target.save();
-    await logPermissionChange({ req, res, target, before, description: `Custom permissions set for ${target.name}` });
+    await logPermissionChange({
+      req,
+      res,
+      target,
+      before,
+      description: requestedMode === 'role_default'
+        ? `Reset ${target.name} to ${target.role} role defaults`
+        : `Custom permissions set for ${target.name}`,
+    });
     return res.json({
       success: true,
-      message: 'Custom permissions updated.',
+      message: requestedMode === 'role_default'
+        ? 'Permissions reset to role defaults.'
+        : 'Custom permissions updated.',
       user: await getPopulatedUser(target._id, req.user),
     });
   } catch (error) {

@@ -6,6 +6,7 @@ import SalesOrder from '../models/SalesOrder.js';
 import Quotation from '../models/Quotation.js';
 import Complaint from '../models/Complaint.js';
 import Route from '../models/Route.js';
+import DealerOrderRequest from '../models/DealerOrderRequest.js';
 import Attendance from '../models/Attendance.js';
 import Employee from '../models/Employee.js';
 import HrmsSettings from '../models/HrmsSettings.js';
@@ -24,6 +25,7 @@ import { generateBranchNumber } from '../utils/branchSequence.js';
 import { listMyTargetProgress } from '../services/targetService.js';
 import { reverseGeocode, geocodeStatus } from '../services/geoService.js';
 import { emitTrackingUpdate } from '../services/socketService.js';
+import { dealerOrderStockPlan, processDealerOrderRequest } from '../services/dealerOrderProcessingService.js';
 
 const router = Router();
 router.use(protect);
@@ -76,6 +78,47 @@ router.post('/me/uploads', requirePermission('sales.executive.app'), (req, res) 
       })),
     });
   });
+});
+
+/**
+ * The branch's sales executives, as a name/id directory.
+ *
+ * Exists because the admin-side `/se-app/*` viewers each fetched `/users?role=...`
+ * purely to fill a filter dropdown, and `/users` is gated on `users.manage` — a
+ * permission none of those pages' own guards imply. So every viewer loaded and then
+ * failed on its very first request. This returns only what a dropdown needs: no
+ * contact details, no role internals, no permissions.
+ *
+ * Gated on `sales.executive.app` — the permission that means "may work with the SE
+ * app surface" — so anyone who can open the SE-app section can populate the filter.
+ *
+ * Returns `name` and `username` only. No phone, email, role, or permissions: a
+ * filter dropdown needs a label and a value, and nothing else belongs in a payload
+ * that is readable by every SE-app user.
+ */
+router.get('/directory/executives', requirePermission('sales.executive.app'), async (req, res) => {
+  try {
+    // `User.status` is capitalised ('Active'/'Inactive') — a lowercase 'active' here
+    // matches nothing and would leave every filter dropdown empty.
+    const filter = { role: 'sales_executive', status: 'Active' };
+    // Scope to the caller's branch unless they hold global access. The SE app is a
+    // branch tool; a branch manager should not see another branch's roster.
+    if (!req.hasGlobalBranchAccess) {
+      filter.$or = [
+        { defaultBranch: req.branchId },
+        { assignedBranches: req.branchId },
+      ];
+    }
+    const rows = await User.find(filter)
+      .select('name username')
+      .sort({ name: 1 })
+      .limit(200)
+      .lean();
+
+    return res.json({ success: true, data: rows });
+  } catch (error) {
+    return res.status(error.status || 500).json({ success: false, message: error.message });
+  }
 });
 
 router.get('/me/dealers', requirePermission('se.dealer.insights'), async (req, res) => {
@@ -1673,5 +1716,138 @@ router.post('/me/messages/:dealerId', requireAnyPermission(...CHAT_PERMISSIONS),
     return res.status(500).json({ success: false, message: error.message });
   }
 });
+
+// ─────────────────────────────────────────────────────────────────────────────
+// SE-scoped dealer order request: stock-plan and process.
+//
+// The web's /dealer-order-requests/:id/process requires `sales.order.approve` —
+// a manager-level permission for dispatch and cancellation approval. The SE
+// should not have it globally, but should still be able to turn their own dealer's
+// approved request into a sales order. These endpoints call the same service
+// functions, but first verify the request belongs to this SE before delegating.
+// That ownership check is the only difference from the web handler.
+// ─────────────────────────────────────────────────────────────────────────────
+
+// Mirrors populateRequest in dealerOrderRequestRoutes — same populates so the
+// app gets the same shape whether it reads from /mine or from here.
+function populateRequest(query) {
+  return query
+    .populate('dealer', 'businessName dealerCode ownerName mobile city status dealerType')
+    .populate('salesExecutive', 'name mobile email')
+    .populate('approvedBy rejectedBy linkedBy processedBy', 'name')
+    .populate('sourceQuotation', 'quotationNumber status grandTotal splitRole splitGroupId')
+    .populate('availableQuotation pendingStockQuotation', 'quotationNumber status grandTotal holdStatus holdExpiresAt splitRole')
+    .populate('sourceSalesOrder', 'orderNumber status approvalStatus reservationStatus grandTotal')
+    .populate('outcomes.quotation', 'quotationNumber status grandTotal splitRole')
+    .populate('outcomes.salesOrder', 'orderNumber status approvalStatus reservationStatus grandTotal');
+}
+
+async function loadOwnRequest(req, res) {
+  const request = await populateRequest(
+    DealerOrderRequest.findOne({ _id: req.params.id, branch: req.branchId, salesExecutive: req.user._id })
+  ).lean();
+  if (!request) {
+  res.status(404).json({ success: false, message: 'Order request not found or not yours.' });
+  return null;
+  }
+  return request;
+}
+
+const seError = (err) => err.status || 500;
+
+// POST /sales-executive/me/order-requests/:id/stock-plan
+// Checks stock availability for an approved request, returns a plan the SE
+// confirms before processing. The service function does the real work.
+router.post('/me/order-requests/:id/stock-plan',
+  requirePermission('dealer.order_request.review'),
+  requirePermission('quotation.management'),
+  async (req, res) => {
+    const session = await mongoose.startSession();
+    try {
+      let payload;
+      await session.withTransaction(async () => {
+        const own = await loadOwnRequest(req, res);
+        if (!own) return;
+        const { request, quotation, plan } = await dealerOrderStockPlan({
+          requestId: req.params.id,
+          branchId: req.branchId,
+          actor: req.user,
+          session,
+        });
+        payload = {
+          request: { _id: request._id, requestNumber: request.requestNumber, revision: request.revision, status: request.status },
+          quotation: { _id: quotation._id, quotationNumber: quotation.quotationNumber, status: quotation.status, grandTotal: quotation.grandTotal },
+          plan: { planHash: plan.planHash, willSplit: plan.willSplit, canHold: plan.canHold, checkedAt: plan.checkedAt, totals: plan.totals, lines: plan.lines || [] },
+        };
+      });
+      if (!payload) return; // loadOwnRequest already sent 404
+      return res.json({
+        success: true,
+        message: payload.plan.willSplit
+          ? 'Part of this request can be reserved now. Give an expected date for the short lines to continue.'
+          : payload.plan.canHold
+            ? 'Everything requested is available and can be reserved now.'
+            : 'None of the requested quantity is available. Give the dealer an expected date or mark the lines unavailable.',
+        data: payload,
+      });
+    } catch (error) {
+      return res.status(seError(error)).json({ success: false, message: error.message });
+    } finally { await session.endSession(); }
+  },
+);
+
+// POST /sales-executive/me/order-requests/:id/process
+// Reserves available stock into a Sales Order and puts the rest to the dealer
+// as a shortfall question. The SE-scoped version of the web endpoint — the
+// only difference is loadOwnRequest instead of the branch-wide loadProcessableRequest.
+router.post('/me/order-requests/:id/process',
+  requirePermission('dealer.order_request.review'),
+  requirePermission('quotation.management'),
+  requirePermission('sales.order.create'),
+  async (req, res) => {
+    const session = await mongoose.startSession();
+    try {
+      let result;
+      const answers = Array.isArray(req.body?.shortfall) ? req.body.shortfall : [];
+      await session.withTransaction(async () => {
+        result = await processDealerOrderRequest({
+          requestId: req.params.id,
+          branchId: req.branchId,
+          actor: req.user,
+          planHash: req.body?.planHash,
+          shortfallInput: answers,
+          offerRemark: req.body?.offerRemark,
+          session,
+        });
+      });
+      // The service returns the raw Mongoose doc; re-populate for the response.
+      const request = await populateRequest(
+        DealerOrderRequest.findById(result.request._id)
+      ).lean();
+      const shortfallCount = result.shortfallLines.length;
+      return res.status(201).json({
+        success: true,
+        message: result.salesOrder
+          ? shortfallCount
+            ? `${result.salesOrder.orderNumber} created and reserved for the available quantity. ${shortfallCount} line${shortfallCount === 1 ? '' : 's'} sent to the dealer.`
+            : `${result.salesOrder.orderNumber} created and reserved for the full requested quantity.`
+          : `No stock could be reserved. ${shortfallCount} line${shortfallCount === 1 ? '' : 's'} sent to the dealer.`,
+        data: {
+          request,
+          salesOrder: result.salesOrder || null,
+          availableQuotation: result.availableQuotation
+            ? { _id: result.availableQuotation._id, quotationNumber: result.availableQuotation.quotationNumber }
+            : null,
+          pendingStockQuotation: result.pendingStockQuotation
+            ? { _id: result.pendingStockQuotation._id, quotationNumber: result.pendingStockQuotation.quotationNumber }
+            : null,
+          plan: result.plan,
+        },
+      });
+    } catch (error) {
+      return res.status(seError(error)).json({ success: false, message: error.message });
+    } finally { await session.endSession(); }
+  },
+);
 
 export default router;

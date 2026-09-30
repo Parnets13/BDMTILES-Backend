@@ -165,3 +165,42 @@ export async function assignmentSummary() {
     byExecutive: byExecutive.sort((left, right) => right.dealerCount - left.dealerCount),
   };
 }
+
+/**
+ * Which dealers cannot use the catalogue, and why — the data behind the
+ * "Assignment health" panel and the dealer list's warning tag.
+ *
+ * Distinct from `assignmentSummary`, which counts assignments. This counts
+ * *breakage*, and it exists because the breakage is invisible from the dealer's
+ * side: `resolveDealerBranch` derives the operating branch from the assigned
+ * executive, so with nobody assigned the catalogue has no branch to price or
+ * stock against. It then returns every `dealerRate: null` and every
+ * `availableQty: 0` with a 200 and no error. The dealer screen shows products
+ * with no price, all marked "Out of stock" — which reads as "we have none of
+ * this" rather than "your account is not finished being set up".
+ *
+ * Both causes resolve to the same remedy (assign an Active executive), so they
+ * are reported together as `broken`: that is the number worth acting on, and the
+ * split is kept only so the admin knows whether they are chasing a data gap or a
+ * deactivation.
+ *
+ * `unassigned` is the same figure `assignmentSummary` returns, so the two agree
+ * by construction rather than by coincidence.
+ */
+export async function assignmentHealth() {
+  const summary = await assignmentSummary();
+  const dealersWithoutBranch = summary.unassigned + summary.strandedOnInactive;
+  return {
+    total: summary.total,
+    dealersWithoutBranch,
+    // Split by cause.
+    unassigned: summary.unassigned,
+    strandedOnInactive: summary.strandedOnInactive,
+    // Pointed at a user who is not a sales_executive at all — not a permission
+    // problem, so it needs a look rather than a reassignment.
+    orphaned: summary.orphaned,
+    healthy: Math.max(0, summary.total - dealersWithoutBranch - summary.orphaned),
+    // The exact filter to send to GET /dealers?assignment=broken.
+    brokenFilter: { assignment: 'broken' },
+  };
+}

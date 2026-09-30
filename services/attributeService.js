@@ -154,6 +154,56 @@ export async function buildAttributeFilter(categoryId, query = {}) {
  * the definitions flagged `filterable`. Select options come from the definition itself;
  * free-entry types are not offered as filters because their values are unbounded.
  */
+/**
+ * A product's attribute values paired with their labels, ready to render.
+ *
+ * The apps receive `attributes` as a raw key→value map, which is enough to FILTER on but not to
+ * DISPLAY: a dealer would read "slabLength: 8" instead of "Slab Length: 8 ft". Resolving the
+ * labels and units here means the dealer app, the SE app and the website all show the same
+ * wording, and a new attribute needs no app change.
+ *
+ * Only attributes the product actually carries are returned, in the order the definitions
+ * declare, so the specs list reads the same for every product in a category. A stored value with
+ * no surviving definition is appended rather than hidden — dropping it would lose data the admin
+ * can still see in the product form.
+ */
+export async function describeProductAttributes(categoryId, attributes = {}) {
+  if (!categoryId) return [];
+  const raw = attributes instanceof Map ? Object.fromEntries(attributes) : (attributes || {});
+  const present = Object.keys(raw).filter((key) => !isBlank(raw[key]));
+  if (!present.length) return [];
+
+  const defs = await definitionsForCategory(categoryId);
+  const byKey = new Map(defs.map((d) => [d.key, d]));
+
+  const ordered = [
+    ...defs.filter((d) => present.includes(d.key)),
+    ...present.filter((key) => !byKey.has(key)).map((key) => ({ key, label: key, unit: '' })),
+  ];
+
+  // The unit is only appended when the value does not already carry it. Select options are
+  // written by hand and usually include it ("18 mm", "1 L"), while a number does not — so
+  // appending unconditionally produced "18 mm mm".
+  const withUnit = (value, unit) => {
+    const text = String(value);
+    if (!unit) return text;
+    return text.toLowerCase().includes(String(unit).toLowerCase()) ? text : `${text} ${unit}`;
+  };
+
+  return ordered.map((def) => {
+    const value = raw[def.key];
+    const text = Array.isArray(value) ? value.join(', ') : String(value);
+    return {
+      key: def.key,
+      label: def.label || def.key,
+      // The value already carries the unit where it needs one, so the client renders `value`
+      // alone. `unit` stays for callers that want to format it themselves.
+      unit: def.unit || '',
+      value: withUnit(text, def.unit),
+    };
+  });
+}
+
 export async function filterableOptionsForCategory(categoryId) {
   const defs = await definitionsForCategory(categoryId, { filterableOnly: true });
   return defs
@@ -180,5 +230,6 @@ export default {
   definitionsForCategory,
   buildAttributeFilter,
   filterableOptionsForCategory,
+  describeProductAttributes,
   assertValidKey,
 };

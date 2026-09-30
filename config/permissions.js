@@ -340,6 +340,10 @@ export const ROLE_DEFAULT_PERMISSIONS = {
     'quotation.dealer', 'quotation.wholesaler', 'quotation.retail', 'quotation.distributor', 'quotation.builder',
     'sales.executive.app', 'se.attendance.view', 'se.route.plan', 'se.dealer.insights',
     'se.collections.view', 'se.targets.view', 'dealer.order_request.create',
+    // An SE creates requests for their dealers and should be able to act on them
+    // too — approve, reject, and process into a quotation / sales order — instead
+    // of waiting for the web team. Scoped to the SE's own requests server-side.
+    'dealer.order_request.review', 'dealer.order_request.approve',
   ],
   delivery_executive: [
     'dashboard.view', 'notification.inbox',

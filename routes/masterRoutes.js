@@ -16,6 +16,7 @@ import Expense from '../models/Expense.js';
 import { protect, requirePermission, userHasPermission } from '../middleware/auth.js';
 import { requireBranch } from '../utils/branchScope.js';
 import {
+  assignmentHealth,
   assignmentSummary,
   buildAssignmentChange,
   findAssignableExecutive,
@@ -289,8 +290,7 @@ async function normalizeDealerAssignment(body, actor, currentAssignment = null) 
   if (selectedId === null || selectedId === '') {
     data.assignedSalesExecutive = null;
     return data;
-  }
-  if (!mongoose.isValidObjectId(selectedId)) {
+  }  if (!mongoose.isValidObjectId(selectedId)) {
     throw dealerError(422, 'Select a valid Sales Executive.');
   }
 
@@ -350,6 +350,7 @@ dealerRouter.get('/', async (req, res) => {
       route: routeId,
       pricingTier,
       assignedSalesExecutive,
+      assignment,
     } = req.query;
     const p = Math.max(1, parseInt(page));
     const l = Math.min(100, parseInt(limit) || 20);
@@ -366,6 +367,25 @@ dealerRouter.get('/', async (req, res) => {
     if (assignedSalesExecutive === 'unassigned') filter.assignedSalesExecutive = null;
     else if (assignedSalesExecutive) filter.assignedSalesExecutive = assignedSalesExecutive;
 
+    // `?assignment=broken` — the dealers whose catalogue cannot work. Both causes
+    // from assignmentHealth: nobody assigned, or assigned to somebody who is no
+    // longer Active. Both end in "no branch", and the catalogue has no branch to
+    // price or stock against either way. Resolved to a list of ids here because
+    // "is this executive Active" is a property of another collection, so Mongo
+    // cannot express it in the dealer query — bounded to executives, not dealers,
+    // and it cannot exceed the number of staff accounts.
+    if (assignment === 'broken') {
+      const inactive = await User.find({ role: 'sales_executive', status: { $ne: 'Active' } })
+        .select('_id').lean();
+      filter.$and = [{
+        $or: [
+          { assignedSalesExecutive: null },
+          { assignedSalesExecutive: { $exists: false } },
+          { assignedSalesExecutive: { $in: inactive.map(u => u._id) } },
+        ],
+      }];
+    }
+
     if (pricingTier) {
       const matchingTypes = await DealerType.find({ pricingTier, status: 'active' }).select('_id').lean();
       const typeIds = matchingTypes.map(t => t._id);
@@ -381,7 +401,26 @@ dealerRouter.get('/', async (req, res) => {
       Dealer.countDocuments(filter),
     ]);
 
-    return res.json({ success: true, data: dealers, pagination: { currentPage: p, totalPages: Math.ceil(total / l), totalItems: total, itemsPerPage: l } });
+    // Mark, per row, whether this dealer's catalogue can work at all — see
+    // assignmentHealth. Derived from the executive already populated above
+    // (it selects `status`), so this adds no query. Sent as a field rather than
+    // left for the client to infer, because "no executive" and "executive since
+    // deactivated" are the same breakage and the client should not have to know
+    // that rule to draw the warning.
+    const data = dealers.map((dealer) => {
+      const executive = dealer.assignedSalesExecutive;
+      const assigned = Boolean(executive);
+      const assignmentBroken = !assigned || executive?.status !== 'Active';
+      return {
+        ...dealer,
+        assignmentBroken,
+        assignmentIssue: !assigned
+          ? 'unassigned'
+          : executive?.status !== 'Active' ? 'executive_inactive' : null,
+      };
+    });
+
+    return res.json({ success: true, data, pagination: { currentPage: p, totalPages: Math.ceil(total / l), totalItems: total, itemsPerPage: l } });
   } catch (error) { return sendDealerError(res, error); }
 });
 
@@ -404,6 +443,27 @@ dealerRouter.get('/sales-executives', requirePermission('dealer.assignment.manag
       .sort({ name: 1 })
       .lean();
     return res.json({ success: true, data: salesExecutives });
+  } catch (error) { return sendDealerError(res, error); }
+});
+
+// GET /masters/dealers/assignment-health
+//
+// Why a dealer's catalogue is empty, grouped by cause.
+//
+// An unassigned dealer is not merely "unrouted": their operating branch is derived
+// from the assigned executive (see resolveDealerBranch), so with nobody assigned the
+// catalogue has no branch to price or stock against and silently returns every rate
+// null and every availableQty 0. The dealer sees products with no price that all read
+// "Out of stock", and nothing anywhere reports an error.
+//
+// A deactivated executive is counted separately because it is not a distinct failure
+// mode — it is the same one, arriving later, and the fix is the same (assign someone
+// active). Counted in the database so the totals stay right beyond the first page.
+//
+// Declared before '/:id' so "assignment-health" is not read as a dealer id.
+dealerRouter.get('/assignment-health', async (_req, res) => {
+  try {
+    return res.json({ success: true, data: await assignmentHealth() });
   } catch (error) { return sendDealerError(res, error); }
 });
 
@@ -489,6 +549,28 @@ dealerRouter.post('/', async (req, res) => {
   try {
     const data = { ...await normalizeDealerAssignment(req.body, req.user), createdBy: req.user._id };
     await applyDealerMobile(data);
+
+    // A dealer with no executive has no operating branch, and the catalogue is
+    // branch-scoped — so the account would be created, the dealer could log in,
+    // and every product would show no price and read "Out of stock" with no error
+    // anywhere. Refusing the save is the only point where that is still visible.
+    //
+    // The caller gets the same escape hatch as any other assignment: assign an
+    // executive, which requires dealer.assignment.manage. Sending
+    // `allowUnassigned: true` records the intent explicitly for the import path,
+    // which creates dealers in bulk and may not know who owns them yet — those
+    // rows are then surfaced by GET /masters/dealers/assignment-health.
+    if (!data.assignedSalesExecutive && req.body?.allowUnassigned !== true) {
+      throw dealerError(
+        422,
+        'Assign a Sales Executive to this dealer. A dealer with nobody assigned has no '
+        + 'operating branch, so the catalogue cannot price or show stock for them.',
+      );
+    }
+    if (!data.assignedSalesExecutive && !userHasPermission(req.user, 'dealer.assignment.manage')) {
+      throw dealerError(403, 'Access denied: dealer.assignment.manage');
+    }
+
     if (!data.dealerCode) {
       const { generateUniqueCode } = await import('../utils/codeGenerator.js');
       data.dealerCode = await generateUniqueCode(Dealer, 'dealerCode', 'DLR', 5);

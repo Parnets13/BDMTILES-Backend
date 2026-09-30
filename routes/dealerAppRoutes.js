@@ -40,6 +40,9 @@ import { buildTrustedRequestItems, orderRequestFingerprint, buildStatusCounts, r
 import { recordDealerResponse, shortfallDto } from '../services/dealerOrderShortfallService.js';
 import { requestFingerprint } from '../utils/idempotency.js';
 import { generateBranchNumber } from '../utils/branchSequence.js';
+import { descendantIds } from '../services/categoryTreeService.js';
+import { filterableOptionsForCategory, describeProductAttributes } from '../services/attributeService.js';
+import Category from '../models/Category.js';
 
 const router = Router();
 router.use(protectDealer);
@@ -353,13 +356,44 @@ router.get('/catalogue', requireDealerPermission('catalogue.view'), async (req, 
       filter.$or = [{ itemName: regex }, { productCode: regex }, { colour: regex }, { design: regex }];
     }
     if (mongoose.isValidObjectId(brand)) filter.brand = brand;
-    if (mongoose.isValidObjectId(category)) filter.category = category;
+
+    // A category filter covers everything filed beneath it, and matches BOTH taxonomy fields:
+    // the admin form's "Category" is level 1 and lands in `product.category`, while its
+    // "Subcategory" is level 2 and lands in `product.subcategory`. Matching `category` alone
+    // returned nothing for a level-2 id.
+    if (mongoose.isValidObjectId(category)) {
+      const ids = await descendantIds(category);
+      const categoryClause = { $or: [{ category: { $in: ids } }, { subcategory: { $in: ids } }] };
+      if (filter.$or) {
+        // The search above already claimed `$or`, so both go under `$and` rather than one
+        // silently overwriting the other.
+        filter.$and = [{ $or: filter.$or }, categoryClause];
+        delete filter.$or;
+      } else {
+        filter.$or = categoryClause.$or;
+      }
+    }
     if (mongoose.isValidObjectId(subcategory)) filter.subcategory = subcategory;
     // 17.3 attribute filters — matched server-side so paging stays correct.
     if (size) filter.tileSize = String(size);
     if (finish) filter.finish = String(finish);
     if (colour) filter.colour = String(colour);
     if (application) filter.applicationArea = String(application);
+
+      // Category-defined attributes, e.g. `?attr.material=Vitreous China` or
+      // `?attr.material=Copper,Brass`. Matched server-side so paging stays correct — narrowing
+      // on the client would only filter the page the dealer happens to be looking at.
+      //
+      // The key is validated as a plain identifier so it cannot be used to reach into another
+      // part of the document; anything else is ignored rather than erroring, so a stale
+      // bookmarked filter degrades to "no filter".
+      for (const [param, raw] of Object.entries(req.query)) {
+        if (!param.startsWith('attr.') || !raw) continue;
+        const key = param.slice('attr.'.length);
+        if (!/^[a-zA-Z][a-zA-Z0-9_]*$/.test(key)) continue;
+        const values = String(raw).split(',').map((v) => v.trim()).filter(Boolean);
+        if (values.length) filter[`attributes.${key}`] = { $in: values };
+      }
 
     const [products, total] = await Promise.all([
       Product.find(filter).sort({ itemName: 1 }).skip((p - 1) * l).limit(l)
@@ -402,6 +436,13 @@ router.get('/catalogue', requireDealerPermission('catalogue.view'), async (req, 
         itemName: product.itemName,
         brand: product.brand?.name || '',
         category: product.category?.name || '',
+        // Category-defined attributes — the same fields the admin form collects and the
+        // website shows. Without these a granite slab or a cement bag had NO specs at all
+        // in the dealer catalogue, so the multi-vertical build was invisible to the very
+        // people ordering those products.
+        attributes: product.attributes instanceof Map
+          ? Object.fromEntries(product.attributes)
+          : (product.attributes || {}),
         tileSize: product.tileSize || '',
         finish: product.finish || '',
         colour: product.colour || '',
@@ -424,7 +465,18 @@ router.get('/catalogue', requireDealerPermission('catalogue.view'), async (req, 
 // Must be declared BEFORE /catalogue/:id so it isn't captured as an :id.
 router.get('/catalogue/filter-options', requireDealerPermission('catalogue.view'), async (req, res) => {
   try {
-    const match = { status: 'active', dealerVisible: { $ne: false } };
+    const base = { status: 'active', dealerVisible: { $ne: false } };
+
+    // Scoped to the requested category, so opening Building Materials stops offering tile sizes
+    // and finishes. Matches `category` OR `subcategory` because a product files its taxonomy
+    // across both fields. Without a category the facets stay global, which the catalogue's
+    // unfiltered view wants.
+    let match = base;
+    if (mongoose.isValidObjectId(req.query.category)) {
+      const ids = await descendantIds(req.query.category);
+      match = { ...base, $or: [{ category: { $in: ids } }, { subcategory: { $in: ids } }] };
+    }
+
     const [brands, categories, sizes, finishes, colours, applications] = await Promise.all([
       Product.aggregate([
         { $match: match },
@@ -447,6 +499,14 @@ router.get('/catalogue/filter-options', requireDealerPermission('catalogue.view'
       Product.distinct('colour', { ...match, colour: { $nin: [null, ''] } }),
       Product.distinct('applicationArea', { ...match, applicationArea: { $nin: [null, ''] } }),
     ]);
+    // The category's own filterable attributes — the same definitions the admin form collects
+    // and the website filters on. This is what lets granite offer slab thickness and
+    // sanitaryware offer material, instead of every listing showing the tile facets.
+    let attributes = [];
+    if (mongoose.isValidObjectId(req.query.category)) {
+      attributes = await filterableOptionsForCategory(req.query.category);
+    }
+
     const clean = (values) => values.filter(Boolean).map(String).sort((a, b) => a.localeCompare(b));
     res.json({
       success: true,
@@ -457,6 +517,7 @@ router.get('/catalogue/filter-options', requireDealerPermission('catalogue.view'
         finishes: clean(finishes),
         colours: clean(colours),
         applications: clean(applications),
+        attributes,
       },
     });
   } catch (error) { sendError(res, error); }
@@ -509,6 +570,13 @@ router.get('/catalogue/:id', requireDealerPermission('catalogue.view'), async (r
         brand: product.brand?.name || '',
         category: product.category?.name || '',
         subcategory: product.subcategory?.name || '',
+        // Category-defined attributes — the same fields the admin form collects and the
+        // website shows. Without these a granite slab or a cement bag had NO specs at all
+        // in the dealer catalogue, so the multi-vertical build was invisible to the very
+        // people ordering those products.
+        attributes: product.attributes instanceof Map
+          ? Object.fromEntries(product.attributes)
+          : (product.attributes || {}),
         tileSize: product.tileSize || '',
         thickness: product.thickness || '',
         finish: product.finish || '',
@@ -522,6 +590,10 @@ router.get('/catalogue/:id', requireDealerPermission('catalogue.view'), async (r
         weightPerBox: product.weightPerBox || 0,
         images: product.images || [],
         videos: product.videos || [],
+        // The same attributes as `attributes` above, but paired with their LABELS and units so
+        // the app can render them directly. A raw map is enough to filter on; "slabLength: 8"
+        // is not something a dealer should have to read.
+        attributeSpecs: await describeProductAttributes(product.category?._id, product.attributes),
         images360: product.images360 || [],
         pricing,
         availableQty,
