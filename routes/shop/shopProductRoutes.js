@@ -419,17 +419,35 @@ router.get('/new-arrivals', async (_req, res) => {
 // The attribute list is what replaces the hardcoded tile fields for the other verticals.
 router.get('/filter-options', async (req, res) => {
   try {
+    // The legacy tile facets are scoped to the requested category.
+    //
+    // They used to be `distinct()` over the WHOLE catalogue, so opening Sanitaryware offered
+    // tile sizes, tile colours and tile finishes — every department got the tile rail. A
+    // category filter must narrow these to that category's own products.
+    //
+    // The scope matches `category` OR `subcategory`, because a product's taxonomy is split
+    // across both fields (the admin form's "Category" is level 1, its "Subcategory" is level 2).
+    let facetScope = ONLY_ONLINE;
+    let scopedCategoryIds = null;
+    if (req.query.category && mongoose.isValidObjectId(req.query.category)) {
+      scopedCategoryIds = await descendantIds(req.query.category);
+      facetScope = {
+        ...ONLY_ONLINE,
+        $or: [{ category: { $in: scopedCategoryIds } }, { subcategory: { $in: scopedCategoryIds } }],
+      };
+    }
+
     const [sizes, finishes, surfaces, thicknesses, types, colours, areas, brandIds, subcategoryIds, categoryIds] = await Promise.all([
-      Product.distinct('tileSize', ONLY_ONLINE),
-      Product.distinct('finish', ONLY_ONLINE),
-      Product.distinct('surface', ONLY_ONLINE),
-      Product.distinct('thickness', ONLY_ONLINE),
-      Product.distinct('tileType', ONLY_ONLINE),
-      Product.distinct('colour', ONLY_ONLINE),
-      Product.distinct('applicationArea', ONLY_ONLINE),
-      Product.distinct('brand', ONLY_ONLINE),
-      Product.distinct('subcategory', ONLY_ONLINE),
-      Product.distinct('category', ONLY_ONLINE),
+      Product.distinct('tileSize', facetScope),
+      Product.distinct('finish', facetScope),
+      Product.distinct('surface', facetScope),
+      Product.distinct('thickness', facetScope),
+      Product.distinct('tileType', facetScope),
+      Product.distinct('colour', facetScope),
+      Product.distinct('applicationArea', facetScope),
+      Product.distinct('brand', facetScope),
+      Product.distinct('subcategory', facetScope),
+      Product.distinct('category', facetScope),
     ]);
     const clean = (arr) => arr.filter((v) => v && String(v).trim()).sort();
 

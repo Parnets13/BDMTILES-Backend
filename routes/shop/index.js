@@ -3,6 +3,7 @@ import shopAuthRoutes from './shopAuthRoutes.js';
 import shopProductRoutes from './shopProductRoutes.js';
 import shopOrderRoutes from './shopOrderRoutes.js';
 import shopContentRoutes from './shopContentRoutes.js';
+import shopEnquiryRoutes from './shopEnquiryRoutes.js';
 import shopWalletRoutes from './shopWalletRoutes.js';
 
 /**
@@ -13,6 +14,7 @@ import shopWalletRoutes from './shopWalletRoutes.js';
  * - /shop/orders   — customer order placement + tracking
  * - /shop/content  — home page CMS content
  * - /shop/wallet   — BDM Cash wallet (balance + transactions)
+ * - /shop/enquiry  — public enquiry form (stock requests, quotation requests)
  */
 const router = Router();
 
@@ -20,6 +22,7 @@ router.use('/auth', shopAuthRoutes);
 router.use('/products', shopProductRoutes);
 router.use('/orders', shopOrderRoutes);
 router.use('/content', shopContentRoutes);
+router.use('/enquiry', shopEnquiryRoutes);
 router.use('/wallet', shopWalletRoutes);
 
 export default router;
