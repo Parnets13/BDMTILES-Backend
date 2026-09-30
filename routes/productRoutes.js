@@ -7,10 +7,11 @@ import Stock from '../models/Stock.js';
 import StockMovement from '../models/StockMovement.js';
 import Brand from '../models/Brand.js';
 import Category from '../models/Category.js';
-import Subcategory from '../models/Subcategory.js';
 import { protect, requirePermission, requireAnyPermission } from '../middleware/auth.js';
 import { uploadProductImages } from '../middleware/upload.js';
 import { normalizeProductUomConfig } from '../services/stockUomService.js';
+import { normalizeAndValidateAttributes } from '../services/attributeService.js';
+import { descendantIds } from '../services/categoryTreeService.js';
 // imageEmbedding service is optional (requires onnxruntime-node package)
 let generateEmbedding = null;
 try {
@@ -98,7 +99,7 @@ router.post('/upload-images', canUploadProductImage, (req, res) => {
 // GET /api/v1/products — list with search, filters, pagination
 router.get('/', async (req, res) => {
   try {
-    const { page = 1, limit = 20, search, brand, category, subcategory, status, tileSize, finish, tileType, applicationArea, sortBy = 'createdAt', order = 'desc' } = req.query;
+    const { page = 1, limit = 20, search, brand, department, category, subcategory, status, tileSize, finish, tileType, applicationArea, sortBy = 'createdAt', order = 'desc' } = req.query;
     const p = Math.max(1, parseInt(page));
     const l = Math.min(100, Math.max(1, parseInt(limit)));
 
@@ -111,7 +112,19 @@ router.get('/', async (req, res) => {
       ];
     }
     if (brand) filter.brand = brand;
-    if (category) filter.category = category;
+
+    // Department / category filtering walks the taxonomy, so picking a department returns
+    // everything filed beneath it, not only the products sitting directly on it. `department`
+    // was previously ignored outright, which made the filter appear to do nothing.
+    const scopeId = [department, category].find((v) => v && mongoose.isValidObjectId(v));
+    if (scopeId) {
+      filter.category = { $in: await descendantIds(scopeId) };
+    } else if (category) {
+      // Not a usable id — matched literally so an unknown value yields nothing rather than
+      // being silently dropped.
+      filter.category = category;
+    }
+
     if (subcategory) filter.subcategory = subcategory;
     if (status) filter.status = status;
     if (tileSize) filter.tileSize = tileSize;
@@ -193,15 +206,48 @@ router.get('/stats', async (req, res) => {
   }
 });
 
-// GET /api/v1/products/filter-options — get brands/categories/subcategories for filter dropdowns
+// GET /api/v1/products/filter-options — brands + the taxonomy, for filter dropdowns
+//
+// Returns BOTH shapes while the Product Master is being moved onto the tree:
+//   legacy — `categories` (level 2) and `subcategories` (level 3) with a scalar `brand`
+//            and a `category` parent, which is what the current cascading selects read
+//   new    — `departments` (level 1) and `tree` (nested), for the tree-based UI
+//
+// Rows written before the migration have no `level` yet, so they are treated as
+// level 2 here. Without that fallback the category dropdown would go empty the moment
+// the schema changed, before the migration had run.
 router.get('/filter-options', async (req, res) => {
   try {
-    const [brands, categories, subcategories] = await Promise.all([
+    const [brands, nodes] = await Promise.all([
       Brand.find({ status: 'active' }).sort({ name: 1 }).lean(),
-      Category.find({ status: 'active' }).sort({ name: 1 }).lean(),
-      Subcategory.find({ status: 'active' }).sort({ name: 1 }).lean(),
+      Category.find({ status: 'active' }).sort({ level: 1, sortOrder: 1, name: 1 }).lean(),
     ]);
-    res.json({ success: true, data: { brands, categories, subcategories } });
+
+    const levelOf = (n) => n.level || 2;   // pre-migration rows default to level 2
+    const shape = (n) => ({
+      ...n,
+      level: levelOf(n),
+      // Legacy scalar brand, so the existing brand-first select still resolves.
+      // `brands` is the real (many-to-many) field and is what the new UI should use.
+      brand: (n.brands && n.brands[0]) || n.brand || null,
+      // Legacy parent key for the subcategory select.
+      category: n.parent || null,
+    });
+
+    const departments = nodes.filter((n) => levelOf(n) === 1).map(shape);
+    const categories = nodes.filter((n) => levelOf(n) === 2).map(shape);
+    const subcategories = nodes.filter((n) => levelOf(n) === 3).map(shape);
+
+    const tree = nodes
+      .filter((n) => !n.parent)
+      .map(function build(n) {
+        return { ...shape(n), children: nodes.filter((c) => String(c.parent) === String(n._id)).map(build) };
+      });
+
+    res.json({
+      success: true,
+      data: { brands, categories, subcategories, departments, tree },
+    });
   } catch (error) {
     res.status(500).json({ success: false, message: error.message });
   }
@@ -229,6 +275,16 @@ router.post('/', canCreateProduct, async (req, res) => {
     const productData = { ...req.body, createdBy: req.user._id };
     Object.assign(productData, normalizeProductUomConfig(productData, productData.unit || 'Box'));
 
+    // Validate the flexible attributes against whatever the product's category declares.
+    // Run unconditionally on create so a required attribute cannot be skipped, and so
+    // unknown keys are dropped rather than stored — otherwise the retired tile columns
+    // could leak back in through the attributes bag.
+    const { attributes, dropped } = await normalizeAndValidateAttributes(
+      productData.category,
+      req.body.attributes || {},
+    );
+    productData.attributes = attributes;
+
     // Auto-generate product code if not provided — check both products AND recycle bin for uniqueness
     if (!productData.productCode) {
       const RecycleBin = (await import('../models/RecycleBin.js')).default;
@@ -250,7 +306,16 @@ router.post('/', canCreateProduct, async (req, res) => {
     // Fire-and-forget: generate image embedding for visual search
     scheduleEmbedding(String(product._id), product.images);
 
-    res.status(201).json({ success: true, message: 'Product created.', data: product });
+    // Surface ignored keys rather than silently discarding them — a form sending a field
+    // the category does not define is a wiring mistake worth seeing.
+    res.status(201).json({
+      success: true,
+      message: dropped.length
+        ? `Product created. Ignored unrecognised attribute${dropped.length === 1 ? '' : 's'}: ${dropped.join(', ')}.`
+        : 'Product created.',
+      data: product,
+      ...(dropped.length ? { ignoredAttributes: dropped } : {}),
+    });
   } catch (error) {
     if (error.code === 11000) return res.status(400).json({ success: false, message: 'Product code already exists.' });
     if (error.status || error.name === 'ValidationError') return res.status(error.status || 422).json({ success: false, message: error.message });
@@ -280,6 +345,24 @@ router.put('/:id', canUpdateProduct, async (req, res) => {
       nextUom.uomConversions = nextUom.uomConversions.map(row => ({ ...row, version: nextUom.inventoryUomVersion }));
     }
     Object.assign(update, nextUom);
+
+    // Attributes are validated against the category the product will END UP in, which
+    // may differ from the current one when this same update moves it. Re-validating on a
+    // category change is what stops a product carrying attributes that belong to the
+    // category it just left.
+    if (req.body.attributes !== undefined || req.body.category !== undefined) {
+      const targetCategory = update.category || existing.category;
+      const raw = req.body.attributes !== undefined
+        ? req.body.attributes
+        : (existing.attributes instanceof Map ? Object.fromEntries(existing.attributes) : (existing.attributes || {}));
+      const { attributes } = await normalizeAndValidateAttributes(targetCategory, raw, {
+        // A partial update that only moves the category must not fail on required
+        // attributes the caller never had the chance to supply.
+        partial: req.body.attributes === undefined,
+      });
+      update.attributes = attributes;
+    }
+
     const product = await Product.findByIdAndUpdate(req.params.id, update, { new: true, runValidators: true })
       .populate('brand', 'name')
       .populate('category', 'name')

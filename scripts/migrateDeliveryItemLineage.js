@@ -3,6 +3,7 @@ import mongoose from 'mongoose';
 import Delivery from '../models/Delivery.js';
 import DispatchTrip from '../models/DispatchTrip.js';
 import PickList from '../models/PickList.js';
+import { ensureSrvResolvable } from '../config/db.js';
 
 const flags = process.argv.slice(2);
 if (flags.some(flag => !['--execute', '--dry-run'].includes(flag)) || (flags.includes('--execute') && flags.includes('--dry-run'))) throw new Error('Use --dry-run or --execute only.');
@@ -10,6 +11,9 @@ const execute = flags.includes('--execute');
 
 async function run() {
   if (!process.env.MONGODB_URI) throw new Error('MONGODB_URI is required.');
+  // A network that refuses SRV queries cannot resolve mongodb+srv://, which would
+  // stop this script with a confusing ECONNREFUSED. Same fallback the server uses.
+  await ensureSrvResolvable(process.env.MONGODB_URI, { autoIndex: false });
   await mongoose.connect(process.env.MONGODB_URI, { autoIndex: false });
   const stats = { examined: 0, safe: 0, ambiguous: 0, updated: 0 };
   for await (const delivery of Delivery.find({ status: { $in: ['assigned', 'in_transit', 'reached', 'failed', 'rescheduled'] }, 'items.0': { $exists: false }, dispatchTrip: { $ne: null }, salesOrder: { $ne: null } }).cursor()) {

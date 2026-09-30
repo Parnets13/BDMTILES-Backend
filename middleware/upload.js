@@ -11,6 +11,9 @@ const complaintUploadDirectory = path.join(uploadRoot, 'complaints');
 const webUploadDirectory = path.join(uploadRoot, 'web');
 const webVideoDirectory = path.join(uploadRoot, 'web-videos');
 const brandUploadDirectory = path.join(uploadRoot, 'brands');
+// Category images (the card shown on the website). Separate from brands so the two can be
+// told apart on disk and either can be cleared without touching the other.
+const categoryUploadDirectory = path.join(uploadRoot, 'categories');
 export const legacySupplierCreditNoteDirectory = path.join(uploadRoot, 'supplier-credit-notes');
 export const supplierCreditNoteDirectory = path.join(privateUploadRoot, 'supplier-credit-notes');
 // Candidate resumes are personal/sensitive — private-uploads, never statically served.
@@ -22,6 +25,7 @@ fs.mkdirSync(complaintUploadDirectory, { recursive: true });
 fs.mkdirSync(webUploadDirectory, { recursive: true });
 fs.mkdirSync(webVideoDirectory, { recursive: true });
 fs.mkdirSync(brandUploadDirectory, { recursive: true });
+fs.mkdirSync(categoryUploadDirectory, { recursive: true });
 fs.mkdirSync(supplierCreditNoteDirectory, { recursive: true });
 fs.mkdirSync(candidateResumeDirectory, { recursive: true });
 fs.mkdirSync(hrGeneratedDocumentDirectory, { recursive: true });
@@ -54,6 +58,14 @@ export const uploadProductImages = multer({
 // Brand logos are uploaded through the category-setup permission boundary.
 export const uploadBrandImage = multer({
   storage: storageFor(brandUploadDirectory),
+  fileFilter,
+  limits: { fileSize: 5 * 1024 * 1024 },
+}).single('image');
+
+// Category images. Same limits and filter as brand logos — a category card and a brand logo
+// have the same constraints, so there is no reason for them to differ.
+export const uploadCategoryImage = multer({
+  storage: storageFor(categoryUploadDirectory),
   fileFilter,
   limits: { fileSize: 5 * 1024 * 1024 },
 }).single('image');

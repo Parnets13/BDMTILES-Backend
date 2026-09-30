@@ -13,10 +13,28 @@ const productSchema = new mongoose.Schema(
     hsnCode: { type: String, trim: true, default: '' },
     gst: { type: Number, required: true, min: 0, max: 28, default: 18 },
 
-    // Hierarchy: Brand → Category → Subcategory
-    brand: { type: mongoose.Schema.Types.ObjectId, ref: 'Brand', required: true },
+    // ── Taxonomy ──────────────────────────────────────────────────────────
+    // Category is the spine, and it is the only required part: it decides which
+    // attributes the product carries and how its quantity is calculated. Everything
+    // else is optional.
+    //
+    // Brand is NOT a parent any more. It is a filter — a cement bag may have no brand
+    // at all, and forcing one is what pushed the legacy data into brand-named
+    // categories like "KAJARIA CATEGORY".
+    //
+    // `subcategory` now points at a level-3 Category node; the standalone Subcategory
+    // collection is deprecated. The ref is switched here so `populate('subcategory')`
+    // resolves against the tree once the migration has run.
     category: { type: mongoose.Schema.Types.ObjectId, ref: 'Category', required: true },
-    subcategory: { type: mongoose.Schema.Types.ObjectId, ref: 'Subcategory', required: true },
+    subcategory: { type: mongoose.Schema.Types.ObjectId, ref: 'Category' },
+    brand: { type: mongoose.Schema.Types.ObjectId, ref: 'Brand' },
+
+    // ── Flexible attributes ───────────────────────────────────────────────
+    // Whatever the product's category declares via AttributeDefinition: `finish`,
+    // `packSize`, `grade`, `thickness` … Keys are the definition `key`, values are the
+    // entered value. This is what carries the other eighteen verticals without adding
+    // a column per vertical.
+    attributes: { type: Map, of: mongoose.Schema.Types.Mixed, default: undefined },
 
     // Tile-specific fields
     tileSize: { type: String, trim: true, default: '' },
@@ -119,6 +137,10 @@ const productSchema = new mongoose.Schema(
 productSchema.index({ itemName: 'text', productCode: 'text', aliasName: 'text' });
 productSchema.index({ brand: 1, category: 1, subcategory: 1 });
 productSchema.index({ status: 1 });
+// Wildcard index so storefront filters can query any category-defined attribute key
+// (`attributes.finish`, `attributes.packSize`, …) without the schema knowing the names
+// in advance. Without this, every attribute filter is a collection scan.
+productSchema.index({ 'attributes.$**': 1 });
 // Index for visual search - products with embeddings
 productSchema.index({ imageEmbedding: 1, status: 1, onlineVisible: 1 });
 

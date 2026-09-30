@@ -14,6 +14,13 @@ dotenv.config();
 
 import User from '../models/User.js';
 import { userHasPermission } from '../middleware/auth.js';
+import { ensureSrvResolvable } from '../config/db.js';
+
+// A network that refuses SRV queries cannot resolve mongodb+srv://, which would
+
+// stop this script with a confusing ECONNREFUSED. Same fallback the server uses.
+
+await ensureSrvResolvable(process.env.MONGO_URI || process.env.MONGODB_URI);
 
 await mongoose.connect(process.env.MONGO_URI || process.env.MONGODB_URI);
 

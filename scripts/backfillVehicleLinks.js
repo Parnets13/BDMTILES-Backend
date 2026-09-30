@@ -20,9 +20,16 @@ import Vehicle from '../models/Vehicle.js';
 import DispatchTrip from '../models/DispatchTrip.js';
 import Delivery from '../models/Delivery.js';
 import Dispatch from '../models/Dispatch.js';
+import { ensureSrvResolvable } from '../config/db.js';
 
 const apply = process.argv.includes('--apply');
 const normalise = value => String(value || '').trim().toUpperCase();
+
+// A network that refuses SRV queries cannot resolve mongodb+srv://, which would
+
+// stop this script with a confusing ECONNREFUSED. Same fallback the server uses.
+
+await ensureSrvResolvable(process.env.MONGODB_URI);
 
 await mongoose.connect(process.env.MONGODB_URI);
 

@@ -1,6 +1,7 @@
 import 'dotenv/config';
 import mongoose from 'mongoose';
 import Dealer, { normalizeDealerMobile } from '../models/Dealer.js';
+import { ensureSrvResolvable } from '../config/db.js';
 
 // Usage:
 //   node --use-system-ca scripts/enableDealerAppAccess.js            → list dealers + app status
@@ -10,6 +11,9 @@ const arg = process.argv[2];
 
 async function run() {
   if (!process.env.MONGODB_URI) throw new Error('MONGODB_URI is required.');
+  // A network that refuses SRV queries cannot resolve mongodb+srv://, which would
+  // stop this script with a confusing ECONNREFUSED. Same fallback the server uses.
+  await ensureSrvResolvable(process.env.MONGODB_URI);
   await mongoose.connect(process.env.MONGODB_URI);
   console.log(`Connected to ${mongoose.connection.name}`);
 

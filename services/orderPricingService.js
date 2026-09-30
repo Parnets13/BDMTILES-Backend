@@ -25,6 +25,26 @@ const fieldProvided = (item, field) => {
 const roundQuantity = value => Math.round((Number(value) + Number.EPSILON) * 1e6) / 1e6;
 const quantitiesMatch = (left, right) => Math.abs(left - right) <= Math.max(0.0001, Math.max(Math.abs(left), Math.abs(right)) * 0.000001);
 
+/**
+ * The area of ONE selling unit, in square feet.
+ *
+ * Tiles carry it in the legacy `sqftPerBox` column; every other vertical stores the calculated
+ * `areaPerUnit` attribute (see the frontend's utils/productCalculations.js). Reading both here
+ * means the order and pricing code never has to know which vertical it is dealing with — a
+ * granite slab, a plywood sheet and a box of tiles all answer the same question.
+ *
+ * Returns 0 when the product has no area at all (a cement bag, a door lock), which is a valid
+ * state — it just cannot be ordered in square feet.
+ */
+function areaPerSellingUnit(product) {
+  const legacy = Number(product?.sqftPerBox);
+  if (Number.isFinite(legacy) && legacy > 0) return legacy;
+  const raw = product?.attributes;
+  const attrs = raw instanceof Map ? Object.fromEntries(raw) : (raw || {});
+  const fromAttribute = Number(attrs.areaPerUnit);
+  return Number.isFinite(fromAttribute) && fromAttribute > 0 ? fromAttribute : 0;
+}
+
 export async function normalizeOrderItemsUom(items, session = null, { requireItemUnit = false } = {}) {
   if (!Array.isArray(items) || items.length === 0) throw routeError(422, 'At least one item is required.');
   const productIds = items.map((item, index) => {
@@ -50,7 +70,7 @@ export async function normalizeOrderItemsUom(items, session = null, { requireIte
       if (requestedUnit !== commercialUnit) throw routeError(422, `items[${index}].unit must match the product commercial unit ${commercialUnit}.`);
       const quantity = roundQuantity(quantityValue(item.quantity, `items[${index}].quantity`));
       const piecesPerBox = finiteNonNegative(product.piecesPerBox, `items[${index}].piecesPerBox`);
-      const sqftPerBox = finiteNonNegative(product.sqftPerBox, `items[${index}].sqftPerBox`);
+      const area = areaPerSellingUnit(product);
       return {
         source: {
           ...item,
@@ -59,17 +79,27 @@ export async function normalizeOrderItemsUom(items, session = null, { requireIte
           quantity,
           boxes: requestedUnit === 'Box' ? quantity : 0,
           pieces: requestedUnit === 'Piece' ? quantity : requestedUnit === 'Box' && piecesPerBox > 0 ? roundQuantity(quantity * piecesPerBox) : 0,
-          sqft: requestedUnit === 'Sqft' ? quantity : requestedUnit === 'Box' && sqftPerBox > 0 ? roundQuantity(quantity * sqftPerBox) : 0,
+          sqft: requestedUnit === 'Sqft' ? quantity : requestedUnit === 'Box' && area > 0 ? roundQuantity(quantity * area) : 0,
         },
         product,
         quantity,
       };
     }
     const piecesPerBox = finiteNonNegative(product.piecesPerBox, `items[${index}].piecesPerBox`);
-    const sqftPerBox = finiteNonNegative(product.sqftPerBox, `items[${index}].sqftPerBox`);
-    if (!(piecesPerBox > 0) || !(sqftPerBox > 0)) {
-      throw routeError(422, `Product ${product.productCode || product.itemName} requires positive piecesPerBox and sqftPerBox conversions.`);
+    const area = areaPerSellingUnit(product);
+
+    // The conversions are needed ONLY when the caller expresses the quantity in those units.
+    // Requiring them unconditionally is what made every non-tile product unorderable — a cement
+    // bag has no pieces-per-box and never will.
+    const wantsPieces = fieldProvided(item, 'pieces');
+    const wantsSqft = fieldProvided(item, 'sqft');
+    if (wantsPieces && !(piecesPerBox > 0)) {
+      throw routeError(422, `Product ${product.productCode || product.itemName} has no pieces-per-box conversion, so it cannot be ordered in pieces.`);
     }
+    if (wantsSqft && !(area > 0)) {
+      throw routeError(422, `Product ${product.productCode || product.itemName} has no area per unit, so it cannot be ordered in sq.ft.`);
+    }
+
     const candidates = [];
     if (fieldProvided(item, 'quantity')) candidates.push({ field: 'quantity', boxes: quantityValue(item.quantity, `items[${index}].quantity`) });
     if (fieldProvided(item, 'boxes')) candidates.push({ field: 'boxes', boxes: quantityValue(item.boxes, `items[${index}].boxes`) });
@@ -77,9 +107,9 @@ export async function normalizeOrderItemsUom(items, session = null, { requireIte
       const pieces = quantityValue(item.pieces, `items[${index}].pieces`);
       candidates.push({ field: 'pieces', boxes: pieces / piecesPerBox });
     }
-    if (fieldProvided(item, 'sqft')) {
+    if (wantsSqft) {
       const sqft = quantityValue(item.sqft, `items[${index}].sqft`);
-      candidates.push({ field: 'sqft', boxes: sqft / sqftPerBox });
+      candidates.push({ field: 'sqft', boxes: sqft / area });
     }
     if (!candidates.length) throw routeError(422, `items[${index}] requires quantity, boxes, pieces, or sqft.`);
     const boxes = candidates[0].boxes;
@@ -94,8 +124,10 @@ export async function normalizeOrderItemsUom(items, session = null, { requireIte
         product: product._id,
         quantity: canonicalBoxes,
         boxes: canonicalBoxes,
-        pieces: roundQuantity(canonicalBoxes * piecesPerBox),
-        sqft: roundQuantity(canonicalBoxes * sqftPerBox),
+        // Zero where the product has no such conversion — a cement bag has neither, and that
+        // is a fact about the product rather than an error.
+        pieces: piecesPerBox > 0 ? roundQuantity(canonicalBoxes * piecesPerBox) : 0,
+        sqft: area > 0 ? roundQuantity(canonicalBoxes * area) : 0,
       },
       product,
       quantity: canonicalBoxes,

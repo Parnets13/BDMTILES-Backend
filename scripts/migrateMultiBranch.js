@@ -45,6 +45,7 @@ import SupplierLedger from '../models/SupplierLedger.js';
 import Task from '../models/Task.js';
 import User from '../models/User.js';
 import Warehouse from '../models/Warehouse.js';
+import { ensureSrvResolvable } from '../config/db.js';
 
 const DEFAULT_CODE = String(process.env.DEFAULT_BRANCH_CODE || 'MAIN').trim().toUpperCase();
 const DEFAULT_NAME = String(process.env.DEFAULT_BRANCH_NAME || 'Main Branch').trim();
@@ -999,6 +1000,9 @@ async function backfillSalesOrderLifecycle() {
 
 async function run() {
   if (!process.env.MONGODB_URI) throw new Error('MONGODB_URI is required.');
+  // A network that refuses SRV queries cannot resolve mongodb+srv://, which would
+  // stop this script with a confusing ECONNREFUSED. Same fallback the server uses.
+  await ensureSrvResolvable(process.env.MONGODB_URI);
   await mongoose.connect(process.env.MONGODB_URI);
   console.log(`Connected to ${mongoose.connection.name}`);
 

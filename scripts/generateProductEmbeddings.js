@@ -24,6 +24,7 @@ import { fileURLToPath } from 'url';
 import dotenv from 'dotenv';
 import Product from '../models/Product.js';
 import { generateEmbedding } from '../services/imageEmbedding.js';
+import { ensureSrvResolvable } from '../config/db.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -54,6 +55,9 @@ const stats = {
  */
 async function connectDB() {
   try {
+    // A network that refuses SRV queries cannot resolve mongodb+srv://, which would stop this
+    // script with a confusing ECONNREFUSED. Same fallback the server uses.
+    await ensureSrvResolvable(process.env.MONGODB_URI);
     await mongoose.connect(process.env.MONGODB_URI, {
       useNewUrlParser: true,
       useUnifiedTopology: true,

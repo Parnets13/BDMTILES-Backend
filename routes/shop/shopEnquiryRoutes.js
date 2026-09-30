@@ -6,6 +6,11 @@ import { appendLeadActivity } from '../../services/leadActivityService.js';
 import { generateUniqueCode } from '../../utils/codeGenerator.js';
 import { getOnlineBranchId } from '../../utils/onlineBranch.js';
 
+/**
+ * Public storefront enquiries are saved as CRM leads, so the sales team can
+ * follow them through the existing lead pipeline. This endpoint does not read
+ * or modify stock.
+ */
 const router = Router();
 const PROJECT_TYPES = new Set(['residential', 'commercial', 'hospitality', 'industrial', 'renovation', 'other']);
 
@@ -15,14 +20,15 @@ const numericValue = (value) => {
   return Number.isFinite(number) && number >= 0 ? number : null;
 };
 
-// POST /api/v1/shop/enquiry — create a CRM lead from a storefront enquiry.
+// POST /api/v1/shop/enquiry
 router.post('/', async (req, res) => {
   try {
-    const name = String(req.body.customerName || '').trim();
-    const phone = String(req.body.customerPhone || '').replace(/\D/g, '');
-    const email = String(req.body.customerEmail || '').trim().toLowerCase();
-    const quantity = numericValue(req.body.quantity) ?? 1;
-    const productId = String(req.body.productId || '').trim();
+    const body = req.body || {};
+    const name = String(body.customerName || '').trim();
+    const phone = String(body.customerPhone || '').replace(/\D/g, '');
+    const email = String(body.customerEmail || '').trim().toLowerCase();
+    const quantity = numericValue(body.quantity) ?? 1;
+    const productId = String(body.productId || '').trim();
 
     if (!name || !/^\d{10}$/.test(phone)) {
       return res.status(422).json({ success: false, message: 'A customer name and valid 10-digit phone number are required.' });
@@ -45,33 +51,32 @@ router.post('/', async (req, res) => {
       if (!product) return res.status(404).json({ success: false, message: 'Product not found.' });
     }
 
-    const productName = String(req.body.productName || product?.itemName || '').trim();
+    const productName = String(body.productName || product?.itemName || '').trim();
     if (!productName) {
       return res.status(422).json({ success: false, message: 'Product name is required.' });
     }
 
-    // Use the same customer-facing price as the product catalog. This prevents
-    // the CRM estimate from becoming zero when a client omits or mislabels it.
+    // Match catalog pricing and coverage so the CRM estimate stays accurate
+    // even if a client omits or sends stale estimated values.
     const unitPrice = product
       ? (Number(product.mrp) > 0 ? Number(product.mrp) : Number(product.retailRate) || 0)
       : null;
-    const submittedValue = numericValue(req.body.estimatedValue);
-    const submittedArea = numericValue(req.body.estimatedArea);
-    const estimatedValue = unitPrice !== null
-      ? unitPrice * quantity
-      : (submittedValue ?? 0);
+    const submittedValue = numericValue(body.estimatedValue);
+    const submittedArea = numericValue(body.estimatedArea);
+    const estimatedValue = unitPrice !== null ? unitPrice * quantity : (submittedValue ?? 0);
     const estimatedArea = product && Number(product.sqftPerBox) > 0
       ? Number(product.sqftPerBox) * quantity
       : (submittedArea ?? 0);
-    const projectType = PROJECT_TYPES.has(req.body.projectType) ? req.body.projectType : 'residential';
+    const projectType = PROJECT_TYPES.has(body.projectType) ? body.projectType : 'residential';
     const branch = await getOnlineBranchId();
     const leadNumber = await generateUniqueCode(Lead, 'leadNumber', 'LD-', 5);
     const enquiryDetails = [
-      `Enquiry type: ${String(req.body.enquiryType || 'send_enquiry')}`,
+      `Website ${String(body.enquiryType || 'enquiry').trim()}`,
+      `Product: ${productName}`,
       `Quantity: ${quantity}`,
-      req.body.variantLabel ? `Variant: ${String(req.body.variantLabel).trim()}` : '',
-      req.body.preferredDeliveryDays ? `Preferred delivery: ${Number(req.body.preferredDeliveryDays)} days` : '',
-      String(req.body.message || '').trim(),
+      body.variantLabel ? `Variant: ${String(body.variantLabel).trim()}` : '',
+      body.preferredDeliveryDays ? `Preferred delivery: ${Number(body.preferredDeliveryDays)} days` : '',
+      String(body.message || '').trim(),
     ].filter(Boolean).join('\n');
 
     const lead = await Lead.create({
@@ -90,6 +95,7 @@ router.post('/', async (req, res) => {
       projectType,
       remarks: enquiryDetails,
       status: 'new',
+      priority: 'medium',
     });
 
     await appendLeadActivity({
@@ -103,13 +109,22 @@ router.post('/', async (req, res) => {
     return res.status(201).json({
       success: true,
       enquiryId: String(lead._id),
-      message: 'Enquiry received.',
-      data: { success: true, leadId: String(lead._id), leadNumber: lead.leadNumber, estimatedArea, estimatedValue, projectType },
+      message: 'Thanks — we have your enquiry and will get back to you shortly.',
+      data: {
+        success: true,
+        leadId: String(lead._id),
+        leadNumber: lead.leadNumber,
+        estimatedArea,
+        estimatedValue,
+        projectType,
+      },
     });
   } catch (error) {
     console.error('[shopEnquiry] Failed to save enquiry:', error.message);
     return res.status(error.status || 500).json({ success: false, message: error.message || 'Failed to save enquiry.' });
   }
 });
+
+// No GET route: the public endpoint must not expose the CRM lead list.
 
 export default router;

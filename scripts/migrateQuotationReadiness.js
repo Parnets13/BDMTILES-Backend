@@ -7,6 +7,7 @@ import Warehouse from '../models/Warehouse.js';
 import Product from '../models/Product.js';
 import Branch from '../models/Branch.js';
 import { quotationStockEligibility } from '../services/quotationStockService.js';
+import { ensureSrvResolvable } from '../config/db.js';
 
 const execute = process.argv.includes('--execute');
 const dryRun = !execute;
@@ -68,6 +69,9 @@ function evidenceConversionState(quotation, orders, ledger) {
 
 async function run() {
   if (!process.env.MONGODB_URI) throw new Error('MONGODB_URI is required.');
+  // A network that refuses SRV queries cannot resolve mongodb+srv://, which would
+  // stop this script with a confusing ECONNREFUSED. Same fallback the server uses.
+  await ensureSrvResolvable(process.env.MONGODB_URI, { autoIndex: false });
   await mongoose.connect(process.env.MONGODB_URI, { autoIndex: false });
   const quotations = await Quotation.collection.find({}).toArray();
   const quotationIds = quotations.map(value => value._id);

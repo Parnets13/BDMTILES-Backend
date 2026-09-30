@@ -2,6 +2,7 @@ import { Router } from 'express';
 import HeroSection from '../../models/webContent/HeroSection.js';
 import HomeBanner from '../../models/webContent/HomeBanner.js';
 import HomeCategory from '../../models/webContent/HomeCategory.js';
+import Category from '../../models/Category.js';
 import Testimonial from '../../models/webContent/Testimonial.js';
 import MarqueeItem from '../../models/webContent/MarqueeItem.js';
 import SiteSettings from '../../models/webContent/SiteSettings.js';
@@ -72,14 +73,83 @@ router.get('/pincode/:pincode', async (req, res) => {
 const ACTIVE = { status: 'active' };
 const bySort = { sortOrder: 1, createdAt: -1 };
 
+// GET /api/v1/shop/content/categories — the taxonomy the storefront navigates by.
+//
+// Departments (level 1) with their categories (level 2) nested, each carrying the slug the
+// website links with. One request drives the header menu, the home-page cards AND slug
+// resolution, so the site cannot disagree with the admin about what exists.
+//
+// `bySlug` is returned as a flat index so /category/<slug> resolves in one lookup instead of
+// walking the tree on every page load.
+//
+// Products are not included — the listing itself comes from /shop/products. This is the map,
+// not the contents.
+router.get('/categories', async (_req, res) => {
+  try {
+    const nodes = await Category.find({ status: 'active', level: { $in: [1, 2] } })
+      .select('_id name slug parent level image badge sortOrder showOnHome')
+      .sort({ sortOrder: 1, name: 1 })
+      .lean();
+
+    const byParent = new Map();
+    for (const node of nodes) {
+      if (node.level !== 2) continue;
+      const key = String(node.parent);
+      if (!byParent.has(key)) byParent.set(key, []);
+      byParent.get(key).push({
+        id: String(node._id),
+        name: node.name,
+        slug: node.slug || '',
+        image: node.image || '',
+        badge: node.badge || '',
+      });
+    }
+
+    const departments = nodes
+      .filter((node) => node.level === 1)
+      .map((node) => ({
+        id: String(node._id),
+        name: node.name,
+        slug: node.slug || '',
+        image: node.image || '',
+        badge: node.badge || '',
+        // What the admin ticked in Category Management, so the home page follows their order
+        // and choice rather than a list baked into the website.
+        showOnHome: Boolean(node.showOnHome),
+        categories: byParent.get(String(node._id)) || [],
+      }));
+
+    const bySlug = {};
+    for (const node of nodes) {
+      if (!node.slug) continue;
+      bySlug[node.slug] = {
+        id: String(node._id),
+        name: node.name,
+        slug: node.slug,
+        level: node.level,
+        image: node.image || '',
+        parentId: node.parent ? String(node.parent) : null,
+      };
+    }
+
+    return res.json({ success: true, data: { departments, bySlug } });
+  } catch (error) {
+    return res.status(500).json({ success: false, message: error.message });
+  }
+});
+
 // GET /api/v1/shop/content — all active storefront home content in one call.
 // Public, no auth, no branch. Consumed by the bdm-tiles-web home page.
 router.get('/', async (_req, res) => {
   try {
-    const [hero, banners, categories, testimonials, marquee, settings, tileRooms, tileTypes, tileSizes, videoTestimonials] = await Promise.all([
+    const [hero, banners, legacyCategories, treeDepartments, testimonials, marquee, settings, tileRooms, tileTypes, tileSizes, videoTestimonials] = await Promise.all([
       HeroSection.find(ACTIVE).sort(bySort).lean(),
       HomeBanner.find(ACTIVE).sort(bySort).lean(),
       HomeCategory.find(ACTIVE).sort(bySort).lean(),
+      // The taxonomy is the source of truth now: level-1 departments flagged showOnHome.
+      // HomeCategory is still queried as a fallback so the site keeps rendering before
+      // the migration has run and the departments carry no flag yet.
+      Category.find({ level: 1, status: 'active', showOnHome: true }).sort({ sortOrder: 1, name: 1 }).lean(),
       Testimonial.find(ACTIVE).sort(bySort).lean(),
       MarqueeItem.find(ACTIVE).sort(bySort).lean(),
       SiteSettings.findOne({ key: 'default' }).lean(),
@@ -88,6 +158,9 @@ router.get('/', async (_req, res) => {
       TileSizeItem.find(ACTIVE).sort(bySort).lean(),
       VideoTestimonial.find(ACTIVE).sort(bySort).lean(),
     ]);
+
+    // Prefer the tree once it has anything to show; otherwise keep serving the legacy list.
+    const categories = treeDepartments.length ? treeDepartments : legacyCategories;
 
     res.json({
       success: true,

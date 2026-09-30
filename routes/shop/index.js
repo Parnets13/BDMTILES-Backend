@@ -3,8 +3,8 @@ import shopAuthRoutes from './shopAuthRoutes.js';
 import shopProductRoutes from './shopProductRoutes.js';
 import shopOrderRoutes from './shopOrderRoutes.js';
 import shopContentRoutes from './shopContentRoutes.js';
-import shopWalletRoutes from './shopWalletRoutes.js';
 import shopEnquiryRoutes from './shopEnquiryRoutes.js';
+import shopWalletRoutes from './shopWalletRoutes.js';
 
 /**
  * Public customer storefront API (BDM Tiles website).
@@ -13,6 +13,7 @@ import shopEnquiryRoutes from './shopEnquiryRoutes.js';
  * - /shop/products — public catalog
  * - /shop/orders   — customer order placement + tracking
  * - /shop/content  — home page CMS content
+ * - /shop/enquiry  — public enquiry form (stock requests, quotation requests)
  * - /shop/wallet   — BDM Cash wallet (balance + transactions)
  */
 const router = Router();
@@ -21,7 +22,7 @@ router.use('/auth', shopAuthRoutes);
 router.use('/products', shopProductRoutes);
 router.use('/orders', shopOrderRoutes);
 router.use('/content', shopContentRoutes);
-router.use('/wallet', shopWalletRoutes);
 router.use('/enquiry', shopEnquiryRoutes);
+router.use('/wallet', shopWalletRoutes);
 
 export default router;

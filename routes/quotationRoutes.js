@@ -10,7 +10,6 @@ import Product from '../models/Product.js';
 import Stock from '../models/Stock.js';
 import Brand from '../models/Brand.js';
 import Category from '../models/Category.js';
-import Subcategory from '../models/Subcategory.js';
 import { resolvePricing } from '../services/pricingResolver.js';
 import { findActiveDealer, priceQuotation } from '../services/quotationPricingService.js';
 import { convertQuotationCore, conversionFingerprint, conversionSourceKey, findConversionReplay } from '../services/quotationConversionService.js';
@@ -527,12 +526,27 @@ router.get('/product-browser', requireAnyPermission('sales.order.create', 'quota
     const wantsFilterOptions = p === 1 && ['true', '1'].includes(String(includeFilterOptions).toLowerCase());
     let filterOptions;
     if (wantsFilterOptions) {
-      const [brands, categories, subcategories] = await Promise.all([
+      const [brands, nodes] = await Promise.all([
         Brand.find({ status: 'active' }).sort({ name: 1 }).select('name').lean(),
-        Category.find({ status: 'active' }).sort({ name: 1 }).select('name brand').lean(),
-        Subcategory.find({ status: 'active' }).sort({ name: 1 }).select('name brand category').lean(),
+        Category.find({ status: 'active' }).sort({ level: 1, sortOrder: 1, name: 1 }).lean(),
       ]);
-      filterOptions = { brands, categories, subcategories };
+      // Mirrors /products/filter-options: the legacy `categories` / `subcategories` lists
+      // keep a scalar `brand` and a `category` parent so the existing cascading selects
+      // still resolve, while `departments` exposes the new top level. Rows written before
+      // the migration have no `level`, so they default to 2 rather than disappearing.
+      const levelOf = (n) => n.level || 2;
+      const shape = (n) => ({
+        ...n,
+        level: levelOf(n),
+        brand: (n.brands && n.brands[0]) || n.brand || null,
+        category: n.parent || null,
+      });
+      filterOptions = {
+        brands,
+        departments: nodes.filter((n) => levelOf(n) === 1).map(shape),
+        categories: nodes.filter((n) => levelOf(n) === 2).map(shape),
+        subcategories: nodes.filter((n) => levelOf(n) === 3).map(shape),
+      };
     }
     const totalPages = Math.ceil(totalItems / l);
     return res.json({

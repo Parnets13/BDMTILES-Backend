@@ -11,8 +11,15 @@ dotenv.config();
 import Dealer from '../models/Dealer.js';
 import Product from '../models/Product.js';
 import DealerPricing from '../models/DealerPricing.js';
+import { ensureSrvResolvable } from '../config/db.js';
 
 const mobile = process.argv[2] || '9876543212';
+
+// A network that refuses SRV queries cannot resolve mongodb+srv://, which would
+
+// stop this script with a confusing ECONNREFUSED. Same fallback the server uses.
+
+await ensureSrvResolvable(process.env.MONGO_URI || process.env.MONGODB_URI);
 
 await mongoose.connect(process.env.MONGO_URI || process.env.MONGODB_URI);
 
