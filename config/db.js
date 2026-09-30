@@ -14,11 +14,45 @@ const isLoopbackUri = (uri) => /(^|\/\/)(127\.0\.0\.1|localhost|\[::1\]|::1)(:|\
 /** An explicit `?tls=true` in the URI is always honoured, whatever the host. */
 const uriRequestsTls = (uri) => /[?&]tls=(true|1)/i.test(uri);
 
+/** `mongodb+srv://` cannot resolve without an SRV lookup; a plain URI never needs one. */
+const isSrvUri = (uri) => /^mongodb\+srv:\/\//i.test(uri);
+
+/**
+ * Some networks refuse SRV queries — an office or VPN resolver that only answers A records,
+ * for instance. The failure surfaces as `querySrv ECONNREFUSED`, which reads like the database
+ * is down when the real problem is the resolver, and it is a confusing hour to lose.
+ *
+ * So probe the SRV record BEFORE connecting and, if the local resolver refuses, switch to
+ * public resolvers for this process. Doing it as a pre-flight check rather than a retry avoids
+ * a second `mongoose.connect()` — mongoose caches the connection promise, so re-connecting
+ * after a failure is unreliable.
+ *
+ * Render and Atlas resolve SRV correctly, so this never fires in production. It only rescues a
+ * local or locked-down network, and nothing is changed globally unless the probe actually fails.
+ */
+export const ensureSrvResolvable = async (uri) => {
+  if (!isSrvUri(uri)) return;
+
+  const host = uri.match(/@([^/?:,]+)/)?.[1];
+  if (!host) return;
+
+  const dns = await import('dns');
+  try {
+    await dns.promises.resolveSrv(`_mongodb._tcp.${host}`);
+  } catch {
+    console.warn(`⚠️  This network refused the SRV lookup for ${host} — falling back to public DNS.`);
+    dns.setServers(['1.1.1.1', '8.8.8.8']);
+    console.warn('   (Set your network DNS to 1.1.1.1 to avoid this.)');
+  }
+};
+
 const connectDB = async () => {
   const uri = process.env.MONGODB_URI;
   if (!uri) {
     throw new Error('MONGODB_URI is required.');
   }
+
+  await ensureSrvResolvable(uri);
 
   // MongoDB connection options to handle SSL/TLS certificate issues.
   //

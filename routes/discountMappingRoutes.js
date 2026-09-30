@@ -195,6 +195,51 @@ router.get('/calculate', requirePermission('sales.order.create'), async (req, re
 // POST /api/v1/discount-mappings/bulk-calculate — resolve for multiple products at once
 // Body: { products: [{ productId, rate, quantity }], dealerType }
 // ══════════════════════════════════════════════════════
+/**
+ * Fill in a rule's `targetName` from whatever it targets.
+ *
+ * Shared by create AND update. The update path used to skip this entirely, so changing a
+ * rule's target left the previous name on display — the list showed a rule pointing at
+ * "Kajaria" while it actually targeted something else.
+ *
+ * A target that cannot be resolved leaves `targetName` untouched rather than blanking it:
+ * the rule itself is still valid, and a missing name should not fail the write.
+ */
+async function resolveTargetName(data) {
+  try {
+    if (data.targetType === 'product' && data.product) {
+      const Product = (await import('../models/Product.js')).default;
+      const p = await Product.findById(data.product).select('itemName productCode').lean();
+      if (p) data.targetName = `${p.itemName} (${p.productCode})`;
+
+    } else if (data.targetType === 'brand' && data.brand) {
+      const Brand = (await import('../models/Brand.js')).default;
+      const b = await Brand.findById(data.brand).select('name').lean();
+      if (b) data.targetName = b.name;
+
+    } else if (data.targetType === 'category' && data.category) {
+      const Category = (await import('../models/Category.js')).default;
+      const c = await Category.findById(data.category).select('name').lean();
+      if (c) data.targetName = c.name;
+
+    } else if (data.targetType === 'subcategory' && data.subcategory) {
+      // Subcategories now live in the Category tree, so resolve there first. The standalone
+      // Subcategory collection is deprecated and is only consulted for rules created before
+      // the migration, whose ids still point at it.
+      const Category = (await import('../models/Category.js')).default;
+      const c = await Category.findById(data.subcategory).select('name').lean();
+      if (c) {
+        data.targetName = c.name;
+      } else {
+        const Subcategory = (await import('../models/Subcategory.js')).default;
+        const sub = await Subcategory.findById(data.subcategory).select('name').lean();
+        if (sub) data.targetName = sub.name;
+      }
+    }
+  } catch { /* a lookup failure must not block the write */ }
+  return data;
+}
+
 router.post('/bulk-calculate', requirePermission('sales.order.create'), async (req, res) => {
   try {
     const { products: productItems, dealerType = 'dealer' } = req.body;
@@ -331,22 +376,7 @@ router.post('/', requirePermission('dealer.discounts'), async (req, res) => {
     }
 
     // Resolve targetName for display
-    if (data.targetType === 'product' && data.product) {
-      const p = await Product.findById(data.product).select('itemName productCode').lean();
-      if (p) data.targetName = `${p.itemName} (${p.productCode})`;
-    } else if (data.targetType === 'brand' && data.brand) {
-      const Brand = (await import('../models/Brand.js')).default;
-      const b = await Brand.findById(data.brand).select('name').lean();
-      if (b) data.targetName = b.name;
-    } else if (data.targetType === 'category' && data.category) {
-      const Category = (await import('../models/Category.js')).default;
-      const c = await Category.findById(data.category).select('name').lean();
-      if (c) data.targetName = c.name;
-    } else if (data.targetType === 'subcategory' && data.subcategory) {
-      const Subcategory = (await import('../models/Subcategory.js')).default;
-      const s = await Subcategory.findById(data.subcategory).select('name').lean();
-      if (s) data.targetName = s.name;
-    }
+    await resolveTargetName(data);
 
     const rule = await DiscountMapping.create(data);
     res.status(201).json({ success: true, message: `Discount rule "${rule.ruleName}" created.`, data: rule });
@@ -362,6 +392,15 @@ router.post('/', requirePermission('dealer.discounts'), async (req, res) => {
 router.put('/:id', requirePermission('dealer.discounts'), async (req, res) => {
   try {
     const { branch, ...updates } = req.body;
+
+    // Re-derive the display name from the target the rule will END UP with — which may
+    // differ from the current one when this same update changes the target.
+    const existing = await DiscountMapping.findOne({ _id: req.params.id, branch: req.branchId }).lean();
+    if (!existing) return res.status(404).json({ success: false, message: 'Not found' });
+    const merged = { ...existing, ...updates };
+    await resolveTargetName(merged);
+    updates.targetName = merged.targetName;
+
     const rule = await DiscountMapping.findOneAndUpdate(
       { _id: req.params.id, branch: req.branchId },
       updates,

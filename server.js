@@ -19,6 +19,7 @@ import webManagementRoutes from './routes/webManagementRoutes.js';
 import walletRoutes from './routes/walletRoutes.js';
 import userRoutes from './routes/userRoutes.js';
 import categoryRoutes from './routes/categoryRoutes.js';
+import attributeRoutes from './routes/attributeRoutes.js';
 import productRoutes from './routes/productRoutes.js';
 import masterRoutes from './routes/masterRoutes.js';
 import salesOrderRoutes from './routes/salesOrderRoutes.js';
@@ -75,6 +76,10 @@ import attendanceRoutes from './routes/attendanceRoutes.js';
 import { startReservationExpiryScheduler } from './services/reservationExpiryScheduler.js';
 import { startQuotationHoldExpiryScheduler } from './services/quotationHoldExpiryScheduler.js';
 import { initSocket, getSocket } from './services/socketService.js';
+
+import dns from 'dns';
+
+dns.setServers(['8.8.8.8', '8.8.4.4']);
 
 const app = express();
 const allowedOrigins = String(process.env.FRONTEND_URL || 'http://localhost:5173')
@@ -146,6 +151,9 @@ app.use('/api/v1/dealer-app', dealerAppRoutes);
 app.use('/api/v1/dealer-downloads', dealerDownloadRoutes);
 app.use('/api/v1/users', userRoutes);
 app.use('/api/v1/category-setup', categoryRoutes);
+// Attribute definitions — the per-category fields that let one product schema serve
+// every vertical instead of carrying a column per vertical.
+app.use('/api/v1/attributes', attributeRoutes);
 app.use('/api/v1/products', productRoutes);
 app.use('/api/v1/masters/branches', branchRoutes);
 app.use('/api/v1/masters', masterRoutes);

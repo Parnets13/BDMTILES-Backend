@@ -1,6 +1,7 @@
 import mongoose from 'mongoose';
 import dotenv from 'dotenv';
 import DealerType from '../models/DealerType.js';
+import { ensureSrvResolvable } from '../config/db.js';
 
 dotenv.config();
 
@@ -15,6 +16,9 @@ const DEFAULT_TYPES = [
 
 async function seed() {
   try {
+    // A network that refuses SRV queries cannot resolve mongodb+srv://, which would
+    // stop this script with a confusing ECONNREFUSED. Same fallback the server uses.
+    await ensureSrvResolvable(process.env.MONGODB_URI);
     await mongoose.connect(process.env.MONGODB_URI);
     console.log('Connected to MongoDB');
 

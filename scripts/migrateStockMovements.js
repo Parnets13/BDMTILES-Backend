@@ -3,6 +3,7 @@ import mongoose from 'mongoose';
 import Stock from '../models/Stock.js';
 import StockMovement, { STOCK_BUCKET_FIELDS } from '../models/StockMovement.js';
 import { stockMovementIntentHash, stockSnapshot } from '../services/stockMovementService.js';
+import { ensureSrvResolvable } from '../config/db.js';
 
 const knownFlags = new Set(['--dry-run', '--execute']);
 const flags = process.argv.slice(2);
@@ -159,6 +160,9 @@ async function processBucket(stockId) {
 
 async function run() {
   if (!process.env.MONGODB_URI) throw new Error('MONGODB_URI is required.');
+  // A network that refuses SRV queries cannot resolve mongodb+srv://, which would
+  // stop this script with a confusing ECONNREFUSED. Same fallback the server uses.
+  await ensureSrvResolvable(process.env.MONGODB_URI, { autoIndex: false });
   await mongoose.connect(process.env.MONGODB_URI, { autoIndex: false });
   console.log(`Connected to ${mongoose.connection.name}`);
   console.log(dryRun

@@ -12,6 +12,13 @@ dotenv.config();
 
 import Employee from '../models/Employee.js';
 import MasterSequence from '../models/MasterSequence.js';
+import { ensureSrvResolvable } from '../config/db.js';
+
+// A network that refuses SRV queries cannot resolve mongodb+srv://, which would
+
+// stop this script with a confusing ECONNREFUSED. Same fallback the server uses.
+
+await ensureSrvResolvable(process.env.MONGODB_URI);
 
 await mongoose.connect(process.env.MONGODB_URI);
 

@@ -8,6 +8,7 @@ import StockTransfer from '../models/StockTransfer.js';
 import Invoice from '../models/Invoice.js';
 import SalesReturn from '../models/SalesReturn.js';
 import { normalizeUom } from '../services/stockUomService.js';
+import { ensureSrvResolvable } from '../config/db.js';
 
 const flags = process.argv.slice(2);
 if (flags.some(flag => !['--execute', '--dry-run'].includes(flag)) || (flags.includes('--execute') && flags.includes('--dry-run'))) {
@@ -139,6 +140,9 @@ async function residualReport(stats) {
 
 async function run() {
   if (!process.env.MONGODB_URI) throw new Error('MONGODB_URI is required.');
+  // A network that refuses SRV queries cannot resolve mongodb+srv://, which would
+  // stop this script with a confusing ECONNREFUSED. Same fallback the server uses.
+  await ensureSrvResolvable(process.env.MONGODB_URI, { autoIndex: false });
   await mongoose.connect(process.env.MONGODB_URI, { autoIndex: false });
   const stats = {
     mode: execute ? 'EXECUTE' : 'DRY RUN',

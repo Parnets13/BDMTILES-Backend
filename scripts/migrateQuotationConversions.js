@@ -4,6 +4,7 @@ import Quotation from '../models/Quotation.js';
 import QuotationConversion from '../models/QuotationConversion.js';
 import SalesOrder from '../models/SalesOrder.js';
 import { requestFingerprint } from '../utils/idempotency.js';
+import { ensureSrvResolvable } from '../config/db.js';
 
 const tolerance = 0.0001;
 const flags = process.argv.slice(2);
@@ -223,6 +224,9 @@ async function replaceSalesOrderIndex() {
 
 async function run() {
   if (!process.env.MONGODB_URI) throw new Error('MONGODB_URI is required.');
+  // A network that refuses SRV queries cannot resolve mongodb+srv://, which would
+  // stop this script with a confusing ECONNREFUSED. Same fallback the server uses.
+  await ensureSrvResolvable(process.env.MONGODB_URI, { autoIndex: false });
   await mongoose.connect(process.env.MONGODB_URI, { autoIndex: false });
   console.log(`Connected to ${mongoose.connection.name}`);
   await preflight();

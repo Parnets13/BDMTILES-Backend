@@ -160,6 +160,15 @@ registerCrud('/pincodes', DeliveryPincode, {
   beforeSave: (data) => { if (data.pincode) data.pincode = String(data.pincode).trim(); },
 });
 registerCrud('/banners', HomeBanner);
+// DEPRECATED PATH — `/categories` still serves the flat HomeCategory collection so the
+// current "Category Management" screen keeps working. The taxonomy now lives in the
+// self-referencing `Category` tree, and the storefront home cards are read from level-1
+// departments flagged `showOnHome` (see routes/shop/shopContentRoutes.js).
+//
+// The screen should be repointed at `/category-setup/nodes?level=1`; once it is, this
+// registration and the HomeCategory model can be retired. Deliberately NOT repointed
+// here, because registerCrud is a generic helper and Category needs a level, a parent
+// and a createdBy that this shape cannot supply.
 registerCrud('/categories', HomeCategory, {
   beforeSave: (data) => {
     if (!data.slug && data.name) data.slug = slugify(data.name);
