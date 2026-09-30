@@ -4,6 +4,7 @@ import shopProductRoutes from './shopProductRoutes.js';
 import shopOrderRoutes from './shopOrderRoutes.js';
 import shopContentRoutes from './shopContentRoutes.js';
 import shopWalletRoutes from './shopWalletRoutes.js';
+import shopEnquiryRoutes from './shopEnquiryRoutes.js';
 
 /**
  * Public customer storefront API (BDM Tiles website).
@@ -21,5 +22,6 @@ router.use('/products', shopProductRoutes);
 router.use('/orders', shopOrderRoutes);
 router.use('/content', shopContentRoutes);
 router.use('/wallet', shopWalletRoutes);
+router.use('/enquiry', shopEnquiryRoutes);
 
 export default router;
