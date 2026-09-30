@@ -13,8 +13,8 @@ import shopWalletRoutes from './shopWalletRoutes.js';
  * - /shop/products — public catalog
  * - /shop/orders   — customer order placement + tracking
  * - /shop/content  — home page CMS content
- * - /shop/wallet   — BDM Cash wallet (balance + transactions)
  * - /shop/enquiry  — public enquiry form (stock requests, quotation requests)
+ * - /shop/wallet   — BDM Cash wallet (balance + transactions)
  */
 const router = Router();
 

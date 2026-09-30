@@ -1,85 +1,130 @@
 import { Router } from 'express';
 import mongoose from 'mongoose';
 import Lead from '../../models/Lead.js';
+import Product from '../../models/Product.js';
+import { appendLeadActivity } from '../../services/leadActivityService.js';
+import { generateUniqueCode } from '../../utils/codeGenerator.js';
 import { getOnlineBranchId } from '../../utils/onlineBranch.js';
 
 /**
- * Public storefront enquiries.
- *
- * The website's "Stock Not Available" / "Request Quotation" forms POST here. They used to POST
- * to `/api/enquiry`, which existed nowhere — the form failed with a 404 and the customer saw
- * "Request failed" with no way forward.
- *
- * The enquiry becomes a LEAD rather than a private record of its own, so it lands in the
- * pipeline the sales team already works from. A form that writes somewhere nobody looks is
- * worse than no form at all.
- *
- * No auth: this is the public website. The payload is therefore validated and nothing from the
- * request is trusted beyond the fields below.
+ * Public storefront enquiries are saved as CRM leads, so the sales team can
+ * follow them through the existing lead pipeline. This endpoint does not read
+ * or modify stock.
  */
 const router = Router();
+const PROJECT_TYPES = new Set(['residential', 'commercial', 'hospitality', 'industrial', 'renovation', 'other']);
 
-const digitsOf = (value) => String(value || '').replace(/\D/g, '');
+const numericValue = (value) => {
+  if (value === undefined || value === null || value === '') return null;
+  const number = Number(value);
+  return Number.isFinite(number) && number >= 0 ? number : null;
+};
 
+// POST /api/v1/shop/enquiry
 router.post('/', async (req, res) => {
   try {
-    const name = String(req.body?.customerName || '').trim();
-    const phone = String(req.body?.customerPhone || '').trim();
-    const email = String(req.body?.customerEmail || '').trim();
-    const message = String(req.body?.message || '').trim();
-    const productName = String(req.body?.productName || '').trim();
-    const enquiryType = String(req.body?.enquiryType || 'enquiry').trim();
-    const quantity = Number(req.body?.quantity) || 0;
+    const body = req.body || {};
+    const name = String(body.customerName || '').trim();
+    const phone = String(body.customerPhone || '').replace(/\D/g, '');
+    const email = String(body.customerEmail || '').trim().toLowerCase();
+    const quantity = numericValue(body.quantity) ?? 1;
+    const productId = String(body.productId || '').trim();
 
-    if (!name) {
-      return res.status(422).json({ success: false, message: 'Please enter your name.' });
-    }
-    const digits = digitsOf(phone);
-    if (digits.length < 10) {
-      return res.status(422).json({ success: false, message: 'Please enter a valid phone number.' });
+    if (!name || !/^\d{10}$/.test(phone)) {
+      return res.status(422).json({ success: false, message: 'A customer name and valid 10-digit phone number are required.' });
     }
     if (email && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
-      return res.status(422).json({ success: false, message: 'Please check the email address.' });
+      return res.status(422).json({ success: false, message: 'A valid email address is required.' });
+    }
+    if (quantity <= 0) {
+      return res.status(422).json({ success: false, message: 'Quantity must be greater than zero.' });
     }
 
-    const branchId = await getOnlineBranchId();
-    const { generateUniqueCode } = await import('../../utils/codeGenerator.js');
-    const leadNumber = await generateUniqueCode(Lead, 'leadNumber', 'LD-', 5);
+    let product = null;
+    if (productId) {
+      if (!mongoose.isValidObjectId(productId)) {
+        return res.status(422).json({ success: false, message: 'Invalid product identifier.' });
+      }
+      product = await Product.findOne({ _id: productId, status: 'active', onlineVisible: true })
+        .select('itemName productCode mrp retailRate sqftPerBox')
+        .lean();
+      if (!product) return res.status(404).json({ success: false, message: 'Product not found.' });
+    }
 
-    // Everything the customer told us, in one readable block — so whoever picks this up does
-    // not have to reconstruct the request from separate columns.
-    const remarks = [
-      `Website ${enquiryType}`,
-      productName ? `Product: ${productName}` : '',
-      quantity ? `Quantity: ${quantity}` : '',
-      message,
+    const productName = String(body.productName || product?.itemName || '').trim();
+    if (!productName) {
+      return res.status(422).json({ success: false, message: 'Product name is required.' });
+    }
+
+    // Match catalog pricing and coverage so the CRM estimate stays accurate
+    // even if a client omits or sends stale estimated values.
+    const unitPrice = product
+      ? (Number(product.mrp) > 0 ? Number(product.mrp) : Number(product.retailRate) || 0)
+      : null;
+    const submittedValue = numericValue(body.estimatedValue);
+    const submittedArea = numericValue(body.estimatedArea);
+    const estimatedValue = unitPrice !== null ? unitPrice * quantity : (submittedValue ?? 0);
+    const estimatedArea = product && Number(product.sqftPerBox) > 0
+      ? Number(product.sqftPerBox) * quantity
+      : (submittedArea ?? 0);
+    const projectType = PROJECT_TYPES.has(body.projectType) ? body.projectType : 'residential';
+    const branch = await getOnlineBranchId();
+    const leadNumber = await generateUniqueCode(Lead, 'leadNumber', 'LD-', 5);
+    const enquiryDetails = [
+      `Website ${String(body.enquiryType || 'enquiry').trim()}`,
+      `Product: ${productName}`,
+      `Quantity: ${quantity}`,
+      body.variantLabel ? `Variant: ${String(body.variantLabel).trim()}` : '',
+      body.preferredDeliveryDays ? `Preferred delivery: ${Number(body.preferredDeliveryDays)} days` : '',
+      String(body.message || '').trim(),
     ].filter(Boolean).join('\n');
 
     const lead = await Lead.create({
       leadNumber,
-      branch: branchId,
+      branch,
       name,
-      phone: digits.length === 10 ? digits : phone,
-      email: email || undefined,
+      phone,
+      ...(email ? { email } : {}),
       customerType: 'online_enquiry',
-      leadChannel: 'online',
       leadSource: 'website',
-      interestedProducts: productName ? [productName] : [],
-      remarks,
+      leadChannel: 'online',
+      leadType: 'product_enquiry',
+      interestedProducts: [product?.productCode, productName].filter(Boolean),
+      estimatedArea,
+      estimatedValue,
+      projectType,
+      remarks: enquiryDetails,
       status: 'new',
       priority: 'medium',
+    });
+
+    await appendLeadActivity({
+      branch,
+      lead,
+      type: 'created',
+      summary: `Lead ${lead.leadNumber} created from a website enquiry`,
+      data: { source: 'website', quantity, estimatedArea, estimatedValue, projectType },
     });
 
     return res.status(201).json({
       success: true,
       enquiryId: String(lead._id),
       message: 'Thanks — we have your enquiry and will get back to you shortly.',
+      data: {
+        success: true,
+        leadId: String(lead._id),
+        leadNumber: lead.leadNumber,
+        estimatedArea,
+        estimatedValue,
+        projectType,
+      },
     });
   } catch (error) {
-    return res.status(500).json({ success: false, message: error.message });
+    console.error('[shopEnquiry] Failed to save enquiry:', error.message);
+    return res.status(error.status || 500).json({ success: false, message: error.message || 'Failed to save enquiry.' });
   }
 });
 
-// GET / — deliberately absent. A public endpoint must not expose the lead list.
+// No GET route: the public endpoint must not expose the CRM lead list.
 
 export default router;
