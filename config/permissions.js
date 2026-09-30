@@ -303,6 +303,13 @@ export const ROLE_DEFAULT_PERMISSIONS = {
     'warehouse.master', 'vehicle.master',
     'reports.inventory',
   ],
+  supervisor: [
+    'dashboard.view', 'notification.inbox', 'stock.view',
+    'picking.management', 'sorting.management',
+    'dispatch.management', 'dispatch.verify',
+    'delivery.view', 'delivery.assignment', 'delivery.execute', 'delivery.verify',
+    'delivery.complete', 'delivery.fail',
+  ],
   finance_manager: [
     'dashboard.view', 'notification.inbox', 'task.management', 'finance.management',
     'dealer.ledger', 'supplier.ledger', 'cheque.management', 'cheque.view', 'cheque.create',
@@ -369,6 +376,7 @@ export const ROLE_INFO = {
   sales_manager: { name: 'Sales Manager', description: 'Sales orders, quotations, leads, dealer management', color: '#fa8c16', rank: 50 },
   purchase_manager: { name: 'Purchase Manager', description: 'PO, GRN, supplier management, stock', color: '#52c41a', rank: 50 },
   warehouse_manager: { name: 'Warehouse Manager', description: 'Stock, picking, sorting, dispatch, delivery', color: '#2f54eb', rank: 50 },
+  supervisor: { name: 'Supervisor', description: 'Supervise picking, sorting, loading, and delivery for assigned branches', color: '#1677ff', rank: 45 },
   finance_manager: { name: 'Finance & Accounts', description: 'Ledger, payments, cheques, reconciliation, GST', color: '#eb2f96', rank: 50 },
   hr_manager: { name: 'HR Manager', description: 'Employees, attendance, leave, salary, expenses', color: '#faad14', rank: 50 },
   sales_executive: { name: 'Sales Executive', description: 'Field sales, leads, quotations, orders', color: '#ff7a45', rank: 30 },

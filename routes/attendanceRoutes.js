@@ -1,6 +1,7 @@
 import { Router } from 'express';
 import Attendance from '../models/Attendance.js';
 import Employee from '../models/Employee.js';
+import HrmsSettings from '../models/HrmsSettings.js';
 import { protect } from '../middleware/auth.js';
 import { requireBranch } from '../utils/branchScope.js';
 
@@ -47,6 +48,83 @@ const findOrCreateEmployee = async (userId, branchId, userData = {}) => {
   return employee;
 };
 
+const calculateAttendanceMetrics = (records, year, month, weeklyOffs = ['Sunday'], dateOfJoining) => {
+  const today = new Date();
+  const daysInMonth = new Date(year, month, 0).getDate();
+  const isCurrentMonth = year === today.getFullYear() && month === today.getMonth() + 1;
+  const lastDay = isCurrentMonth ? today.getDate() : daysInMonth;
+  const byDay = new Map(records.map(record => [new Date(record.date).getDate(), record]));
+  const offDays = new Set(['sunday', ...weeklyOffs.map(day => String(day).toLowerCase())]);
+  const joinedAt = dateOfJoining ? new Date(dateOfJoining) : null;
+  const joinedDay = joinedAt && !Number.isNaN(joinedAt.getTime())
+    ? joinedAt.getFullYear() < year || (joinedAt.getFullYear() === year && joinedAt.getMonth() + 1 < month)
+      ? 1
+      : joinedAt.getFullYear() === year && joinedAt.getMonth() + 1 === month
+        ? joinedAt.getDate()
+        : daysInMonth + 1
+    : 1;
+  const counts = {
+    present: 0,
+    absent: 0,
+    late: 0,
+    halfDay: 0,
+    leave: 0,
+    weekOff: 0,
+    holiday: 0,
+    onDuty: 0,
+    totalMarked: 0,
+  };
+  const missingDates = [];
+  const weekOffDates = [];
+  let expectedDays = 0;
+  let creditedDays = 0;
+
+  for (let day = joinedDay; day <= lastDay; day++) {
+    const date = new Date(year, month - 1, day);
+    const record = byDay.get(day);
+    const status = record?.status;
+    if (record) counts.totalMarked++;
+    if (status === 'Week Off') counts.weekOff++;
+    if (status === 'Holiday') counts.holiday++;
+    if (status === 'Leave') counts.leave++;
+    if (status === 'Present') counts.present++;
+    if (status === 'Absent') counts.absent++;
+    if (status === 'Late') counts.late++;
+    if (status === 'Half Day') counts.halfDay++;
+    if (status === 'On Duty') counts.onDuty++;
+
+    const weekday = date.toLocaleDateString('en-US', {weekday: 'long'}).toLowerCase();
+    const dateKey = `${year}-${String(month).padStart(2, '0')}-${String(day).padStart(2, '0')}`;
+    if (offDays.has(weekday)) {
+      if (status !== 'Week Off') counts.weekOff++;
+      weekOffDates.push(dateKey);
+      continue;
+    }
+    if (status === 'Week Off') {
+      weekOffDates.push(dateKey);
+      continue;
+    }
+    if (['Holiday', 'Leave'].includes(status)) continue;
+
+    expectedDays++;
+    if (!record) {
+      missingDates.push(dateKey);
+    } else if (status === 'Present' || status === 'On Duty') {
+      creditedDays++;
+    } else if (status === 'Late' || status === 'Half Day') {
+      creditedDays += 0.5;
+    }
+  }
+
+  return {
+    counts,
+    missingDates,
+    weekOffDates,
+    expectedDays,
+    percentage: expectedDays > 0 ? Math.min(100, Math.round((creditedDays / expectedDays) * 100)) : 0,
+  };
+};
+
 /**
  * POST /attendance/mark
  * Mark attendance for today
@@ -69,7 +147,7 @@ router.post('/mark', async (req, res) => {
       date: today,
     });
 
-    if (existing) {
+    if (existing?.punchIn) {
       return res.status(400).json({
         success: false,
         message: 'Attendance already marked for today',
@@ -77,17 +155,27 @@ router.post('/mark', async (req, res) => {
       });
     }
 
-    // Create attendance record
-    const attendance = await Attendance.create({
+    if (existing && !['Absent', 'Present'].includes(existing.status)) {
+      return res.status(400).json({
+        success: false,
+        message: `Attendance cannot be marked because today's status is ${existing.status}.`,
+        data: existing,
+      });
+    }
+
+    // Reuse an unpunched Absent record when the attendance process created it
+    // earlier in the day; otherwise create the employee's punch-in record.
+    const attendance = existing || new Attendance({
       branch: branchId,
       employee: employee._id,
       date: today,
-      punchIn: new Date(),
-      punchInLocation: req.body.location || undefined,
-      status: 'Present',
-      source: 'App',
-      markedBy: userId,
     });
+    attendance.punchIn = new Date();
+    attendance.punchInLocation = req.body.location || undefined;
+    attendance.status = 'Present';
+    attendance.source = 'App';
+    attendance.markedBy = userId;
+    await attendance.save();
 
     return res.json({
       success: true,
@@ -95,11 +183,52 @@ router.post('/mark', async (req, res) => {
       data: attendance,
     });
   } catch (error) {
+    if (error?.code === 11000) {
+      return res.status(409).json({
+        success: false,
+        message: 'Attendance has already been marked for today.',
+      });
+    }
     console.error('Mark attendance error:', error);
     return res.status(500).json({
       success: false,
       message: error.message || 'Failed to mark attendance',
     });
+  }
+});
+
+/**
+ * POST /attendance/checkout
+ * Record today's punch-out and elapsed attendance hours.
+ */
+router.post('/checkout', async (req, res) => {
+  try {
+    const employee = await findOrCreateEmployee(req.user._id, req.branchId, req.user);
+    const today = new Date();
+    today.setHours(0, 0, 0, 0);
+    const attendance = await Attendance.findOne({
+      branch: req.branchId,
+      employee: employee._id,
+      date: today,
+    });
+
+    if (!attendance?.punchIn) {
+      return res.status(400).json({success: false, message: 'Mark attendance before checking out.'});
+    }
+    if (attendance.punchOut) {
+      return res.status(400).json({success: false, message: 'Attendance is already checked out.', data: attendance});
+    }
+
+    const punchOut = new Date();
+    attendance.punchOut = punchOut;
+    attendance.punchOutLocation = req.body.location || undefined;
+    attendance.totalHours = Math.max(0, Math.round(((punchOut.getTime() - attendance.punchIn.getTime()) / 3600000) * 100) / 100);
+    await attendance.save();
+
+    return res.json({success: true, message: 'Checked out successfully.', data: attendance});
+  } catch (error) {
+    console.error('Check out attendance error:', error);
+    return res.status(500).json({success: false, message: error.message || 'Failed to check out'});
   }
 });
 
@@ -169,30 +298,27 @@ router.get('/calendar', async (req, res) => {
       },
     }).sort({ date: 1 });
 
-    // Calculate stats
+    const hrmsSettings = await HrmsSettings.findOne({branch: branchId}).lean();
+    const metrics = calculateAttendanceMetrics(records, year, month, hrmsSettings?.weeklyOffs, employee.dateOfJoining || employee.createdAt);
     const stats = {
-      totalDays: records.length,
-      present: records.filter(r => r.status === 'Present').length,
-      absent: records.filter(r => r.status === 'Absent').length,
-      halfDay: records.filter(r => r.status === 'Half Day').length,
-      late: records.filter(r => r.status === 'Late').length,
-      leave: records.filter(r => r.status === 'Leave').length,
-      weekOff: records.filter(r => r.status === 'Week Off').length,
-      holiday: records.filter(r => r.status === 'Holiday').length,
+      totalDays: metrics.expectedDays,
+      present: metrics.counts.present,
+      absent: metrics.counts.absent + metrics.missingDates.length,
+      halfDay: metrics.counts.halfDay,
+      late: metrics.counts.late,
+      leave: metrics.counts.leave,
+      weekOff: metrics.counts.weekOff,
+      holiday: metrics.counts.holiday,
     };
-
-    // Calculate attendance percentage
-    const workingDays = stats.totalDays - stats.weekOff - stats.holiday;
-    const presentDays = stats.present + (stats.halfDay * 0.5);
-    stats.percentage = workingDays > 0 
-      ? Math.round((presentDays / workingDays) * 100) 
-      : 0;
+    stats.percentage = metrics.percentage;
 
     return res.json({
       success: true,
       data: {
         records,
         stats,
+        missingDates: metrics.missingDates,
+        weekOffDates: metrics.weekOffDates,
         year,
         month,
       },
@@ -221,7 +347,7 @@ router.get('/summary', async (req, res) => {
     const startOfMonth = new Date(now.getFullYear(), now.getMonth(), 1);
     startOfMonth.setHours(0, 0, 0, 0);
     
-    const endOfMonth = new Date(now.getFullYear(), now.getMonth() + 1, 0);
+    const endOfMonth = new Date(now.getFullYear(), now.getMonth(), now.getDate());
     endOfMonth.setHours(23, 59, 59, 999);
 
     const records = await Attendance.find({
@@ -233,24 +359,19 @@ router.get('/summary', async (req, res) => {
       },
     });
 
+    const hrmsSettings = await HrmsSettings.findOne({branch: branchId}).lean();
+    const metrics = calculateAttendanceMetrics(records, now.getFullYear(), now.getMonth() + 1, hrmsSettings?.weeklyOffs, employee.dateOfJoining || employee.createdAt);
     const summary = {
-      present: records.filter(r => r.status === 'Present').length,
-      absent: records.filter(r => r.status === 'Absent').length,
-      late: records.filter(r => r.status === 'Late').length,
-      leave: records.filter(r => r.status === 'Leave').length,
-      halfDay: records.filter(r => r.status === 'Half Day').length,
-      totalMarked: records.length,
+      present: metrics.counts.present,
+      absent: metrics.counts.absent + metrics.missingDates.length,
+      late: metrics.counts.late,
+      leave: metrics.counts.leave,
+      halfDay: metrics.counts.halfDay,
+      totalMarked: metrics.counts.totalMarked,
+      onDuty: metrics.counts.onDuty,
     };
 
-    // Calculate percentage
-    const workingDays = records.filter(r => 
-      !['Week Off', 'Holiday'].includes(r.status)
-    ).length;
-    
-    const presentDays = summary.present + (summary.halfDay * 0.5);
-    summary.percentage = workingDays > 0
-      ? Math.round((presentDays / workingDays) * 100)
-      : 0;
+    summary.percentage = metrics.percentage;
 
     return res.json({
       success: true,

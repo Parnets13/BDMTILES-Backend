@@ -26,9 +26,10 @@ router.patch('/:id/complete', requirePermission('delivery.complete'));
 router.patch('/:id/fail', requirePermission('delivery.fail'));
 
 const terminalStatuses = ['delivered', 'partially_delivered', 'failed'];
+const isSupervisor = user => String(user?.role ?? '').toLowerCase() === 'supervisor';
 const deliveryScope = req => ({
   branch: req.branchId,
-  ...(req.user.role === 'delivery_executive' ? { deliveryExecutive: req.user._id } : {}),
+  ...(!isSupervisor(req.user) ? { deliveryExecutive: req.user._id } : {}),
 });
 const findAccessibleDelivery = (req, id) => Delivery.findOne({ _id: id, ...deliveryScope(req) });
 const safeDelivery = value => {
@@ -101,7 +102,7 @@ router.get('/', async (req, res) => {
       const statuses = String(status).split(',').map(s => s.trim()).filter(Boolean);
       filter.status = statuses.length === 1 ? statuses[0] : { $in: statuses };
     }
-    if (deliveryExecutive && req.user.role !== 'delivery_executive') filter.deliveryExecutive = deliveryExecutive;
+    if (deliveryExecutive && String(req.user.role ?? '').toLowerCase() !== 'delivery_executive') filter.deliveryExecutive = deliveryExecutive;
 
     const [deliveries, total] = await Promise.all([
       Delivery.find(filter).select('-otp').sort({ createdAt: -1 }).skip((p - 1) * l).limit(l)
@@ -109,7 +110,7 @@ router.get('/', async (req, res) => {
         .lean(),
       Delivery.countDocuments(filter),
     ]);
-    res.json({ success: true, data: deliveries, pagination: { currentPage: p, totalPages: Math.ceil(total / l), totalItems: total } });
+    res.json({ success: true, data: deliveries, pagination: { currentPage: p, totalPages: Math.ceil(total / l), totalItems: total, itemsPerPage: l } });
   } catch (e) { res.status(500).json({ success: false, message: e.message }); }
 });
 

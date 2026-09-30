@@ -77,9 +77,9 @@ import { startReservationExpiryScheduler } from './services/reservationExpirySch
 import { startQuotationHoldExpiryScheduler } from './services/quotationHoldExpiryScheduler.js';
 import { initSocket, getSocket } from './services/socketService.js';
 
-import dns from 'dns';
+// import dns from 'dns';
 
-dns.setServers(['8.8.8.8', '8.8.4.4']);
+// dns.setServers(['8.8.8.8', '8.8.4.4']);
 
 const app = express();
 const allowedOrigins = String(process.env.FRONTEND_URL || 'http://localhost:5173')

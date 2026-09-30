@@ -18,20 +18,48 @@ const router = Router();
 router.use(protect);
 router.use(requireBranch);
 
-router.get(['/', '/stats', '/:id'], requireAnyPermission('picking.management', 'sorting.management', 'dispatch.management'));
-router.get('/generatable-orders', requireAnyPermission('sales.order.approve', 'picking.management'));
-router.get('/assignable-staff', requireAnyPermission('picking.management', 'sorting.management', 'dispatch.management'));
+const canViewUnassignedWorkflowOrders = (user) => String(user?.role ?? '').toLowerCase() === 'supervisor';
+const requireWorkflowManager = (req, res, next) => (
+  canViewUnassignedWorkflowOrders(req.user)
+    ? next()
+    : res.status(403).json({ success: false, message: 'Supervisor access is required for this action.' })
+);
+
+const requireAssignedPickList = async (req, res, next) => {
+  try {
+    if (canViewUnassignedWorkflowOrders(req.user)) return next();
+    if (!mongoose.isValidObjectId(req.params.id)) {
+      const staticPaths = new Set([
+        'stats',
+        'generatable-orders',
+        'assignable-staff',
+        'delivery-executives',
+        'available-vehicles',
+      ]);
+      if (staticPaths.has(req.params.id)) return next();
+      return res.status(400).json({ success: false, message: 'Invalid _id' });
+    }
+    const assigned = await PickList.exists({ _id: req.params.id, branch: req.branchId, assignedTo: req.user._id });
+    if (!assigned) return res.status(404).json({ success: false, message: 'Pick list not found.' });
+    return next();
+  } catch (error) {
+    return next(error);
+  }
+};
+
+router.get(['/', '/stats'], requireAnyPermission('picking.management', 'sorting.management', 'dispatch.management'));
+router.get('/:id', requireAnyPermission('picking.management', 'sorting.management', 'dispatch.management'), requireAssignedPickList);
+router.get('/generatable-orders', requireAnyPermission('sales.order.approve', 'picking.management'), requireWorkflowManager);
+router.get('/assignable-staff', requireAnyPermission('picking.management', 'sorting.management', 'dispatch.management'), requireWorkflowManager);
 router.get('/delivery-executives', requireAnyPermission('dispatch.management', 'dispatch.verify'));
 router.get('/available-vehicles', requireAnyPermission('dispatch.management', 'dispatch.verify'));
-router.post('/generate/:soId', requireAnyPermission('sales.order.approve', 'picking.management'));
-router.patch(
-  ['/:id/assign', '/:id/start', '/:id/complete-picking', '/:id/verify'],
-  requirePermission('picking.management')
-);
-router.patch(['/:id/sort', '/:id/pack'], requirePermission('sorting.management'));
-router.patch('/:id/ready', requireAnyPermission('sorting.management', 'dispatch.management'));
-router.patch('/:id/verify-loading', requireAnyPermission('dispatch.management', 'dispatch.verify'));
-router.patch('/:id/mark-short', requireAnyPermission('picking.management', 'sorting.management'));
+router.post('/generate/:soId', requireAnyPermission('sales.order.approve', 'picking.management'), requireWorkflowManager);
+router.patch('/:id/assign', requireAssignedPickList, requirePermission('picking.management'), requireWorkflowManager);
+router.patch(['/:id/start', '/:id/complete-picking', '/:id/verify'], requireAssignedPickList, requirePermission('picking.management'));
+router.patch(['/:id/sort', '/:id/pack'], requireAssignedPickList, requirePermission('sorting.management'));
+router.patch('/:id/ready', requireAssignedPickList, requireAnyPermission('sorting.management', 'dispatch.management'));
+router.patch('/:id/verify-loading', requireAssignedPickList, requireAnyPermission('dispatch.management', 'dispatch.verify'));
+router.patch('/:id/mark-short', requireAssignedPickList, requireAnyPermission('picking.management', 'sorting.management'));
 
 const stateError = (res, record, expected, action) => res.status(409).json({
   success: false,
@@ -44,6 +72,7 @@ router.get('/', async (req, res) => {
     const p = Math.max(1, parseInt(page));
     const l = Math.min(100, parseInt(limit) || 20);
     const filter = { branch: req.branchId };
+    if (!canViewUnassignedWorkflowOrders(req.user)) filter.assignedTo = req.user._id;
     if (search) {
       const regex = new RegExp(search, 'i');
       filter.$or = [{ pickListNumber: regex }, { orderNumber: regex }, { dealerName: regex }];
@@ -52,7 +81,7 @@ router.get('/', async (req, res) => {
       const statuses = String(status).split(',').map(value => value.trim()).filter(Boolean);
       filter.status = statuses.length > 1 ? { $in: statuses } : statuses[0];
     }
-    if (assignedTo) filter.assignedTo = assignedTo;
+    if (assignedTo && canViewUnassignedWorkflowOrders(req.user)) filter.assignedTo = assignedTo;
     if (priority) filter.priority = priority;
 
     const [pickLists, total] = await Promise.all([
@@ -62,16 +91,18 @@ router.get('/', async (req, res) => {
         .lean(),
       PickList.countDocuments(filter),
     ]);
-    res.json({ success: true, data: pickLists, pagination: { currentPage: p, totalPages: Math.ceil(total / l), totalItems: total } });
+    res.json({ success: true, data: pickLists, pagination: { currentPage: p, totalPages: Math.ceil(total / l), totalItems: total, itemsPerPage: l } });
   } catch (e) { res.status(500).json({ success: false, message: e.message }); }
 });
 
 router.get('/stats', async (req, res) => {
   try {
+    const scope = { branch: req.branchId };
+    if (!canViewUnassignedWorkflowOrders(req.user)) scope.assignedTo = req.user._id;
     const statuses = ['generated', 'assigned', 'in_progress', 'picked', 'verified', 'sorted', 'packed', 'ready_for_dispatch', 'loaded'];
     const [total, ...counts] = await Promise.all([
-      PickList.countDocuments({ branch: req.branchId }),
-      ...statuses.map(status => PickList.countDocuments({ branch: req.branchId, status })),
+      PickList.countDocuments(scope),
+      ...statuses.map(status => PickList.countDocuments({ ...scope, status })),
     ]);
     const data = { total };
     statuses.forEach((status, index) => { data[status === 'in_progress' ? 'inProgress' : status === 'ready_for_dispatch' ? 'ready' : status] = counts[index]; });
@@ -79,7 +110,7 @@ router.get('/stats', async (req, res) => {
   } catch (e) { res.status(500).json({ success: false, message: e.message }); }
 });
 
-router.post('/reserve-backorder/:soId', requireAnyPermission('sales.order.approve', 'picking.management'), async (req, res) => {
+router.post('/reserve-backorder/:soId', requireAnyPermission('sales.order.approve', 'picking.management'), requireWorkflowManager, async (req, res) => {
   const session = await mongoose.startSession();
   try {
     let order;
