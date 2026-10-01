@@ -40,12 +40,12 @@ function validRate(product, field) {
   return Number.isFinite(value) && value >= 0 ? value : null;
 }
 function chooseBaseRate(product, preferredTier, orderType, walkIn) {
-  const requestedTier = preferredTier || (walkIn ? 'retailRate' : ORDER_TYPE_TIERS[orderType]) || 'dealerRate';
+  const requestedTier = preferredTier || (walkIn ? 'mrp' : ORDER_TYPE_TIERS[orderType]) || 'dealerRate';
   const candidates = [
     requestedTier,
-    'mrp',
-    walkIn ? 'retailRate' : ORDER_TYPE_TIERS[orderType],
-    'dealerRate', 'retailRate', 'wholesaleRate', 'distributorRate', 'builderRate', 'projectRate',
+    walkIn ? 'mrp' : 'dealerRate',
+    'retailRate',
+    'dealerRate', 'wholesaleRate', 'distributorRate', 'builderRate', 'projectRate',
   ].filter((field, index, values) => field && values.indexOf(field) === index);
   const positiveField = candidates.find((field) => validRate(product, field) > 0);
   const selectedField = positiveField || candidates.find((field) => validRate(product, field) !== null) || 'mrp';

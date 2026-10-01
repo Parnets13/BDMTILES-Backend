@@ -261,7 +261,7 @@ router.post('/otp/verify', otpVerifyLimiter, async (req, res) => {
     user.refreshSessions = boundedSessions(user.refreshSessions, credential.session);
     await user.save({ validateBeforeSave: false });
 
-    const token = generateToken(user._id, user.role, user.tokenVersion || 0);
+    const token = generateToken(user._id, user.role, user.tokenVersion || 0, 'otp');
     const userObj = await buildAuthUser(user._id);
     setRefreshCookie(res, credential.token);
     logAuthEvent({

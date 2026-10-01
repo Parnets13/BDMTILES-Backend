@@ -98,7 +98,9 @@ export const authenticateOnly = async (req, res, next) => {
 export const protect = async (req, res, next) => {
   try {
     if (!await authenticateRequest(req, res)) return undefined;
-    if (req.user.mustChangePassword) {
+    const isFieldApp = String(req.get('x-bdmtiles-client') || '').trim().toLowerCase() === 'bdmtiles-sales-app'
+      || req.authToken?.authMethod === 'otp';
+    if (req.user.mustChangePassword && !isFieldApp) {
       return res.status(403).json({
         success: false,
         code: 'PASSWORD_CHANGE_REQUIRED',

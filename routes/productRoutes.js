@@ -7,11 +7,31 @@ import Stock from '../models/Stock.js';
 import StockMovement from '../models/StockMovement.js';
 import Brand from '../models/Brand.js';
 import Category from '../models/Category.js';
+import Dealer from '../models/Dealer.js';
+import Branch from '../models/Branch.js';
 import { protect, requirePermission, requireAnyPermission } from '../middleware/auth.js';
 import { uploadProductImages } from '../middleware/upload.js';
 import { normalizeProductUomConfig } from '../services/stockUomService.js';
 import { normalizeAndValidateAttributes } from '../services/attributeService.js';
 import { descendantIds } from '../services/categoryTreeService.js';
+import { resolvePricing } from '../services/pricingResolver.js';
+import { resolveDealerBranch } from '../services/dealerAssignmentService.js';
+
+const money = (value) => Math.round((Number(value) + Number.EPSILON) * 100) / 100;
+
+const mrpSaving = (mrp, rate) => {
+  const listPrice = money(mrp);
+  const yourPrice = rate === null || rate === undefined ? null : money(rate);
+  if (!(listPrice > 0) || yourPrice === null || !(yourPrice < listPrice)) {
+    return { mrp: listPrice > 0 ? listPrice : null, discountPercent: null, savingPerUnit: null };
+  }
+  return {
+    mrp: listPrice,
+    discountPercent: Math.round(((listPrice - yourPrice) / listPrice) * 100),
+    savingPerUnit: money(listPrice - yourPrice),
+  };
+};
+
 // imageEmbedding service is optional (requires onnxruntime-node package)
 let generateEmbedding = null;
 try {
@@ -99,7 +119,23 @@ router.post('/upload-images', canUploadProductImage, (req, res) => {
 // GET /api/v1/products — list with search, filters, pagination
 router.get('/', async (req, res) => {
   try {
-    const { page = 1, limit = 20, search, brand, department, category, subcategory, status, tileSize, finish, tileType, applicationArea, sortBy = 'createdAt', order = 'desc' } = req.query;
+    const {
+      page = 1,
+      limit = 20,
+      search,
+      brand,
+      department,
+      category,
+      subcategory,
+      status,
+      tileSize,
+      finish,
+      tileType,
+      applicationArea,
+      sortBy = 'createdAt',
+      order = 'desc',
+      dealer: dealerId,
+    } = req.query;
     const p = Math.max(1, parseInt(page));
     const l = Math.min(100, Math.max(1, parseInt(limit)));
 
@@ -147,11 +183,30 @@ router.get('/', async (req, res) => {
       Product.countDocuments(filter),
     ]);
 
+    // Resolve optional dealer for customized rates
+    let selectedDealer = null;
+    if (dealerId && mongoose.isValidObjectId(dealerId)) {
+      selectedDealer = await Dealer.findById(dealerId).populate('dealerType').lean();
+    }
+
     // Attach branch-scoped available/total stock so pickers (PR, quotations, SO)
     // show real balances instead of an undefined field that renders as 0.
     const headerBranchId = req.get('X-Branch-Id');
-    const branchScope = mongoose.isValidObjectId(headerBranchId)
-      ? { branch: new mongoose.Types.ObjectId(headerBranchId) }
+    let effectiveBranch = (mongoose.isValidObjectId(headerBranchId) ? headerBranchId : null)
+      || req.branchId
+      || (selectedDealer ? await resolveDealerBranch(selectedDealer) : null)
+      || req.user?.defaultBranch
+      || req.user?.assignedBranches?.[0]
+      || req.user?.branch
+      || null;
+
+    if (!effectiveBranch) {
+      const firstBranch = await Branch.findOne({ status: 'active' }).select('_id').lean();
+      effectiveBranch = firstBranch?._id || null;
+    }
+
+    const branchScope = effectiveBranch && mongoose.isValidObjectId(effectiveBranch)
+      ? { branch: new mongoose.Types.ObjectId(String(effectiveBranch)) }
       : {};
     const productIds = products.map((product) => product._id);
     const stockRows = productIds.length ? await Stock.aggregate([
@@ -168,8 +223,34 @@ router.get('/', async (req, res) => {
       } },
     ]) : [];
     const stockByProduct = new Map(stockRows.map((row) => [String(row._id), row]));
-    const withStock = products.map((product) => {
+
+    const withStock = await Promise.all(products.map(async (product) => {
       const stock = stockByProduct.get(String(product._id));
+      let dealerRate = null;
+      let effectiveRate = null;
+      let rateField = null;
+
+      if (selectedDealer && effectiveBranch) {
+        try {
+          const priced = await resolvePricing({
+            branchId: effectiveBranch,
+            dealerId: selectedDealer._id,
+            product,
+            quantity: 1,
+            pricingDate: new Date(),
+          });
+          dealerRate = money(priced.pricingRate);
+          effectiveRate = money(priced.effectiveRate);
+          rateField = priced.rateField;
+        } catch {
+          dealerRate = Number(product.dealerRate) || Number(product.retailRate) || null;
+        }
+      } else {
+        dealerRate = Number(product.dealerRate) || Number(product.retailRate) || null;
+      }
+
+      const savings = mrpSaving(product.mrp, dealerRate);
+
       return {
         ...product,
         stockAvailable: Number(stock?.availableQty || 0),
@@ -177,12 +258,21 @@ router.get('/', async (req, res) => {
         stockReserved: Number(stock?.reservedQty || 0),
         stockQuoted: Number(stock?.quotedQty || 0),
         stockDamaged: Number(stock?.damagedQty || 0),
+        dealerRate,
+        effectiveRate,
+        rateField,
+        ...savings,
       };
-    });
+    }));
 
     res.json({
       success: true,
       data: withStock,
+      selectedDealer: selectedDealer ? {
+        _id: selectedDealer._id,
+        businessName: selectedDealer.businessName,
+        dealerCode: selectedDealer.dealerCode,
+      } : null,
       pagination: { currentPage: p, totalPages: Math.ceil(total / l), totalItems: total, itemsPerPage: l },
     });
   } catch (error) {
@@ -270,7 +360,89 @@ router.get('/:id', async (req, res) => {
     const { describeProductAttributes } = await import('../services/attributeService.js');
     const attributeSpecs = await describeProductAttributes(product.category?._id, product.attributes);
 
-    res.json({ success: true, data: { ...product, attributeSpecs } });
+    // Resolve optional dealer for customized rates
+    let selectedDealer = null;
+    if (req.query.dealer && mongoose.isValidObjectId(req.query.dealer)) {
+      selectedDealer = await Dealer.findById(req.query.dealer).populate('dealerType').lean();
+    }
+
+    const headerBranchId = req.get('X-Branch-Id');
+    let effectiveBranch = (mongoose.isValidObjectId(headerBranchId) ? headerBranchId : null)
+      || req.branchId
+      || (selectedDealer ? await resolveDealerBranch(selectedDealer) : null)
+      || req.user?.defaultBranch
+      || req.user?.assignedBranches?.[0]
+      || req.user?.branch
+      || null;
+
+    if (!effectiveBranch) {
+      const firstBranch = await Branch.findOne({ status: 'active' }).select('_id').lean();
+      effectiveBranch = firstBranch?._id || null;
+    }
+
+    const branchScope = effectiveBranch && mongoose.isValidObjectId(effectiveBranch)
+      ? { branch: new mongoose.Types.ObjectId(String(effectiveBranch)), product: new mongoose.Types.ObjectId(String(product._id)) }
+      : { product: new mongoose.Types.ObjectId(String(product._id)) };
+
+    const stockRows = await Stock.aggregate([
+      { $match: branchScope },
+      { $group: {
+        _id: '$product',
+        totalQty: { $sum: '$totalQty' },
+        availableQty: { $sum: '$availableQty' },
+        reservedQty: { $sum: '$reservedQty' },
+        quotedQty: { $sum: '$quotedQty' },
+        damagedQty: { $sum: '$damagedQty' },
+      } },
+    ]);
+    const stock = stockRows[0];
+
+    let dealerRate = null;
+    let effectiveRate = null;
+    let rateField = null;
+
+    if (selectedDealer && effectiveBranch) {
+      try {
+        const priced = await resolvePricing({
+          branchId: effectiveBranch,
+          dealerId: selectedDealer._id,
+          product,
+          quantity: 1,
+          pricingDate: new Date(),
+        });
+        dealerRate = money(priced.pricingRate);
+        effectiveRate = money(priced.effectiveRate);
+        rateField = priced.rateField;
+      } catch {
+        dealerRate = Number(product.dealerRate) || Number(product.retailRate) || null;
+      }
+    } else {
+      dealerRate = Number(product.dealerRate) || Number(product.retailRate) || null;
+    }
+
+    const savings = mrpSaving(product.mrp, dealerRate);
+
+    res.json({
+      success: true,
+      data: {
+        ...product,
+        attributeSpecs,
+        stockAvailable: Number(stock?.availableQty || 0),
+        stockTotal: Number(stock?.totalQty || 0),
+        stockReserved: Number(stock?.reservedQty || 0),
+        stockQuoted: Number(stock?.quotedQty || 0),
+        stockDamaged: Number(stock?.damagedQty || 0),
+        dealerRate,
+        effectiveRate,
+        rateField,
+        ...savings,
+        selectedDealer: selectedDealer ? {
+          _id: selectedDealer._id,
+          businessName: selectedDealer.businessName,
+          dealerCode: selectedDealer.dealerCode,
+        } : null,
+      },
+    });
   } catch (error) {
     res.status(500).json({ success: false, message: error.message });
   }
