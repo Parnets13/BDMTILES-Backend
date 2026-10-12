@@ -61,7 +61,22 @@ const otpVerifyLimiter = rateLimit({
 });
 
 // Roles permitted to sign in through the phone + OTP field-app flow.
-const OTP_LOGIN_ROLES = new Set(['sales_executive']);
+//
+// This used to be `sales_executive` only, because the field app was the only OTP
+// client. The warehouse roles are now here too: picking / sorting / loading /
+// delivery staff use the same app and therefore the same login, and they have no
+// password of their own to fall back on (their account is created from HRMS with
+// a temporary password they were never meant to keep). A role missing from this
+// set fails at /otp/verify with "This account cannot use app login", which reads
+// like a permissions problem rather than the allowlist it actually is.
+const OTP_LOGIN_ROLES = new Set([
+  'sales_executive',
+  'delivery_executive',
+  'picking_staff',
+  'sorting_staff',
+  'supervisor',
+  'warehouse_manager',
+]);
 // Generic response so an attacker cannot enumerate which phone numbers exist.
 const OTP_REQUEST_RESPONSE = 'If that number is registered for the field app, an OTP has been sent.';
 // Header the BDMTILES field app sends on every request. An unregistered number is
@@ -180,7 +195,7 @@ router.post('/otp/request', otpRequestLimiter, async (req, res) => {
         return res.json({
           ...response,
           registered: false,
-          message: 'This mobile number is not registered for the BDMTILES Sales app. Please check the number, or ask your administrator to enable app access for you.',
+          message: 'This mobile number is not registered for the BDMTILES app. Please check the number, or ask your administrator to enable app access for you.',
         });
       }
       return res.json(response);
@@ -466,7 +481,16 @@ router.post('/change-password', authenticateOnly, async (req, res) => {
     user.refreshSessions = [credential.session];
     await user.save();
 
-    const token = generateToken(user._id, user.role, user.tokenVersion);
+    // Carry the caller's own authMethod through. Without it this defaulted to
+    // 'password' and handed a mobile (OTP) session a 15-minute token — the user
+    // would change their password and then be signed out a quarter of an hour
+    // later, with nothing to refresh against. `authenticateOnly` sets req.authToken.
+    const token = generateToken(
+      user._id,
+      user.role,
+      user.tokenVersion,
+      req.authToken?.authMethod || 'password'
+    );
     const userObj = await buildAuthUser(user._id);
     setRefreshCookie(res, credential.token);
     return res.json({ success: true, message: 'Password changed successfully.', token, user: userObj });

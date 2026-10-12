@@ -10,7 +10,7 @@ import Vehicle from '../models/Vehicle.js';
 import Delivery from '../models/Delivery.js';
 import { ROLE_DEFAULT_PERMISSIONS } from '../config/permissions.js';
 import { protect, requirePermission, requireAnyPermission } from '../middleware/auth.js';
-import { requireBranch } from '../utils/branchScope.js';
+import { GLOBAL_BRANCH_ROLES, requireBranch } from '../utils/branchScope.js';
 import { generateBranchNumber } from '../utils/branchSequence.js';
 import { QUANTITY_TOLERANCE, refreshSalesOrderLine, reserveSalesOrderInventory } from '../utils/salesOrderInventory.js';
 
@@ -18,11 +18,40 @@ const router = Router();
 router.use(protect);
 router.use(requireBranch);
 
-const canViewUnassignedWorkflowOrders = (user) => String(user?.role ?? '').toLowerCase() === 'supervisor';
+/**
+ * Roles that MANAGE the picking workflow rather than only work the lists assigned to them:
+ * generate a pick list, assign a picker, list assignable staff, and act on a list that is
+ * not their own.
+ *
+ * This is deliberately a role gate and not a permission gate. `picking.management` is held by
+ * pickers too, and SOW 2.8 gives picking and sorting staff only their ASSIGNED lists, while
+ * SOW 2.7 gives the warehouse manager "picking list creation". So the permission check in front
+ * of each route answers "may you touch picking at all"; this answers "are you in charge of it".
+ *
+ * `GLOBAL_BRANCH_ROLES` is the same set the rest of the app uses to mean "super_admin and
+ * owner", imported rather than re-listed so those two can never be forgotten here: every other
+ * guard in the app lets them through, and a bare role comparison that omits them locks the two
+ * highest roles out of the workflow without any error that names the real cause.
+ *
+ * That is exactly what this used to do — it tested `role === 'supervisor'` and nothing else, so
+ * a Super Admin was refused with "Supervisor access is required" when generating a pick list,
+ * and got a 404 on any pick list assigned to somebody else.
+ */
+const WORKFLOW_MANAGER_ROLES = new Set(['supervisor', 'warehouse_manager', 'admin', 'sub_admin']);
+
+const canViewUnassignedWorkflowOrders = (user) => {
+  // Normalised once, so a differently-cased role cannot slip past either set.
+  const role = String(user?.role ?? '').toLowerCase();
+  return GLOBAL_BRANCH_ROLES.has(role) || WORKFLOW_MANAGER_ROLES.has(role);
+};
+
 const requireWorkflowManager = (req, res, next) => (
   canViewUnassignedWorkflowOrders(req.user)
     ? next()
-    : res.status(403).json({ success: false, message: 'Supervisor access is required for this action.' })
+    : res.status(403).json({
+        success: false,
+        message: 'Supervisor, warehouse manager or admin access is required for this action.',
+      })
 );
 
 const requireAssignedPickList = async (req, res, next) => {
@@ -771,6 +800,10 @@ router.patch('/:id/ready', async (req, res) => {
     if (pickList.status !== 'packed') return stateError(res, pickList, 'packed', 'mark ready for dispatch');
     if (!(pickList.totalBoxes > 0)) return res.status(409).json({ success: false, message: 'Pack and record total boxes before dispatch.' });
     pickList.status = 'ready_for_dispatch';
+    // Loading begins the moment the list enters the loading queue, which is here — not
+    // when the loader happens to open the screen. SOW 9.3 wants a start and an end time;
+    // only the end was recorded before. Set once: re-marking ready keeps the first stamp.
+    if (!pickList.loadingStartTime) pickList.loadingStartTime = new Date();
     await pickList.save();
     res.json({ success: true, message: 'Ready for dispatch planning.', data: pickList });
   } catch (e) { res.status(500).json({ success: false, message: e.message }); }

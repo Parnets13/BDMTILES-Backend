@@ -93,6 +93,9 @@ const pickListSchema = new mongoose.Schema(
     sortingStartTime: Date,
     sortingEndTime: Date,
     packingEndTime: Date,
+    // When the list became ready for dispatch, i.e. when the loading queue picked it up.
+    // SOW 9.3 asks for loading start AND completion; only completion was recorded before.
+    loadingStartTime: Date,
     loadingEndTime: Date,
 
     // Sorting & Packing

@@ -3,6 +3,7 @@ import mongoose from 'mongoose';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import Product from '../models/Product.js';
+import ProductOption from '../models/ProductOption.js';
 import Stock from '../models/Stock.js';
 import StockMovement from '../models/StockMovement.js';
 import Brand from '../models/Brand.js';
@@ -16,6 +17,13 @@ import { normalizeAndValidateAttributes } from '../services/attributeService.js'
 import { descendantIds } from '../services/categoryTreeService.js';
 import { resolvePricing } from '../services/pricingResolver.js';
 import { resolveDealerBranch } from '../services/dealerAssignmentService.js';
+import {
+  MAX_OPTION_LENGTH,
+  PRODUCT_OPTION_FIELDS,
+  mergedOptions,
+  normaliseOptionValue,
+  productUsageFilter,
+} from '../config/productOptions.js';
 
 const money = (value) => Math.round((Number(value) + Number.EPSILON) * 100) / 100;
 
@@ -337,6 +345,177 @@ router.get('/filter-options', async (req, res) => {
     res.json({
       success: true,
       data: { brands, categories, subcategories, departments, tree },
+    });
+  } catch (error) {
+    res.status(500).json({ success: false, message: error.message });
+  }
+});
+
+// ── Specification dropdown options ────────────────────────────────────────────
+//
+// MUST stay above `/:id` below, or Express would match "options" as a product id and this
+// handler would never run.
+//
+// The lists are seeded in config/productOptions.js and extended per branch by ProductOption
+// rows. Only the additions are stored, so correcting a default is a one-line change here
+// rather than a data migration across every branch.
+
+/**
+ * Every dropdown's full list (defaults + this branch's additions), plus the additions
+ * themselves.
+ *
+ * The additions come back as rows with their `_id` so the UI can offer to remove one. Only
+ * additions are removable — the defaults live in code, so "deleting" one would mean nothing.
+ */
+const loadSpecOptions = async (branchId) => {
+  const custom = await ProductOption.find({ branch: branchId })
+    .select('field value')
+    .sort({ createdAt: 1 })
+    .lean();
+  const byField = {};
+  for (const row of custom) {
+    (byField[row.field] = byField[row.field] || []).push(row.value);
+  }
+  const options = {};
+  for (const field of PRODUCT_OPTION_FIELDS) {
+    options[field] = mergedOptions(field, byField[field] || []);
+  }
+  return { options, custom };
+};
+
+router.get('/options', async (req, res) => {
+  try {
+    const { options, custom } = await loadSpecOptions(req.branchId);
+    res.json({ success: true, data: options, custom });
+  } catch (error) {
+    res.status(500).json({ success: false, message: error.message });
+  }
+});
+
+/**
+ * Add a value to one dropdown.
+ *
+ * Returns the WHOLE refreshed option map, so the form can update every list from this single
+ * response instead of firing a second GET.
+ *
+ * Re-adding an existing value is not an error — it returns 200 with the unchanged list, because
+ * two admins adding "Rustic" at the same moment is a normal thing to happen and neither should
+ * see a failure for it.
+ */
+router.post('/options', async (req, res) => {
+  try {
+    const field = String(req.body?.field || '').trim();
+    if (!PRODUCT_OPTION_FIELDS.includes(field)) {
+      return res.status(422).json({ success: false, message: `Unknown option list "${field}".` });
+    }
+
+    // Canonicalise before storing. A tile size saved as "1010" never produces a SqFt/Box
+    // calculation — sqftPerTile() parses "WxH" — and nothing downstream would explain why.
+    const normalised = normaliseOptionValue(field, req.body?.value);
+    if (!normalised.ok) {
+      return res.status(422).json({ success: false, message: normalised.message });
+    }
+    const value = normalised.value;
+
+    if (value.length > MAX_OPTION_LENGTH) {
+      return res.status(422).json({
+        success: false,
+        message: `Keep it under ${MAX_OPTION_LENGTH} characters.`,
+      });
+    }
+
+    const { options, custom } = await loadSpecOptions(req.branchId);
+    // Match on the normalised value so "600x600" does not duplicate an existing "600 x 600".
+    const existing = (options[field] || []).find(
+      (candidate) => String(candidate).toLowerCase() === value.toLowerCase()
+    );
+    if (existing) {
+      // `added` carries the STORED form, so the form selects the value that actually exists
+      // rather than the differently-cased text that was typed.
+      return res.json({
+        success: true,
+        message: `"${existing}" is already in the list.`,
+        data: options,
+        custom,
+        added: existing,
+      });
+    }
+
+    await ProductOption.create({
+      branch: req.branchId,
+      field,
+      value,
+      createdBy: req.user?._id,
+    });
+
+    const refreshed = await loadSpecOptions(req.branchId);
+    res.status(201).json({
+      success: true,
+      message: `"${value}" added.`,
+      data: refreshed.options,
+      custom: refreshed.custom,
+      // The canonical form, so the caller selects exactly what was saved.
+      added: value,
+    });
+  } catch (error) {
+    // The unique index is the real guard against a race between two admins adding the same
+    // value; treat losing that race as success rather than showing a duplicate-key error.
+    if (error?.code === 11000) {
+      const raced = await loadSpecOptions(req.branchId);
+      return res.json({
+        success: true,
+        message: 'That value is already in the list.',
+        data: raced.options,
+        custom: raced.custom,
+      });
+    }
+    res.status(500).json({ success: false, message: error.message });
+  }
+});
+
+/**
+ * Remove an option the admin added earlier.
+ *
+ * Refused while products still use it — deleting it would leave those products holding a value
+ * that is no longer in any list, so the dropdown would show blank for them and nobody would know
+ * why. The refusal names the count so the admin can go and re-assign those products first.
+ *
+ * Only additions can be removed. A built-in default is not a database row at all, so there is
+ * nothing to delete; the 404 says so rather than pretending to succeed.
+ */
+router.delete('/options/:id', async (req, res) => {
+  try {
+    if (!mongoose.isValidObjectId(req.params.id)) {
+      return res.status(422).json({ success: false, message: 'Invalid option id.' });
+    }
+    const option = await ProductOption.findOne({ _id: req.params.id, branch: req.branchId }).lean();
+    if (!option) {
+      return res.status(404).json({
+        success: false,
+        message: 'That option was not added here, so it cannot be removed.',
+      });
+    }
+
+    const usageFilter = productUsageFilter(option.field, option.value);
+    const inUse = usageFilter
+      ? await Product.countDocuments({ branch: req.branchId, ...usageFilter })
+      : 0;
+
+    if (inUse > 0) {
+      return res.status(409).json({
+        success: false,
+        message: `"${option.value}" is used by ${inUse} product${inUse === 1 ? '' : 's'}. Change those products first, then remove it.`,
+        inUse,
+      });
+    }
+
+    await ProductOption.deleteOne({ _id: option._id });
+    const refreshed = await loadSpecOptions(req.branchId);
+    res.json({
+      success: true,
+      message: `"${option.value}" removed.`,
+      data: refreshed.options,
+      custom: refreshed.custom,
     });
   } catch (error) {
     res.status(500).json({ success: false, message: error.message });

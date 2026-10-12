@@ -1,9 +1,34 @@
 import jwt from 'jsonwebtoken';
 
+/**
+ * Access-token lifetime.
+ *
+ * The web admin is a browser tab on a desk, so 15 minutes is right for it: a stolen
+ * token is useless quickly, and the httpOnly refresh cookie keeps the session alive
+ * invisibly.
+ *
+ * Mobile cannot use that mechanism. **React Native has no cookie jar**, so the
+ * refresh cookie is never stored and never sent, and there is nothing for the app
+ * to refresh with. A 15-minute token therefore did not mean "refreshes quietly" —
+ * it meant **the user is signed out every 15 minutes**, routinely mid-pick or
+ * mid-delivery, because the app's only 401 handling is to clear the session.
+ *
+ * So OTP-issued tokens (the mobile field apps) get a long lifetime instead. This
+ * matches the dealer app, which has always used a 30-day token
+ * (`generateDealerToken`), so the platform is not adopting a new posture here —
+ * the staff apps were simply the odd ones out.
+ *
+ * Revocation is unaffected: every request still compares `tokenVersion`, so
+ * logout-all, deactivation, and HRMS access-revocation invalidate these tokens
+ * immediately. Override with MOBILE_TOKEN_EXPIRY.
+ */
+const WEB_ACCESS_TOKEN_TTL = '15m';
+const MOBILE_ACCESS_TOKEN_TTL = process.env.MOBILE_TOKEN_EXPIRY || '30d';
+
 export const generateToken = (userId, role, tokenVersion = 0, authMethod = 'password') => jwt.sign(
   { userId, role, type: 'access', tokenVersion, authMethod },
   process.env.JWT_SECRET,
-  { expiresIn: '15m' }
+  { expiresIn: authMethod === 'otp' ? MOBILE_ACCESS_TOKEN_TTL : WEB_ACCESS_TOKEN_TTL }
 );
 
 export const generateRefreshToken = (userId, tokenVersion = 0, jti) => {
