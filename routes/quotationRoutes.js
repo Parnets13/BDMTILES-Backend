@@ -1080,6 +1080,19 @@ router.post('/:id/convert', requirePermission('quotation.management'), requirePe
       } catch (replayError) {
         error = replayError;
       }
+      // A duplicate key reaching here is either a retry that arrived under a
+      // fresh Idempotency-Key, or the legacy unique branch/sourceQuotation index
+      // that predates partial conversions. The driver text names an index nobody
+      // can act on, so translate it into something a branch user can act on.
+      // `config/db.js` retires that index at boot; the migration script does the
+      // same on demand. `\b` keeps this from matching the replacement index name.
+      if (!error.status && /duplicate key/i.test(String(error.message))) {
+        error = Object.assign(new Error(
+          /branch_1_sourceQuotation_1\b/.test(String(error.message))
+            ? 'This quotation already has a Sales Order in this branch. The database still enforces a legacy one-order-per-quotation rule from before partial conversions — restart the API (or run npm run migrate:quotation-conversions:execute) to retire it, then retry.'
+            : 'A Sales Order for this quotation already exists. Refresh Quotation Manager and retry.',
+        ), { status: 409 });
+      }
     }
     return res.status(error.status || (error.code === 11000 ? 409 : 500)).json({
       success: false,

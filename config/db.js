@@ -1,5 +1,6 @@
 import mongoose from 'mongoose';
 import Attendance from '../models/Attendance.js';
+import SalesOrder from '../models/SalesOrder.js';
 
 const migrateAttendanceIndexes = async () => {
   const collection = Attendance.collection;
@@ -26,6 +27,57 @@ const migrateAttendanceIndexes = async () => {
     {branch: 1, employee: 1, date: 1},
     {unique: true, name: 'branch_1_employee_1_date_1'},
   );
+};
+
+/**
+ * Retires the legacy unique `{ branch, sourceQuotation }` index on salesorders.
+ *
+ * That index encoded "one quotation becomes exactly one Sales Order". Partial and
+ * available-stock conversions deliberately break the assumption — a single
+ * quotation can now produce several orders — so the schema declares
+ * `{ branch, sourceQuotation, createdAt }` instead.
+ *
+ * Mongoose never drops an index it no longer declares, so any database created
+ * under the old rule keeps enforcing the old rule. The symptom is a second
+ * conversion failing with `E11000 ... index: branch_1_sourceQuotation_1`, which
+ * reads like an application bug rather than a stale constraint. Build the
+ * replacement first, verify it is non-unique, then retire the legacy index —
+ * the same order `scripts/migrateQuotationConversions.js` uses, so a boot and an
+ * explicit migration converge on the same state.
+ */
+const migrateSalesOrderQuotationIndexes = async () => {
+  const collection = SalesOrder.collection;
+  try {
+    await SalesOrder.createCollection();
+  } catch (error) {
+    if (error.codeName !== 'NamespaceExists' && error.code !== 48) throw error;
+  }
+
+  await collection.createIndex(
+    {branch: 1, sourceQuotation: 1, createdAt: 1},
+    {
+      name: 'branch_1_sourceQuotation_1_createdAt_1',
+      partialFilterExpression: {sourceQuotation: {$type: 'objectId'}},
+    },
+  );
+
+  const indexes = await collection.indexes();
+  const replacement = indexes.find(index => index.name === 'branch_1_sourceQuotation_1_createdAt_1');
+  if (!replacement || replacement.unique) {
+    throw new Error('Sales Order quotation-history index could not be verified as non-unique.');
+  }
+
+  const legacyIndex = indexes.find(index =>
+    index.name === 'branch_1_sourceQuotation_1' &&
+    index.unique &&
+    index.key?.branch === 1 &&
+    index.key?.sourceQuotation === 1 &&
+    Object.keys(index.key).length === 2
+  );
+  if (legacyIndex) {
+    await collection.dropIndex(legacyIndex.name);
+    console.log('🧹 Removed legacy unique salesorders branch/sourceQuotation index');
+  }
 };
 
 /**
@@ -102,6 +154,7 @@ const connectDB = async () => {
 
   const conn = await mongoose.connect(uri, options);
   await migrateAttendanceIndexes();
+  await migrateSalesOrderQuotationIndexes();
   console.log(`✅ MongoDB Connected: ${conn.connection.host}`);
   console.log(`   Database: ${conn.connection.name}`);
   return conn;
