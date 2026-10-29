@@ -3,3 +3,8 @@ node_modules/
 *.log
 .DS_Store
 dist/
+
+# Large/generated files — never commit these
+*.zip
+uploads/
+private-uploads/
