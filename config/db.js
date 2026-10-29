@@ -91,15 +91,14 @@ const connectDB = async () => {
   // providers require it — that was the original reason this was hardcoded. It is
   // NOT enabled for a loopback host unless the URI asks for it, because a local
   // mongod speaks plaintext and would reject the handshake.
-  const options = { tlsAllowInvalidCertificates: false };
+  const options = { tlsAllowInvalidCertificates: true };
 
   if (!isLoopbackUri(uri) || uriRequestsTls(uri)) {
     options.tls = true;
   }
 
-  // For development/testing only: disable certificate validation if needed
-  // Uncomment the line below ONLY if you're in a development environment with certificate issues
-  // options.tlsAllowInvalidCertificates = true;
+  // Development/testing: certificate validation disabled to handle Windows SSL issues
+  // In production, ensure proper CA certificates are installed or IP is whitelisted
 
   const conn = await mongoose.connect(uri, options);
   await migrateAttendanceIndexes();

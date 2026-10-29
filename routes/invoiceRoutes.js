@@ -2,6 +2,7 @@ import { Router } from 'express';
 import Invoice from '../models/Invoice.js';
 import SalesOrder from '../models/SalesOrder.js';
 import DispatchTrip from '../models/DispatchTrip.js';
+import PickList from '../models/PickList.js';
 import Payment from '../models/Payment.js';
 import SalesReturn from '../models/SalesReturn.js';
 import BranchSettings from '../models/BranchSettings.js';
@@ -85,6 +86,136 @@ router.get('/stats', requirePermission('invoice'), async (req, res) => {
   } catch (e) { res.status(500).json({ success: false, message: e.message }); }
 });
 
+// ── Sorting List → invoice handoff ────────────────────────────────────────────
+// Feeds the "Create Invoice" dropdown. A pick list enters it exactly when the
+// Sorting List starts showing the "Pack" action — i.e. sorting was verified and
+// completed (status `sorted`) — and stays until it is invoiced. Sorting posts the
+// authoritative quantities (short/damage movements), so that is the first point
+// an invoice can be raised from; packing only records physical box counts.
+// A row is billable from `sorted` onwards; dispatch removes it from this queue.
+const SORTING_PIPELINE = ['sorted', 'packed', 'ready_for_dispatch'];
+const PICK_STAGE_RANK = { sorted: 2, packed: 3, ready_for_dispatch: 4 };
+const PICK_STAGE_LABEL = {
+  sorted: 'Sorted',
+  packed: 'Packed',
+  ready_for_dispatch: 'Ready for dispatch',
+};
+
+router.get('/pending-orders', requirePermission('invoice'), async (req, res) => {
+  try {
+    const { search = '', limit = 200 } = req.query;
+
+    const invoiced = await Invoice.find({ branch: req.branchId, status: { $ne: 'cancelled' } })
+      .select('salesOrder').lean();
+    const invoicedIds = new Set(invoiced.map(row => String(row.salesOrder)).filter(Boolean));
+
+    // The sorting queue is the whole candidate set.
+    const pickLists = await PickList.find({ branch: req.branchId, status: { $in: SORTING_PIPELINE } })
+      .select('salesOrder pickListNumber status totalBoxes totalPickedQty deliveryRoute items.salesOrderItem items.sortedQty items.pickedQty')
+      .lean();
+    const liveLists = pickLists.filter(list => !invoicedIds.has(String(list.salesOrder)));
+    if (!liveLists.length) {
+      return res.json({ success: true, data: [], counts: { sorting: 0, billable: 0 } });
+    }
+
+    const orderIds = [...new Set(liveLists.map(list => String(list.salesOrder)))];
+    const orders = await SalesOrder.find({ branch: req.branchId, _id: { $in: orderIds } })
+      .select('orderNumber dealerName dealerCode customerName status orderDate grandTotal items dealer')
+      .populate('dealer', 'businessName dealerCode gstin state')
+      .lean();
+
+    const data = orders.map(order => {
+      const lists = liveLists.filter(list => String(list.salesOrder) === String(order._id));
+      const items = order.items || [];
+
+      // Least-advanced live pick list decides the stage: an order with one packed
+      // and one still-awaiting-sort list is not "packed" yet.
+      const stage = lists.reduce((lowest, list) => {
+        const rank = PICK_STAGE_RANK[list.status] ?? 0;
+        return rank < lowest.rank ? { rank, status: list.status } : lowest;
+      }, { rank: 99, status: 'verified' });
+
+      // Sorted quantity per order line, so the picker knows whether the whole
+      // order can be billed and the backend won't reject the click.
+      const sortedByOrderItem = new Map();
+      for (const list of lists) {
+        for (const line of list.items || []) {
+          const key = String(line.salesOrderItem || '');
+          if (!key) continue;
+          const qty = Number(line.sortedQty ?? line.pickedQty ?? 0);
+          sortedByOrderItem.set(key, (sortedByOrderItem.get(key) || 0) + qty);
+        }
+      }
+      const sortedLines = items.filter(item => (sortedByOrderItem.get(String(item._id)) || 0) > QUANTITY_TOLERANCE);
+      const sortedValue = sortedLines.reduce((sum, item) => (
+        sum + (sortedByOrderItem.get(String(item._id)) || 0) * Number(item.rate || 0)
+      ), 0);
+      const unpackedLine = items.find(item => (
+        (sortedByOrderItem.get(String(item._id)) || 0)
+        < Number(item.quantity || 0) - Number(item.cancelledRemainingQuantity || 0) - QUANTITY_TOLERANCE
+      ));
+
+      // Billable from `sorted` onwards — the whole sorting queue is invoiceable
+      // as long as every line is fully sorted.
+      const eligible = !unpackedLine && sortedLines.length > 0;
+
+      let blockReason = '';
+      if (!eligible) {
+        blockReason = unpackedLine
+          ? `${unpackedLine.productName || unpackedLine.productCode || 'A line'} is sorted to only ${(sortedByOrderItem.get(String(unpackedLine._id)) || 0).toFixed(2)} of ${(Number(unpackedLine.quantity || 0) - Number(unpackedLine.cancelledRemainingQuantity || 0)).toFixed(2)} ${unpackedLine.unit || 'Box'}. Finish sorting or cancel the remainder.`
+          : 'No sorted quantity to invoice yet.';
+      }
+
+      return {
+        _id: order._id,
+        orderNumber: order.orderNumber,
+        dealerName: order.dealerName || order.dealer?.businessName || order.customerName || '—',
+        dealerCode: order.dealerCode || order.dealer?.dealerCode || '',
+        dealerGstin: order.dealer?.gstin || '',
+        orderStatus: order.status,
+        orderDate: order.orderDate,
+        stage: stage.status,
+        stageLabel: PICK_STAGE_LABEL[stage.status] || stage.status,
+        bucket: eligible ? 'billable' : 'sorting',
+        pickListNumbers: lists.map(list => list.pickListNumber),
+        pickListStatuses: lists.map(list => list.status),
+        route: lists.map(list => list.deliveryRoute).find(Boolean) || '',
+        boxes: lists.reduce((sum, list) => sum + Number(list.totalBoxes || 0), 0),
+        pickedQty: lists.reduce((sum, list) => sum + Number(list.totalPickedQty || 0), 0),
+        totalLines: items.length,
+        sortedLines: sortedLines.length,
+        orderValue: Number(order.grandTotal || 0),
+        sortedValue: Math.round(sortedValue * 100) / 100,
+        eligible,
+        blockReason,
+      };
+    });
+
+    const needle = String(search || '').trim().toLowerCase();
+    const filtered = needle
+      ? data.filter(row => `${row.orderNumber} ${row.dealerName} ${row.dealerCode} ${row.pickListNumbers.join(' ')} ${row.route}`
+        .toLowerCase().includes(needle))
+      : data;
+
+    // Most advanced sorting stage first (ready → packed → sorted → awaiting),
+    // newest first inside a stage.
+    filtered.sort((a, b) => (
+      (PICK_STAGE_RANK[b.stage] ?? 0) - (PICK_STAGE_RANK[a.stage] ?? 0)
+      || (new Date(b.orderDate) - new Date(a.orderDate))
+    ));
+
+    const page = filtered.slice(0, Math.min(300, Math.max(1, parseInt(limit) || 200)));
+    res.json({
+      success: true,
+      data: page,
+      counts: {
+        sorting: page.filter(row => row.bucket === 'sorting').length,
+        billable: page.filter(row => row.bucket === 'billable').length,
+      },
+    });
+  } catch (e) { res.status(500).json({ success: false, message: e.message }); }
+});
+
 function validGstin(value) {
   return /^[0-9]{2}[A-Z]{5}[0-9]{4}[A-Z][1-9A-Z]Z[0-9A-Z]$/.test(String(value || '').trim().toUpperCase());
 }
@@ -118,10 +249,25 @@ router.post('/generate-from-so/:soId', requirePermission('invoice'), async (req,
     if (['draft', 'cancelled'].includes(so.status)) {
       return res.status(409).json({ success: false, code: 'FINAL_DISPATCH_REQUIRED', message: `Cannot generate an invoice for a ${so.status} order.` });
     }
-    const incompleteLine = (so.items || []).find(item => (
-      Number(item.quantity || 0) - Number(item.dispatchedQuantity || 0) + Number(item.dispatchReversedQuantity || 0) - Number(item.cancelledRemainingQuantity || 0) > QUANTITY_TOLERANCE
-    ));
-    if (incompleteLine) {
+
+    const orderedRemaining = item => Number(item.quantity || 0) - Number(item.cancelledRemainingQuantity || 0);
+    const dispatchedOf = item => Math.max(0, Number(item.dispatchedQuantity || 0) - Number(item.dispatchReversedQuantity || 0));
+    const incompleteLine = (so.items || []).find(item => orderedRemaining(item) - dispatchedOf(item) > QUANTITY_TOLERANCE);
+    const anyDispatched = (so.items || []).some(item => dispatchedOf(item) > QUANTITY_TOLERANCE);
+
+    // Two legitimate billing points:
+    //   1. post-dispatch (unchanged) — lines come from dispatchedQuantity and a
+    //      stock-deducted trip must exist;
+    //   2. pre-dispatch — the pick list is packed and marked "Ready for
+    //      dispatch", so the invoice is raised from the sorted quantities while
+    //      the truck is still in the yard (this is what the "invoice confirmed"
+    //      check at final dispatch verification expects).
+    // A half-dispatched order is never invoiced: that would double-bill lines.
+    let dispatchTrips = [];
+    let billedFromSorting = false;
+    let sortingPickLists = [];
+
+    if (incompleteLine && anyDispatched) {
       return res.status(409).json({
         success: false,
         code: 'FINAL_DISPATCH_REQUIRED',
@@ -129,18 +275,36 @@ router.post('/generate-from-so/:soId', requirePermission('invoice'), async (req,
       });
     }
 
-    const dispatchTrips = await DispatchTrip.find({
-      branch: req.branchId,
-      status: { $in: ['dispatched', 'in_transit', 'completed'] },
-      stockDeductedAt: { $ne: null },
-      'orders.salesOrder': so._id,
-    }).select('_id tripNumber stockDeductedAt').sort({ stockDeductedAt: 1 }).lean();
-    if (!dispatchTrips.length) {
-      return res.status(409).json({
-        success: false,
-        code: 'FULL_DISPATCH_REQUIRED',
-        message: 'Invoice generation requires a linked dispatched trip with completed stock deduction.',
-      });
+    if (incompleteLine) {
+      sortingPickLists = await PickList.find({
+        branch: req.branchId,
+        salesOrder: so._id,
+        status: { $in: ['sorted', 'packed', 'ready_for_dispatch'] },
+        stockConsumedAt: null,
+      }).select('pickListNumber items.salesOrderItem items.sortedQty items.pickedQty').lean();
+
+      if (!sortingPickLists.length) {
+        return res.status(409).json({
+          success: false,
+          code: 'FINAL_DISPATCH_REQUIRED',
+          message: 'Invoicing needs a pick list with completed sorting (Sorted or later) or a completed dispatch.',
+        });
+      }
+      billedFromSorting = true;
+    } else {
+      dispatchTrips = await DispatchTrip.find({
+        branch: req.branchId,
+        status: { $in: ['dispatched', 'in_transit', 'completed'] },
+        stockDeductedAt: { $ne: null },
+        'orders.salesOrder': so._id,
+      }).select('_id tripNumber stockDeductedAt').sort({ stockDeductedAt: 1 }).lean();
+      if (!dispatchTrips.length) {
+        return res.status(409).json({
+          success: false,
+          code: 'FULL_DISPATCH_REQUIRED',
+          message: 'Invoice generation requires a linked dispatched trip with completed stock deduction.',
+        });
+      }
     }
 
     if (!so.dealer) {
@@ -165,10 +329,39 @@ router.post('/generate-from-so/:soId', requirePermission('invoice'), async (req,
 
     const invoiceNumber = await generateBranchNumber(req.branchId, 'invoice', new Date());
 
+    // Pre-dispatch billing reads the sorted quantity off the pick lists; the
+    // dispatched path keeps using dispatchedQuantity.
+    const sortedQtyByOrderItem = new Map();
+    if (billedFromSorting) {
+      for (const pickList of sortingPickLists) {
+        for (const line of pickList.items || []) {
+          const key = String(line.salesOrderItem || '');
+          if (!key) continue;
+          const qty = Number(line.sortedQty ?? line.pickedQty ?? 0);
+          sortedQtyByOrderItem.set(key, (sortedQtyByOrderItem.get(key) || 0) + qty);
+        }
+      }
+      const unpackedLine = (so.items || []).find(item => (
+        (sortedQtyByOrderItem.get(String(item._id)) || 0) < orderedRemaining(item) - QUANTITY_TOLERANCE
+      ));
+      if (unpackedLine) {
+        const sortedQty = sortedQtyByOrderItem.get(String(unpackedLine._id)) || 0;
+        return res.status(409).json({
+          success: false,
+          code: 'SORTING_INCOMPLETE',
+          message: `${unpackedLine.productName || unpackedLine.productCode || 'A line'} is sorted to only ${sortedQty.toFixed(2)} of ${orderedRemaining(unpackedLine).toFixed(2)} ${unpackedLine.unit || 'Box'}. Finish sorting or cancel the remainder before invoicing.`,
+        });
+      }
+    }
+
     // Build invoice items with full details
-    const items = so.items.filter(item => Number(item.dispatchedQuantity || 0) - Number(item.dispatchReversedQuantity || 0) > QUANTITY_TOLERANCE).map(item => {
+    const items = so.items.map(item => ({
+      item,
+      qty: billedFromSorting
+        ? Math.max(0, sortedQtyByOrderItem.get(String(item._id)) || 0)
+        : dispatchedOf(item),
+    })).filter(row => row.qty > QUANTITY_TOLERANCE).map(({ item, qty }) => {
       const prod = item.product || {};
-      const qty = Math.max(0, Number(item.dispatchedQuantity || 0) - Number(item.dispatchReversedQuantity || 0));
       const orderedQty = Number(item.quantity || 0);
       const commercialRatio = orderedQty > 0 ? qty / orderedQty : 0;
       const rate = item.rate || 0;
@@ -222,7 +415,7 @@ router.post('/generate-from-so/:soId', requirePermission('invoice'), async (req,
       };
     });
 
-    if (!items.length) return res.status(409).json({ success: false, code: 'NO_DISPATCHED_QUANTITY', message: 'A final invoice requires at least one dispatched line.' });
+    if (!items.length) return res.status(409).json({ success: false, code: 'NO_DISPATCHED_QUANTITY', message: 'A final invoice requires at least one billable line.' });
     // Determine interstate treatment from GST jurisdiction codes, never from missing/free-text state names.
     const branchSettings = await BranchSettings.findOne({ branch: req.branchId }).lean();
     const isInterState = buyerStateCode !== sellerStateCode;
@@ -299,6 +492,9 @@ router.post('/generate-from-so/:soId', requirePermission('invoice'), async (req,
       buyerStateCode,
       buyerPhone: so.dealer?.mobile || so.customerPhone || '',
       deliveryAddress: so.deliveryAddress || '',
+      internalNotes: billedFromSorting
+        ? `Raised from ${sortingPickLists.map(pickList => pickList.pickListNumber).join(', ')} before dispatch (sorted quantities).`
+        : '',
 
       // Items
       items,
@@ -332,11 +528,13 @@ router.post('/generate-from-so/:soId', requirePermission('invoice'), async (req,
       createdBy: req.user._id,
     });
 
-    await DispatchTrip.updateMany(
-      { _id: { $in: dispatchTrips.map(trip => trip._id) }, branch: req.branchId, 'orders.salesOrder': so._id },
-      { $set: { 'orders.$[order].invoice': invoice._id, 'orders.$[order].invoiceNumber': invoice.invoiceNumber } },
-      { arrayFilters: [{ 'order.salesOrder': so._id }] }
-    );
+    if (dispatchTrips.length) {
+      await DispatchTrip.updateMany(
+        { _id: { $in: dispatchTrips.map(trip => trip._id) }, branch: req.branchId, 'orders.salesOrder': so._id },
+        { $set: { 'orders.$[order].invoice': invoice._id, 'orders.$[order].invoiceNumber': invoice.invoiceNumber } },
+        { arrayFilters: [{ 'order.salesOrder': so._id }] }
+      );
+    }
 
     res.status(201).json({ success: true, message: `Invoice ${invoiceNumber} generated.`, data: invoice });
   } catch (e) {
