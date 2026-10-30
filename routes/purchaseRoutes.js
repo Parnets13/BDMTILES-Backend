@@ -56,7 +56,7 @@ router.get('/purchase-orders', requireAnyPermission('po.management', 'po.approve
   try {
     const { page = 1, limit = 20, search, status, supplier } = req.query;
     const p = Math.max(1, parseInt(page)); const l = Math.min(100, parseInt(limit) || 20);
-    let filter = { branch: req.branchId };
+    let filter = { branch: req.branchScope };
     if (search) {
       const escaped = String(search).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
       const r = new RegExp(escaped, 'i');
@@ -74,7 +74,7 @@ router.get('/purchase-orders', requireAnyPermission('po.management', 'po.approve
 
 router.get('/purchase-orders/stats', requireAnyPermission('po.management', 'po.approve'), async (req, res) => {
   try {
-    const scope = { branch: req.branchId };
+    const scope = { branch: req.branchScope };
     const [total, draft, pendingApproval, approved, rejected, partialReceived, received, cancelled] = await Promise.all([
       PurchaseOrder.countDocuments(scope),
       PurchaseOrder.countDocuments({ ...scope, status: 'draft' }),
@@ -91,7 +91,7 @@ router.get('/purchase-orders/stats', requireAnyPermission('po.management', 'po.a
 
 router.get('/purchase-orders/:id', requireAnyPermission('po.management', 'po.approve'), async (req, res) => {
   try {
-    const po = await PurchaseOrder.findOne({ _id: req.params.id, branch: req.branchId }).populate('supplier', 'companyName supplierCode mobile').populate('items.product', 'productCode itemName images').lean();
+    const po = await PurchaseOrder.findOne({ _id: req.params.id, branch: req.branchScope }).populate('supplier', 'companyName supplierCode mobile').populate('items.product', 'productCode itemName images').lean();
     if (!po) return res.status(404).json({ success: false, message: 'PO not found.' });
     res.json({ success: true, data: po });
   } catch (e) { res.status(500).json({ success: false, message: e.message }); }
@@ -99,7 +99,7 @@ router.get('/purchase-orders/:id', requireAnyPermission('po.management', 'po.app
 
 router.get('/purchase-orders/:id/print', requireAnyPermission('po.management', 'po.approve'), async (req, res) => {
   try {
-    const po = await PurchaseOrder.findOne({ _id: req.params.id, branch: req.branchId })
+    const po = await PurchaseOrder.findOne({ _id: req.params.id, branch: req.branchScope })
       .populate('supplier', 'companyName supplierCode contactPerson mobile email gstin address city state pinCode')
       .populate('receivingWarehouse', 'warehouseCode name address city state pinCode')
       .populate('createdBy approvedBy', 'name email').lean();
@@ -145,14 +145,14 @@ router.put('/purchase-orders/:id', requirePermission('po.management'), async (re
   try {
     let updated;
     await session.withTransaction(async () => {
-      const po = await PurchaseOrder.findOne({ _id: req.params.id, branch: req.branchId }).session(session);
+      const po = await PurchaseOrder.findOne({ _id: req.params.id, branch: req.branchScope }).session(session);
       if (!po) throw Object.assign(new Error('Purchase order not found.'), { status: 404 });
       if (po.status !== 'draft') throw Object.assign(new Error('Only a draft purchase order can be amended.'), { status: 409 });
       const reason = String(req.body.amendmentReason || '').trim();
       if (!reason) throw Object.assign(new Error('amendmentReason is required.'), { status: 422 });
       const before = purchaseOrderSnapshot(po);
-      const calculated = await calculatePurchaseOrder({ branchId: req.branchId, input: req.body, session });
-      await assertPurchaseOrderSourceIntegrity({ branchId: req.branchId, po, calculated, session });
+      const calculated = await calculatePurchaseOrder({ branchId: req.branchScope, input: req.body, session });
+      await assertPurchaseOrderSourceIntegrity({ branchId: req.branchScope, po, calculated, session });
       Object.assign(po, calculated);
       const after = purchaseOrderSnapshot(po);
       const diff = amendmentDiff(before, after);
@@ -172,7 +172,7 @@ router.patch('/purchase-orders/:id/submit', requirePermission('po.management'), 
   try {
     let result;
     await session.withTransaction(async () => {
-      result = await submitPurchaseOrder({ branchId: req.branchId, poId: req.params.id, actor: req.user, remarks: String(req.body.remarks || ''), session });
+      result = await submitPurchaseOrder({ branchId: req.branchScope, poId: req.params.id, actor: req.user, remarks: String(req.body.remarks || ''), session });
     });
     return res.json({ success: true, message: result.replayed ? 'Purchase order is already submitted.' : 'Purchase order submitted for approval.', data: result });
   } catch (error) {
@@ -186,7 +186,7 @@ const directPurchaseOrderAction = async (req, res, nextStatus) => {
     let result;
     await session.withTransaction(async () => {
       result = await actionPurchaseOrderApproval({
-        branchId: req.branchId, poId: req.params.id, actorId: req.user._id,
+        branchId: req.branchScope, poId: req.params.id, actorId: req.user._id,
         nextStatus, remarks: String(req.body.remarks || ''), session,
       });
     });
@@ -206,7 +206,7 @@ router.patch('/purchase-orders/:id/status', requirePermission('po.management'), 
     try {
       let result;
       await session.withTransaction(async () => {
-        result = await submitPurchaseOrder({ branchId: req.branchId, poId: req.params.id, actor: req.user, remarks: String(req.body.remarks || ''), session });
+        result = await submitPurchaseOrder({ branchId: req.branchScope, poId: req.params.id, actor: req.user, remarks: String(req.body.remarks || ''), session });
       });
       return res.json({ success: true, message: 'Purchase order submitted for approval.', data: result.po });
     } catch (error) {
@@ -221,12 +221,12 @@ router.patch('/purchase-orders/:id/status', requirePermission('po.management'), 
 
 router.delete('/purchase-orders/:id', requirePermission('po.management'), async (req, res) => {
   try {
-    const po = await PurchaseOrder.findOne({ _id: req.params.id, branch: req.branchId }).select('status').lean();
+    const po = await PurchaseOrder.findOne({ _id: req.params.id, branch: req.branchScope }).select('status').lean();
     if (!po) return res.status(404).json({ success: false, message: 'Purchase order not found.' });
     if (po.status !== 'draft') return res.status(409).json({ success: false, message: 'Only a draft purchase order can be deleted.' });
     const { safeDelete } = await import('../middleware/safeDelete.js');
     const result = await safeDelete(PurchaseOrder, req.params.id, {
-      user: req.user, module: 'purchase', titleField: 'supplierName', codeField: 'poNumber', scope: { branch: req.branchId },
+      user: req.user, module: 'purchase', titleField: 'supplierName', codeField: 'poNumber', scope: { branch: req.branchScope },
     });
     return res.status(result.status || 200).json(result);
   } catch (error) { return res.status(500).json({ success: false, message: error.message }); }
@@ -322,7 +322,7 @@ router.get('/grn', requirePermission('grn.entry'), async (req, res) => {
   try {
     const { page = 1, limit = 20, search, status, supplier } = req.query;
     const p = Math.max(1, parseInt(page)); const l = Math.min(100, parseInt(limit) || 20);
-    let filter = { branch: req.branchId };
+    let filter = { branch: req.branchScope };
     if (search) {
       const escaped = String(search).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
       const r = new RegExp(escaped, 'i');
@@ -330,7 +330,7 @@ router.get('/grn', requirePermission('grn.entry'), async (req, res) => {
     }
     if (status) filter.status = status;
     if (supplier) filter.supplier = supplier;
-    const scope = { branch: req.branchId };
+    const scope = { branch: req.branchScope };
     const [grns, total, draft, verified, approved, posted] = await Promise.all([
       GRN.find(filter).sort({ createdAt: -1 }).skip((p-1)*l).limit(l).populate('supplier', 'companyName').lean(),
       GRN.countDocuments(filter),
@@ -352,7 +352,7 @@ router.get('/grn', requirePermission('grn.entry'), async (req, res) => {
 router.get('/grn/available-pos', requirePermission('grn.entry'), async (req, res) => {
   try {
     const pos = await PurchaseOrder.find({
-      branch: req.branchId,
+      branch: req.branchScope,
       status: { $in: ['approved', 'sent', 'partial_received'] },
       items: { $elemMatch: { pendingQty: { $gt: 0 } } },
     })
@@ -366,7 +366,7 @@ router.get('/grn/available-pos', requirePermission('grn.entry'), async (req, res
 
 router.get('/grn/:id', requirePermission('grn.entry'), async (req, res) => {
   try {
-    const grn = await GRN.findOne({ _id: req.params.id, branch: req.branchId }).populate('supplier', 'companyName').populate('items.product', 'productCode itemName images').populate('items.warehouse', 'name').lean();
+    const grn = await GRN.findOne({ _id: req.params.id, branch: req.branchScope }).populate('supplier', 'companyName').populate('items.product', 'productCode itemName images').populate('items.warehouse', 'name').lean();
     if (!grn) return res.status(404).json({ success: false, message: 'GRN not found.' });
     res.json({ success: true, data: grn });
   } catch (e) { res.status(500).json({ success: false, message: e.message }); }
@@ -384,7 +384,7 @@ router.post('/grn', requirePermission('grn.entry'), async (req, res) => {
     let result;
     let replayed = false;
     await session.withTransaction(async () => {
-      const existing = await GRN.findOne({ branch: req.branchId, sourceKey }).session(session);
+      const existing = await GRN.findOne({ branch: req.branchScope, sourceKey }).session(session);
       if (existing) {
         if (existing.requestFingerprint && existing.requestFingerprint !== requestFingerprint) {
           throw grnError(409, 'This Idempotency-Key was already used with a different request payload.');
@@ -400,7 +400,7 @@ router.post('/grn', requirePermission('grn.entry'), async (req, res) => {
       }
       if (!req.body.purchaseOrder) throw grnError(422, 'An approved purchase order is required for a GRN.');
 
-      const po = await PurchaseOrder.findOne({ _id: req.body.purchaseOrder, branch: req.branchId }).session(session);
+      const po = await PurchaseOrder.findOne({ _id: req.body.purchaseOrder, branch: req.branchScope }).session(session);
       if (!po) throw grnError(404, 'Purchase order not found.');
       if (!['approved', 'sent', 'partial_received'].includes(po.status)) {
         throw grnError(409, 'Only an approved purchase order with pending quantities can be used for a GRN.');
@@ -417,7 +417,7 @@ router.post('/grn', requirePermission('grn.entry'), async (req, res) => {
       const items = normalizeGRNItems({
         items: req.body.items,
         po,
-        branchId: req.branchId,
+        branchId: req.branchScope,
         grnNumber,
       });
       await assertWarehousesInBranch(
@@ -428,7 +428,7 @@ router.post('/grn', requirePermission('grn.entry'), async (req, res) => {
 
       [result] = await GRN.create([{
         grnNumber,
-        branch: req.branchId,
+        branch: req.branchScope,
         grnDate,
         sourceKey,
         requestFingerprint,
@@ -456,7 +456,7 @@ router.post('/grn', requirePermission('grn.entry'), async (req, res) => {
     });
   } catch (error) {
     if (error.code === 11000) {
-      const existing = await GRN.findOne({ branch: req.branchId, sourceKey });
+      const existing = await GRN.findOne({ branch: req.branchScope, sourceKey });
       if (existing) {
         if (existing.requestFingerprint && existing.requestFingerprint !== requestFingerprint) {
           return res.status(409).json({ success: false, message: 'This Idempotency-Key was already used with a different request payload.' });
@@ -479,18 +479,18 @@ router.patch('/grn/:id', requirePermission('grn.entry'), async (req, res) => {
   try {
     let updated;
     await session.withTransaction(async () => {
-      const grn = await GRN.findOne({ _id: req.params.id, branch: req.branchId }).session(session);
+      const grn = await GRN.findOne({ _id: req.params.id, branch: req.branchScope }).session(session);
       if (!grn) throw grnError(404, 'GRN not found.');
       if (grn.status !== 'draft') throw grnError(409, `Only a draft GRN can be edited. Current status: ${grn.status}.`);
 
-      const po = await PurchaseOrder.findOne({ _id: grn.purchaseOrder, branch: req.branchId }).session(session);
+      const po = await PurchaseOrder.findOne({ _id: grn.purchaseOrder, branch: req.branchScope }).session(session);
       if (!po) throw grnError(404, 'Purchase order not found in the active branch.');
       if (!['approved', 'sent', 'partial_received'].includes(po.status)) {
         throw grnError(409, 'Only an approved purchase order with pending quantities can be received.');
       }
 
       if (req.body.items !== undefined) {
-        const items = normalizeGRNItems({ items: req.body.items, po, branchId: req.branchId, grnNumber: grn.grnNumber });
+        const items = normalizeGRNItems({ items: req.body.items, po, branchId: req.branchScope, grnNumber: grn.grnNumber });
         await assertWarehousesInBranch(
           items.filter(item => item.receivedQty > 0).map(item => item.warehouse),
           req.branchId,
@@ -524,7 +524,7 @@ router.patch('/grn/:id', requirePermission('grn.entry'), async (req, res) => {
 // have been posted yet, so removal is safe.
 router.delete('/grn/:id', requirePermission('grn.entry'), async (req, res) => {
   try {
-    const grn = await GRN.findOne({ _id: req.params.id, branch: req.branchId }).select('status grnNumber').lean();
+    const grn = await GRN.findOne({ _id: req.params.id, branch: req.branchScope }).select('status grnNumber').lean();
     if (!grn) throw grnError(404, 'GRN not found.');
     if (grn.status !== 'draft') throw grnError(409, `Only a draft GRN can be deleted. Current status: ${grn.status}.`);
     const { safeDelete } = await import('../middleware/safeDelete.js');
@@ -541,7 +541,7 @@ router.delete('/grn/:id', requirePermission('grn.entry'), async (req, res) => {
 router.patch('/grn/:id/verify', requirePermission('grn.entry'), async (req, res) => {
   try {
     const grn = await GRN.findOneAndUpdate(
-      { _id: req.params.id, branch: req.branchId, status: 'draft' },
+      { _id: req.params.id, branch: req.branchScope, status: 'draft' },
       { $set: { status: 'verified', verifiedBy: req.user._id, verifiedAt: new Date() } },
       { new: true, runValidators: true }
     );
@@ -559,7 +559,7 @@ router.patch('/grn/:id/approve', requirePermission('grn.approve'), async (req, r
     let posted;
     let replayed = false;
     await session.withTransaction(async () => {
-      const grn = await GRN.findOne({ _id: req.params.id, branch: req.branchId }).session(session);
+      const grn = await GRN.findOne({ _id: req.params.id, branch: req.branchScope }).session(session);
       if (!grn) throw grnError(404, 'GRN not found.');
       if (grn.status === 'posted') {
         posted = grn;
@@ -571,7 +571,7 @@ router.patch('/grn/:id/approve', requirePermission('grn.approve'), async (req, r
       }
       if (!grn.purchaseOrder) throw grnError(409, 'A purchase order is required before a GRN can be posted.');
 
-      const po = await PurchaseOrder.findOne({ _id: grn.purchaseOrder, branch: req.branchId }).session(session);
+      const po = await PurchaseOrder.findOne({ _id: grn.purchaseOrder, branch: req.branchScope }).session(session);
       if (!po) throw grnError(404, 'Purchase order not found in the active branch.');
       if (!['approved', 'sent', 'partial_received'].includes(po.status)) {
         throw grnError(409, 'Only an approved purchase order can be received.');
@@ -585,7 +585,7 @@ router.patch('/grn/:id/approve', requirePermission('grn.approve'), async (req, r
       const normalizedItems = normalizeGRNItems({
         items: grn.items,
         po,
-        branchId: req.branchId,
+        branchId: req.branchScope,
         grnNumber: grn.grnNumber,
       });
       await assertWarehousesInBranch(
@@ -688,8 +688,8 @@ async function updatePOReceivedQty(po, grnItems, session) {
 // ═══════════════════════════════════════
 router.get('/stock', requirePermission('stock.view'), async (req, res) => {
   try {
-    const result = await listStocks(req.branchId, req.query);
-    const branchTotals = await getStockSummary(req.branchId);
+    const result = await listStocks(req.branchScope, req.query);
+    const branchTotals = await getStockSummary(req.branchScope);
     return res.json({ success: true, data: result.data, pagination: result.pagination, totals: result.totals, branchTotals });
   } catch (error) {
     return res.status(error.status || 500).json({ success: false, message: error.message });
@@ -698,7 +698,7 @@ router.get('/stock', requirePermission('stock.view'), async (req, res) => {
 
 router.get('/stock/summary', requirePermission('stock.view'), async (req, res) => {
   try {
-    const summary = await getStockSummary(req.branchId);
+    const summary = await getStockSummary(req.branchScope);
     return res.json({ success: true, data: { ...summary, inventoryValue: summary.totalValue, totalValue: summary.availableValue } });
   } catch (error) {
     return res.status(error.status || 500).json({ success: false, message: error.message });
@@ -712,7 +712,7 @@ router.post('/stock/adjust', requireLegacyAdjustmentOrAll('stock.adjustment.crea
   if (!idempotencyKey || idempotencyKey.length > 200) return res.status(422).json({ success: false, message: 'A valid Idempotency-Key header is required.' });
   if (!reason) return res.status(422).json({ success: false, message: 'reason is required.' });
   try {
-    const durable = await createSubmittedLegacyAdjustment({ branchId: req.branchId, actorId: req.user._id, body: req.body, idempotencyKey });
+    const durable = await createSubmittedLegacyAdjustment({ branchId: req.branchScope, actorId: req.user._id, body: req.body, idempotencyKey });
     return res.json({
       success: true,
       message: durable.replayed
@@ -755,7 +755,7 @@ router.post('/stock/adjust', requireLegacyAdjustmentOrAll('stock.adjustment.crea
         correlationKey: operationKey,
         movementType: 'manual_adjustment',
         phase: 'posted',
-        branch: req.branchId, product, warehouse, shade, batch,
+        branch: req.branchScope, product, warehouse, shade, batch,
         deltas: { totalQty: signedBaseQuantity, availableQty: signedBaseQuantity },
         upsert: signedBaseQuantity > 0,
         ...uom,
@@ -796,7 +796,7 @@ router.post('/stock/transfer', requirePermission('stock.transfer'), async (req, 
       const correlationKey = stockOperationKey(req.branchId, 'legacy-transfer', idempotencyKey);
       const sourceId = deterministicSourceId(correlationKey);
       const common = {
-        correlationKey, movementType: 'legacy_transfer', phase: 'posted', branch: req.branchId,
+        correlationKey, movementType: 'legacy_transfer', phase: 'posted', branch: req.branchScope,
         product, shade, batch, ...uom,
         sourceType: 'LegacyStockTransfer', sourceModel: 'Stock', sourceId, sourceNumber: idempotencyKey,
         actor: req.user._id, occurredAt: new Date(), reason, remarks: req.body.remarks || '',
@@ -830,7 +830,7 @@ router.post('/stock/transfer', requirePermission('stock.transfer'), async (req, 
 // ═══════════════════════════════════════
 router.get('/stock/alerts', requirePermission('stock.view'), async (req, res) => {
   try {
-    const result = await getCanonicalStockAlerts(req.branchId, {
+    const result = await getCanonicalStockAlerts(req.branchScope, {
       warehouse: req.query.warehouse,
       includeAdequate: false,
       sortBy: 'available',
@@ -886,7 +886,7 @@ router.get('/audit/pending', requireAnyPermission('stock.audit.create', 'stock.a
     if (!warehouse) return res.status(400).json({ success: false, message: 'Warehouse is required.' });
     await assertWarehousesInBranch([warehouse], req.branchId);
 
-    const stocks = await Stock.find({ branch: req.branchId, warehouse })
+    const stocks = await Stock.find({ branch: req.branchScope, warehouse })
       .populate('product', 'productCode itemName tileSize images brand')
       .populate('warehouse', 'name')
       .sort({ 'product.itemName': 1 })
@@ -904,7 +904,7 @@ router.post('/audit/submit', requireAllPermissions('stock.audit.create', 'stock.
   if (!idempotencyKey || idempotencyKey.length > 200) return res.status(422).json({ success: false, message: 'A valid Idempotency-Key header is required.' });
   if (!warehouse || !Array.isArray(counts) || !counts.length) return res.status(422).json({ success: false, message: 'warehouse and counts are required.' });
   try {
-    const durable = await createSubmittedLegacyAudit({ branchId: req.branchId, actorId: req.user._id, body: req.body, idempotencyKey });
+    const durable = await createSubmittedLegacyAudit({ branchId: req.branchScope, actorId: req.user._id, body: req.body, idempotencyKey });
     const document = durable.document;
     const countedLines = document.lines.filter((line) => line.physicalCount !== undefined && line.physicalCount !== null);
     return res.json({
@@ -953,7 +953,7 @@ router.post('/audit/submit', requireAllPermissions('stock.audit.create', 'stock.
       await assertWarehousesInBranch([warehouse], req.branchId, { session });
       const correlationKey = stockOperationKey(req.branchId, 'physical-audit', idempotencyKey);
       const operationKeys = normalized.map(count => `${correlationKey}:${count.stockId}`);
-      const existingMovements = await StockMovement.find({ branch: req.branchId, operationKey: { $in: operationKeys } }).session(session).lean();
+      const existingMovements = await StockMovement.find({ branch: req.branchScope, operationKey: { $in: operationKeys } }).session(session).lean();
       if (existingMovements.length) {
         if (existingMovements.length !== normalized.length) throw grnError(409, 'This audit idempotency key has an incomplete movement set.');
         const existingByKey = new Map(existingMovements.map(movement => [movement.operationKey, movement]));
@@ -987,7 +987,7 @@ router.post('/audit/submit', requireAllPermissions('stock.audit.create', 'stock.
         });
         return;
       }
-      const stocks = await Stock.find({ _id: { $in: normalized.map(item => item.stockId) }, branch: req.branchId, warehouse }).session(session);
+      const stocks = await Stock.find({ _id: { $in: normalized.map(item => item.stockId) }, branch: req.branchScope, warehouse }).session(session);
       if (stocks.length !== normalized.length) throw grnError(422, 'Every count must reference an existing stock bucket in the selected branch and warehouse.');
       const stockById = new Map(stocks.map(stock => [String(stock._id), stock]));
       results = [];
@@ -1014,7 +1014,7 @@ router.post('/audit/submit', requireAllPermissions('stock.audit.create', 'stock.
           operationKey: `${correlationKey}:${stock._id}`,
           correlationKey,
           movementType: 'physical_count', phase: 'counted',
-          branch: req.branchId, product: stock.product, warehouse: stock.warehouse, shade: stock.shade, batch: stock.batch,
+          branch: req.branchScope, product: stock.product, warehouse: stock.warehouse, shade: stock.shade, batch: stock.batch,
           deltas: { totalQty: discrepancy, availableQty: discrepancy }, allowZeroDeltas: true,
           enteredQuantity: count.physicalQty, ...uom,
           sourceType: 'PhysicalStockAudit', sourceModel: 'Stock', sourceId: deterministicSourceId(correlationKey),
@@ -1053,7 +1053,7 @@ router.post('/audit/submit', requireAllPermissions('stock.audit.create', 'stock.
 // GET /api/v1/purchase/stock/reorder-suggestions — compatibility shape backed by canonical stock alerts
 router.get('/stock/reorder-suggestions', requirePermission('stock.view'), async (req, res) => {
   try {
-    const result = await getCanonicalStockAlerts(req.branchId, {
+    const result = await getCanonicalStockAlerts(req.branchScope, {
       warehouse: req.query.warehouse,
       includeAdequate: false,
       sortBy: 'severity',
@@ -1093,7 +1093,7 @@ router.get('/stock/reorder-suggestions', requirePermission('stock.view'), async 
           source: 'reorder_suggestion',
           key: [req.branchId, row.warehouse?._id || 'all', row.product].map(String).join(':'),
           snapshotAt: result.scope.snapshotAt,
-          branch: req.branchId,
+          branch: req.branchScope,
           warehouse: row.warehouse?._id || null,
           configuredReorderLevel: row.thresholds.configuredReorderLevel,
           effectiveReorderLevel: row.thresholds.effectiveReorderLevel,
@@ -1105,7 +1105,7 @@ router.get('/stock/reorder-suggestions', requirePermission('stock.view'), async 
       success: true,
       data: suggestions,
       scope: {
-        branch: req.branchId,
+        branch: req.branchScope,
         warehouse: result.scope.warehouse?._id || null,
         warehouseName: result.scope.warehouse?.name || 'All branch warehouses',
         snapshotAt: result.scope.snapshotAt,

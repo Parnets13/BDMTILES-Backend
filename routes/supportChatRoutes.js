@@ -183,7 +183,7 @@ router.post('/:dealerId', async (req, res) => {
     if (body.length > 2000) throw fail(422, 'Message is too long (2000 characters max).', 'MESSAGE_TOO_LONG');
 
     const message = await DealerMessage.create({
-      branch: req.branchId,
+      branch: req.branchScope,
       dealer: dealer._id,
       // The dealer app renders anything that is not 'dealer' as the staff side, so
       // a support reply lands in the same bubble stream as the executive's.

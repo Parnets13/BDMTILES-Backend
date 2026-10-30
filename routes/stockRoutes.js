@@ -53,19 +53,19 @@ const transferItemMatches = (item, stock) => (
 // Static routes must remain before /:id routes.
 router.get('/', async (req, res) => {
   try {
-    const [result, branchTotals] = await Promise.all([listStocks(req.branchId, req.query), getStockSummary(req.branchId)]);
+    const [result, branchTotals] = await Promise.all([listStocks(req.branchScope, req.query), getStockSummary(req.branchScope)]);
     return res.json({ success: true, ...result, branchTotals });
   } catch (error) { return handleError(res, error); }
 });
 
 router.get('/summary', async (req, res) => {
-  try { return res.json({ success: true, data: await getStockSummary(req.branchId) }); }
+  try { return res.json({ success: true, data: await getStockSummary(req.branchScope) }); }
   catch (error) { return handleError(res, error); }
 });
 
 router.get('/alerts', async (req, res) => {
   try {
-    const result = await getCanonicalStockAlerts(req.branchId, req.query);
+    const result = await getCanonicalStockAlerts(req.branchScope, req.query);
     return res.json({ success: true, ...result });
   } catch (error) { return handleError(res, error); }
 });
@@ -73,9 +73,9 @@ router.get('/alerts', async (req, res) => {
 router.get('/filter-options', async (req, res) => {
   try {
     const [warehouses, shades, batches] = await Promise.all([
-      Warehouse.find({ branch: req.branchId }).select('warehouseCode name type status city').sort({ name: 1 }).lean(),
-      Stock.distinct('shade', { branch: req.branchId, shade: { $ne: '' } }),
-      Stock.distinct('batch', { branch: req.branchId, batch: { $ne: '' } }),
+      Warehouse.find({ branch: req.branchScope }).select('warehouseCode name type status city').sort({ name: 1 }).lean(),
+      Stock.distinct('shade', { branch: req.branchScope, shade: { $ne: '' } }),
+      Stock.distinct('batch', { branch: req.branchScope, batch: { $ne: '' } }),
     ]);
     return res.json({
       success: true,
@@ -132,7 +132,7 @@ router.get('/attribute-registry', async (req, res) => {
   try {
     const summarise = async (field) => {
       const rows = await Stock.aggregate([
-        { $match: { branch: req.branchId } },
+        { $match: { branch: req.branchScope } },
         {
           $group: {
             _id: { $ifNull: [`$${field}`, ''] },
@@ -188,20 +188,20 @@ router.get('/attribute-registry', async (req, res) => {
 
 router.get('/movements', async (req, res) => {
   try {
-    const result = await listMovements(req.branchId, req.query);
+    const result = await listMovements(req.branchScope, req.query);
     return res.json({ success: true, ...result });
   } catch (error) { return handleError(res, error); }
 });
 
 router.get('/movements/summary', async (req, res) => {
-  try { return res.json({ success: true, data: await movementSummary(req.branchId, req.query) }); }
+  try { return res.json({ success: true, data: await movementSummary(req.branchScope, req.query) }); }
   catch (error) { return handleError(res, error); }
 });
 
 router.get('/:id/detail', async (req, res) => {
   try {
     if (!mongoose.isValidObjectId(req.params.id)) throw apiError(422, 'stock id must be a valid identifier.');
-    const stock = await Stock.findOne({ _id: req.params.id, branch: req.branchId })
+    const stock = await Stock.findOne({ _id: req.params.id, branch: req.branchScope })
       .populate({ path: 'product', populate: [{ path: 'brand', select: 'name code status' }, { path: 'category', select: 'name code status' }, { path: 'subcategory', select: 'name code status' }] })
       .populate('warehouse')
       .lean();
@@ -215,18 +215,18 @@ router.get('/:id/detail', async (req, res) => {
         .populate('actor', 'name role').populate('relatedWarehouse', 'warehouseCode name branch').lean(),
       StockMovement.find({ stock: stock._id, 'deltas.totalQty': { $gt: 0 } }).sort({ occurredAt: -1, _id: -1 }).limit(10).populate('actor', 'name role').lean(),
       StockMovement.find({ stock: stock._id, 'deltas.totalQty': { $lt: 0 } }).sort({ occurredAt: -1, _id: -1 }).limit(10).populate('actor', 'name role').lean(),
-      SalesOrder.find({ branch: req.branchId, status: { $nin: ['cancelled', 'delivered'] }, items: { $elemMatch: { ...itemElemMatch, reservedQuantity: { $gt: 0 } } } })
+      SalesOrder.find({ branch: req.branchScope, status: { $nin: ['cancelled', 'delivered'] }, items: { $elemMatch: { ...itemElemMatch, reservedQuantity: { $gt: 0 } } } })
         .select('orderNumber orderDate status reservationStatus dealer dealerName items').sort({ orderDate: -1 }).limit(25).lean(),
-      StockTransfer.find({ status: 'in_transit', $or: [{ sourceBranch: req.branchId, fromWarehouse: match.warehouse }, { destinationBranch: req.branchId, toWarehouse: match.warehouse }], items: { $elemMatch: { product: match.product, shade: match.shade, batch: match.batch } } })
+      StockTransfer.find({ status: 'in_transit', $or: [{ sourceBranch: req.branchScope, fromWarehouse: match.warehouse }, { destinationBranch: req.branchScope, toWarehouse: match.warehouse }], items: { $elemMatch: { product: match.product, shade: match.shade, batch: match.batch } } })
         .select('transferNumber transferDate sourceBranch destinationBranch fromWarehouse toWarehouse status dispatchDate items').sort({ dispatchDate: -1 }).limit(25)
         .populate('fromWarehouse toWarehouse', 'warehouseCode name branch').lean(),
-      GRN.find({ branch: req.branchId, status: 'posted', items: { $elemMatch: itemElemMatch } }).select('grnNumber grnDate supplier supplierName purchaseOrder poNumber items postedAt').sort({ postedAt: -1 }).limit(10).lean(),
-      PurchaseReturn.find({ branch: req.branchId, status: { $in: ['debit_issued', 'reversed'] }, items: { $elemMatch: itemElemMatch } }).select('debitNoteNumber returnDate status supplier supplierName items approvalDate reversedAt').sort({ updatedAt: -1 }).limit(10).lean(),
-      SalesReturn.find({ branch: req.branchId, status: { $in: ['credit_issued', 'refund_pending', 'replacement_pending', 'reversed'] }, items: { $elemMatch: itemElemMatch } }).select('returnNumber returnDate status dealer dealerName items approvalDate reversedAt').sort({ updatedAt: -1 }).limit(10).lean(),
-      DispatchReturn.find({ branch: req.branchId, items: { $elemMatch: itemElemMatch } }).select('returnNumber requestedAt status delivery salesOrder items postedAt').sort({ updatedAt: -1 }).limit(10).lean(),
-      StockAdjustment.find({ branch: req.branchId, status: { $in: ['submitted', 'approved', 'reversed'] }, lines: { $elemMatch: itemElemMatch } })
+      GRN.find({ branch: req.branchScope, status: 'posted', items: { $elemMatch: itemElemMatch } }).select('grnNumber grnDate supplier supplierName purchaseOrder poNumber items postedAt').sort({ postedAt: -1 }).limit(10).lean(),
+      PurchaseReturn.find({ branch: req.branchScope, status: { $in: ['debit_issued', 'reversed'] }, items: { $elemMatch: itemElemMatch } }).select('debitNoteNumber returnDate status supplier supplierName items approvalDate reversedAt').sort({ updatedAt: -1 }).limit(10).lean(),
+      SalesReturn.find({ branch: req.branchScope, status: { $in: ['credit_issued', 'refund_pending', 'replacement_pending', 'reversed'] }, items: { $elemMatch: itemElemMatch } }).select('returnNumber returnDate status dealer dealerName items approvalDate reversedAt').sort({ updatedAt: -1 }).limit(10).lean(),
+      DispatchReturn.find({ branch: req.branchScope, items: { $elemMatch: itemElemMatch } }).select('returnNumber requestedAt status delivery salesOrder items postedAt').sort({ updatedAt: -1 }).limit(10).lean(),
+      StockAdjustment.find({ branch: req.branchScope, status: { $in: ['submitted', 'approved', 'reversed'] }, lines: { $elemMatch: itemElemMatch } })
         .select('adjustmentNumber status reason remarks lines submittedAt approvedAt reversedAt postingVersion').sort({ updatedAt: -1 }).limit(10).lean(),
-      PhysicalStockAudit.find({ branch: req.branchId, status: { $in: ['submitted', 'approved', 'reversed'] }, lines: { $elemMatch: { stock: stock._id } } })
+      PhysicalStockAudit.find({ branch: req.branchScope, status: { $in: ['submitted', 'approved', 'reversed'] }, lines: { $elemMatch: { stock: stock._id } } })
         .select('auditNumber status warehouse scope baselineAt remarks lines submittedAt approvedAt reversedAt postingVersion').sort({ updatedAt: -1 }).limit(10).lean(),
     ]);
 
@@ -277,9 +277,9 @@ router.get('/:id/detail', async (req, res) => {
 router.get('/:id/movements', async (req, res) => {
   try {
     if (!mongoose.isValidObjectId(req.params.id)) throw apiError(422, 'stock id must be a valid identifier.');
-    const stock = await Stock.findOne({ _id: req.params.id, branch: req.branchId }).select('_id').lean();
+    const stock = await Stock.findOne({ _id: req.params.id, branch: req.branchScope }).select('_id').lean();
     if (!stock) throw apiError(404, 'Stock bucket not found in the active branch.');
-    const result = await listMovements(req.branchId, req.query, stock._id);
+    const result = await listMovements(req.branchScope, req.query, stock._id);
     return res.json({ success: true, stock: stock._id, ...result });
   } catch (error) { return handleError(res, error); }
 });

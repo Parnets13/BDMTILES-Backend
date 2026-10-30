@@ -43,7 +43,7 @@ router.get('/', async (req, res) => {
     const { page = 1, limit = 20, search, status } = req.query;
     const p = Math.max(1, parseInt(page));
     const l = Math.min(100, parseInt(limit) || 20);
-    const filter = { branch: req.branchId };
+    const filter = { branch: req.branchScope };
     if (search) { const r = new RegExp(search, 'i'); filter.$or = [{ dispatchNumber: r }, { vehicle: r }, { driverName: r }]; }
     if (status) filter.status = status;
     const [data, total] = await Promise.all([
@@ -61,7 +61,7 @@ router.get('/', async (req, res) => {
 // GET /api/v1/dispatch/stats
 router.get('/stats', async (req, res) => {
   try {
-    const scope = { branch: req.branchId };
+    const scope = { branch: req.branchScope };
     const [total, planned, inTransit, completed, cancelled] = await Promise.all([
       Dispatch.countDocuments(scope),
       Dispatch.countDocuments({ ...scope, status: 'planned' }),
@@ -78,7 +78,7 @@ router.get('/stats', async (req, res) => {
 // GET /api/v1/dispatch/pending-orders — orders ready for dispatch
 router.get('/pending-orders', async (req, res) => {
   try {
-    const orders = await SalesOrder.find({ branch: req.branchId, status: { $in: ['confirmed', 'processing', 'approved'] } })
+    const orders = await SalesOrder.find({ branch: req.branchScope, status: { $in: ['confirmed', 'processing', 'approved'] } })
       .select('orderNumber orderDate dealerName dealerCode deliveryAddress grandTotal expectedDeliveryDate items deliveryPriority')
       .sort({ deliveryPriority: 1, orderDate: 1 }).limit(100).lean();
     res.json({ success: true, data: orders });
@@ -88,7 +88,7 @@ router.get('/pending-orders', async (req, res) => {
 // GET /api/v1/dispatch/:id
 router.get('/:id', async (req, res) => {
   try {
-    const d = await Dispatch.findOne({ _id: req.params.id, branch: req.branchId })
+    const d = await Dispatch.findOne({ _id: req.params.id, branch: req.branchScope })
       .populate('route', 'name')
       .populate('warehouse', 'name')
       .populate('deliveryExecutive', 'name phone email status')
@@ -104,7 +104,7 @@ router.post('/', async (req, res) => {
     // Compatibility dispatches always begin in planning. Identity fields are
     // allow-listed here so callers cannot forge an executive or bypass status.
     const data = {
-      branch: req.branchId,
+      branch: req.branchScope,
       dispatchDate: req.body.dispatchDate,
       route: req.body.route,
       routeName: req.body.routeName,
@@ -120,7 +120,7 @@ router.post('/', async (req, res) => {
         vehicleId: req.body.vehicleRef || undefined,
         vehicleNumber: req.body.vehicleRef ? undefined : req.body.vehicle,
         allowBusy: true,
-        branchId: req.branchId,
+        branchId: req.branchScope,
       });
       data.vehicleRef = vehicle._id;
       data.vehicle = vehicle.vehicleNumber;
@@ -137,7 +137,7 @@ router.post('/', async (req, res) => {
     const dispatch = await Dispatch.create(data);
     if (salesOrderIds.length) {
       await SalesOrder.updateMany(
-        { _id: { $in: salesOrderIds }, branch: req.branchId },
+        { _id: { $in: salesOrderIds }, branch: req.branchScope },
         { $set: { status: 'partial_dispatch' } }
       );
     }
@@ -153,7 +153,7 @@ router.patch('/:id/status', async (req, res) => {
     if (!DISPATCH_STATUSES.has(status)) {
       return res.status(422).json({ success: false, message: 'Invalid dispatch status.' });
     }
-    const current = await Dispatch.findOne({ _id: req.params.id, branch: req.branchId }).lean();
+    const current = await Dispatch.findOne({ _id: req.params.id, branch: req.branchScope }).lean();
     if (!current) return res.status(404).json({ success: false, message: 'Not found.' });
     const salesOrderIds = await assertSalesOrdersInBranch(current.orders, req.branchId);
 
@@ -167,7 +167,7 @@ router.patch('/:id/status', async (req, res) => {
         vehicleNumber: req.body.vehicleRef ? undefined : req.body.vehicle,
         // A Dispatch is not a DispatchTrip, so it does not hold a trip slot.
         allowBusy: true,
-        branchId: req.branchId,
+        branchId: req.branchScope,
       });
       updates.vehicleRef = vehicle._id;
       updates.vehicle = vehicle.vehicleNumber;
@@ -187,14 +187,14 @@ router.patch('/:id/status', async (req, res) => {
     }
 
     const dispatch = await Dispatch.findOneAndUpdate(
-      { _id: current._id, branch: req.branchId },
+      { _id: current._id, branch: req.branchScope },
       updates,
       { new: true, runValidators: true }
     ).populate('deliveryExecutive', 'name phone email status');
     // If completed, mark all linked SOs as dispatched
     if ((status === 'completed' || status === 'in_transit') && salesOrderIds.length) {
       await SalesOrder.updateMany(
-        { _id: { $in: salesOrderIds }, branch: req.branchId },
+        { _id: { $in: salesOrderIds }, branch: req.branchScope },
         { $set: { status: status === 'completed' ? 'delivered' : 'dispatched' } }
       );
     }

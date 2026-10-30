@@ -175,7 +175,7 @@ router.get('/warehouses', requirePermission('quotation.management'), requireBran
     const p = Math.max(1, Number.parseInt(page, 10) || 1);
     const l = Math.min(100, Math.max(1, Number.parseInt(limit, 10) || 50));
 
-    const filter = { branch: req.branchId, status: 'active' };
+    const filter = { branch: req.branchScope, status: 'active' };
     if (search) {
       const regex = new RegExp(String(search).replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'i');
       filter.$or = [{ name: regex }, { warehouseCode: regex }];
@@ -262,7 +262,7 @@ router.get('/', requirePermission('quotation.management'), async (req, res) => {
     if (createdBy && req.user.role === 'sales_executive' && String(createdBy) !== String(req.user._id)) {
       throw routeError(403, 'Sales executives can only list their own quotations.');
     }
-    const filter = { branch: req.branchId, ...quotationActorScope(req) };
+    const filter = { branch: req.branchScope, ...quotationActorScope(req) };
     const conditions = [];
     const addTextCondition = (value, fields) => {
       if (!value) return;
@@ -326,7 +326,7 @@ router.get('/', requirePermission('quotation.management'), async (req, res) => {
       if (converted === 'true') candidates = candidates.filter(value => value.conversionState !== 'none');
       if (converted === 'false') candidates = candidates.filter(value => value.conversionState === 'none');
       if (stockStatuses.length) {
-        readinessByQuotation = await getQuotationReadinessMap({ branchId: req.branchId, quotations: candidates });
+        readinessByQuotation = await getQuotationReadinessMap({ branchId: req.branchScope, quotations: candidates });
         candidates = candidates.filter(value => stockStatuses.includes(readinessByQuotation.get(String(value._id))?.overallStatus));
       }
       total = candidates.length;
@@ -340,7 +340,7 @@ router.get('/', requirePermission('quotation.management'), async (req, res) => {
       ]);
       data = data.map(value => withQuotationValidity(value));
     }
-    if (!readinessByQuotation) readinessByQuotation = await getQuotationReadinessMap({ branchId: req.branchId, quotations: data });
+    if (!readinessByQuotation) readinessByQuotation = await getQuotationReadinessMap({ branchId: req.branchScope, quotations: data });
     const enriched = data.map(quotation => withQuotationReadiness(
       quotation,
       readinessByQuotation.get(String(quotation._id)),
@@ -364,7 +364,7 @@ router.get('/', requirePermission('quotation.management'), async (req, res) => {
 
 router.get('/stats', requirePermission('quotation.management'), async (req, res) => {
   try {
-    const scope = { branch: req.branchId, ...quotationActorScope(req) };
+    const scope = { branch: req.branchScope, ...quotationActorScope(req) };
     const quotations = await Quotation.find(scope)
       .select('_id branch items status approvalRequired approvalStatus approvalReasons approvalDate stockQueuedAt validUntil conversionState conversionVersion convertedToSO convertedSalesOrders createdAt grandTotal')
       .lean();
@@ -372,7 +372,7 @@ router.get('/stats', requirePermission('quotation.management'), async (req, res)
       .map(value => withQuotationValidity(value))
       .filter(value => value.status !== 'cancelled' && value.effectiveStatus !== 'expired');
     const readinessMap = await getQuotationReadinessMap({
-      branchId: req.branchId,
+      branchId: req.branchScope,
       quotations: readinessCandidates,
     });
     const statusCounts = Object.fromEntries(Object.keys(STATUS_TRANSITIONS).map(status => [status, 0]));
@@ -503,7 +503,7 @@ router.get('/product-browser', requireAnyPermission('sales.order.create', 'quota
     ]);
     const productIds = products.map((product) => product._id);
     const stockRows = productIds.length ? await Stock.aggregate([
-      { $match: { branch: req.branchId, product: { $in: productIds } } },
+      { $match: { branch: req.branchScope, product: { $in: productIds } } },
       { $group: {
         _id: '$product', totalQty: { $sum: '$totalQty' }, availableQty: { $sum: '$availableQty' },
         reservedQty: { $sum: '$reservedQty' }, blockedQty: { $sum: '$blockedQty' },
@@ -516,7 +516,7 @@ router.get('/product-browser', requireAnyPermission('sales.order.create', 'quota
     const stockByProduct = new Map(stockRows.map((row) => [String(row._id), row]));
     const data = await mapWithConcurrency(products, 6, async (product) => {
       const pricing = await resolvePricing({
-        branchId: req.branchId, dealerId: scope === 'dealer' ? dealerId : undefined,
+        branchId: req.branchScope, dealerId: scope === 'dealer' ? dealerId : undefined,
         dealerTypeId: scope === 'dealer_type' ? dealerTypeId : undefined,
         scope, product, quantity: qty, pricingDate: at,
         orderType: scope === 'walk_in' ? 'retail' : 'dealer',
@@ -627,7 +627,7 @@ router.get('/:id', requirePermission('quotation.management'), async (req, res) =
     if (!mongoose.isValidObjectId(req.params.id)) throw routeError(422, 'Quotation id is invalid.');
     const quotation = await Quotation.findOne({
       _id: req.params.id,
-      branch: req.branchId,
+      branch: req.branchScope,
       ...quotationActorScope(req),
     })
       .populate('branch', 'branchCode name city state address phone email gstin')
@@ -680,13 +680,13 @@ router.post('/', requirePermission('quotation.management'), async (req, res) => 
           throw routeError(403, 'Dealer order request review permission is required to create its quotation.');
         }
         if (!mongoose.isValidObjectId(sourceRequestId)) throw routeError(422, 'sourceDealerOrderRequest must be valid.');
-        sourceRequest = await DealerOrderRequest.findOne({ _id: sourceRequestId, branch: req.branchId }).session(session);
+        sourceRequest = await DealerOrderRequest.findOne({ _id: sourceRequestId, branch: req.branchScope }).session(session);
         if (!sourceRequest) throw routeError(404, 'Dealer order request not found.');
         if (sourceRequest.status === 'quotation_linked' || sourceRequest.sourceQuotation) {
           const existing = sourceRequest.sourceQuotation
             ? await Quotation.findOne({
               _id: sourceRequest.sourceQuotation,
-              branch: req.branchId,
+              branch: req.branchScope,
               sourceDealerOrderRequest: sourceRequest._id,
             }).session(session)
             : null;
@@ -724,7 +724,7 @@ router.post('/', requirePermission('quotation.management'), async (req, res) => 
       fields.items = await applyQuotationUomSnapshots(fields.items, { session, at: data.quotationDate });
       fields.items = await applyQuotationStockSnapshot(fields.items, req.branchId, { session });
       Object.assign(data, fields, {
-        branch: req.branchId,
+        branch: req.branchScope,
         createdBy: req.user._id,
         snapshotCaptured: true,
         stockSnapshotAt,
@@ -741,7 +741,7 @@ router.post('/', requirePermission('quotation.management'), async (req, res) => 
         const linked = await DealerOrderRequest.findOneAndUpdate(
           {
             _id: sourceRequest._id,
-            branch: req.branchId,
+            branch: req.branchScope,
             status: 'approved',
             revision: sourceRequest.revision,
             sourceQuotation: { $exists: false },
@@ -761,7 +761,7 @@ router.post('/', requirePermission('quotation.management'), async (req, res) => 
       }
 
       await syncAutomaticApprovalRequest({
-        branchId: req.branchId,
+        branchId: req.branchScope,
         type: 'quotation',
         referenceModel: 'Quotation',
         referenceId: quotation._id,
@@ -792,7 +792,7 @@ router.put('/:id', requirePermission('quotation.management'), async (req, res) =
   try {
     let quotation;
     await session.withTransaction(async () => {
-      quotation = await Quotation.findOne({ _id: req.params.id, branch: req.branchId, ...quotationActorScope(req) }).session(session);
+      quotation = await Quotation.findOne({ _id: req.params.id, branch: req.branchScope, ...quotationActorScope(req) }).session(session);
       if (!quotation) throw routeError(404, 'Quotation not found.');
       if (!['draft', 'pending_approval'].includes(quotation.status)) throw routeError(409, `Cannot edit quotation in "${quotation.status}" status.`);
       const updates = editableBody(req.body);
@@ -803,7 +803,7 @@ router.put('/:id', requirePermission('quotation.management'), async (req, res) =
       if (quotation.sourceDealerOrderRequest) {
         const sourceRequest = await DealerOrderRequest.findOne({
           _id: quotation.sourceDealerOrderRequest,
-          branch: req.branchId,
+          branch: req.branchScope,
           status: 'quotation_linked',
           sourceQuotation: quotation._id,
         }).session(session);
@@ -831,7 +831,7 @@ router.put('/:id', requirePermission('quotation.management'), async (req, res) =
       if (quotation.tallySyncStatus === 'synced') quotation.tallySyncStatus = 'pending';
       await quotation.save({ session });
       await syncAutomaticApprovalRequest({
-        branchId: req.branchId,
+        branchId: req.branchScope,
         type: 'quotation',
         referenceModel: 'Quotation',
         referenceId: quotation._id,
@@ -862,7 +862,7 @@ router.patch('/:id/validity', requirePermission('quotation.management'), async (
     const newValidUntil = effectiveValidUntil(requestedValidUntil);
     const current = await Quotation.findOne({
       _id: req.params.id,
-      branch: req.branchId,
+      branch: req.branchScope,
       ...quotationActorScope(req),
     });
     if (!current) throw routeError(404, 'Quotation not found.');
@@ -903,7 +903,7 @@ router.patch('/:id/validity', requirePermission('quotation.management'), async (
     const quotation = await Quotation.findOneAndUpdate(
       {
         _id: current._id,
-        branch: req.branchId,
+        branch: req.branchScope,
         updatedAt: expectedUpdatedAt,
         ...quotationActorScope(req),
       },
@@ -930,7 +930,7 @@ router.patch('/:id/status', requirePermission('quotation.management'), async (re
     const { status } = req.body;
     let quotation;
     await session.withTransaction(async () => {
-      const current = await Quotation.findOne({ _id: req.params.id, branch: req.branchId, ...quotationActorScope(req) }).session(session);
+      const current = await Quotation.findOne({ _id: req.params.id, branch: req.branchScope, ...quotationActorScope(req) }).session(session);
       if (!current) throw routeError(404, 'Quotation not found.');
       if (current.conversionState === 'partial' && status !== 'cancelled') {
         throw routeError(409, 'A partially converted quotation must remain in its FIFO queue until fully converted or explicitly cancelled.');
@@ -951,7 +951,7 @@ router.patch('/:id/status', requirePermission('quotation.management'), async (re
       const statusFields = { status };
       if (['approved', 'accepted'].includes(status) && !current.stockQueuedAt) statusFields.stockQueuedAt = new Date();
       quotation = await Quotation.findOneAndUpdate(
-        { _id: current._id, branch: req.branchId, status: current.status, updatedAt: current.updatedAt, ...quotationActorScope(req) },
+        { _id: current._id, branch: req.branchScope, status: current.status, updatedAt: current.updatedAt, ...quotationActorScope(req) },
         { $set: statusFields },
         { new: true, runValidators: true, session }
       );
@@ -968,7 +968,7 @@ router.patch('/:id/status', requirePermission('quotation.management'), async (re
           });
         }
         await syncAutomaticApprovalRequest({
-          branchId: req.branchId,
+          branchId: req.branchScope,
           type: 'quotation',
           referenceModel: 'Quotation',
           referenceId: quotation._id,
@@ -1012,7 +1012,7 @@ router.post('/:id/convert', requirePermission('quotation.management'), requirePe
   });
   const findReplay = (session = null) => findConversionReplay({
     quotationId: req.params.id,
-    branchId: req.branchId,
+    branchId: req.branchScope,
     sourceKey,
     fingerprint,
     actorScope,
@@ -1030,7 +1030,7 @@ router.post('/:id/convert', requirePermission('quotation.management'), requirePe
   // permanent 405), so this is the only place the sales.order.<type> permissions can
   // bind. Checked before the transaction opens so a refusal costs nothing.
   try {
-    const quotation = await Quotation.findOne({ _id: req.params.id, branch: req.branchId })
+    const quotation = await Quotation.findOne({ _id: req.params.id, branch: req.branchScope })
       .select('customerType dealer')
       .populate({ path: 'dealer', select: 'dealerType', populate: { path: 'dealerType', select: 'pricingTier' } })
       .lean();
@@ -1061,7 +1061,7 @@ router.post('/:id/convert', requirePermission('quotation.management'), requirePe
       }
       result = await convertQuotationCore({
         quotationId: req.params.id,
-        branchId: req.branchId,
+        branchId: req.branchScope,
         actor: req.user,
         actorScope,
         mode,
@@ -1126,7 +1126,7 @@ router.post('/:id/conversions/:conversionId/reverse', requirePermission('quotati
       conversion = await QuotationConversion.findOne({
         _id: req.params.conversionId,
         quotation: req.params.id,
-        branch: req.branchId,
+        branch: req.branchScope,
       }).session(session);
       if (!conversion) throw routeError(404, 'Quotation conversion not found.');
       if (conversion.status === 'voided') {
@@ -1136,17 +1136,17 @@ router.post('/:id/conversions/:conversionId/reverse', requirePermission('quotati
         assertIdempotentReplay({ requestFingerprint: conversion.reversalRequestFingerprint }, fingerprint);
         quotation = await Quotation.findOne({
           _id: req.params.id,
-          branch: req.branchId,
+          branch: req.branchScope,
           ...quotationActorScope(req),
         }).session(session);
-        salesOrder = await SalesOrder.findOne({ _id: conversion.salesOrder, branch: req.branchId }).session(session);
+        salesOrder = await SalesOrder.findOne({ _id: conversion.salesOrder, branch: req.branchScope }).session(session);
         idempotent = true;
         return;
       }
 
       salesOrder = await SalesOrder.findOne({
         _id: conversion.salesOrder,
-        branch: req.branchId,
+        branch: req.branchScope,
         sourceQuotation: req.params.id,
       }).session(session);
       if (!salesOrder) throw routeError(409, 'Linked Sales Order could not be verified.');
@@ -1158,7 +1158,7 @@ router.post('/:id/conversions/:conversionId/reverse', requirePermission('quotati
 
       const current = await Quotation.findOne({
         _id: req.params.id,
-        branch: req.branchId,
+        branch: req.branchScope,
         ...quotationActorScope(req),
       }).session(session).lean();
       if (!current) throw routeError(404, 'Quotation not found.');
@@ -1177,7 +1177,7 @@ router.post('/:id/conversions/:conversionId/reverse', requirePermission('quotati
       });
       const anyConverted = nextItems.some(item => Number(item.convertedQuantity || 0) > 0.0001);
       const activeConversions = await QuotationConversion.find({
-        branch: req.branchId,
+        branch: req.branchScope,
         quotation: current._id,
         _id: { $ne: conversion._id },
         status: { $ne: 'voided' },
@@ -1189,7 +1189,7 @@ router.post('/:id/conversions/:conversionId/reverse', requirePermission('quotati
       quotation = await Quotation.findOneAndUpdate(
         {
           _id: current._id,
-          branch: req.branchId,
+          branch: req.branchScope,
           ...quotationActorScope(req),
           ...versionScope,
         },
@@ -1207,7 +1207,7 @@ router.post('/:id/conversions/:conversionId/reverse', requirePermission('quotati
       );
       if (!quotation) throw routeError(409, 'Quotation changed before reversal; refresh and retry.');
       const reversed = await QuotationConversion.findOneAndUpdate(
-        { _id: conversion._id, branch: req.branchId, status: { $ne: 'voided' } },
+        { _id: conversion._id, branch: req.branchScope, status: { $ne: 'voided' } },
         {
           $set: {
             status: 'voided',
@@ -1242,13 +1242,13 @@ router.post('/:id/conversions/:conversionId/reverse', requirePermission('quotati
 
 router.delete('/:id', requirePermission('quotation.management'), async (req, res) => {
   try {
-    const existing = await Quotation.findOne({ _id: req.params.id, branch: req.branchId, ...quotationActorScope(req) }).lean();
+    const existing = await Quotation.findOne({ _id: req.params.id, branch: req.branchScope, ...quotationActorScope(req) }).lean();
     if (!existing) throw routeError(404, 'Quotation not found.');
     if (existing.sourceDealerOrderRequest) throw routeError(409, 'A quotation linked to an approved dealer order request cannot be deleted.');
     if (!['draft', 'cancelled'].includes(existing.status)) throw routeError(409, 'Only draft or cancelled quotations can be deleted.');
     const { safeDelete } = await import('../middleware/safeDelete.js');
     const result = await safeDelete(Quotation, req.params.id, {
-      user: req.user, module: 'quotation', titleField: 'dealerName', codeField: 'quotationNumber', scope: { branch: req.branchId, ...quotationActorScope(req) },
+      user: req.user, module: 'quotation', titleField: 'dealerName', codeField: 'quotationNumber', scope: { branch: req.branchScope, ...quotationActorScope(req) },
     });
     return res.status(result.status || 200).json(result);
   } catch (error) { return res.status(error.status || (['CastError', 'ValidationError'].includes(error.name) ? 422 : 500)).json({ success: false, message: error.message }); }
@@ -1262,7 +1262,7 @@ router.get('/:id/check-stock', requirePermission('quotation.management'), async 
     if (!mongoose.isValidObjectId(req.params.id)) throw routeError(422, 'Quotation id is invalid.');
     const quotation = await Quotation.findOne({
       _id: req.params.id,
-      branch: req.branchId,
+      branch: req.branchScope,
       ...quotationActorScope(req),
     }).lean();
     if (!quotation) return res.status(404).json({ success: false, message: 'Quotation not found.' });
@@ -1327,7 +1327,7 @@ const splitPlanDto = plan => ({
 async function loadHoldTarget(req, session = null) {
   let query = Quotation.findOne({
     _id: req.params.id,
-    branch: req.branchId,
+    branch: req.branchScope,
     ...quotationActorScope(req),
   });
   if (session) query = query.session(session);
@@ -1343,7 +1343,7 @@ router.get('/:id/split-preview', requirePermission('quotation.management'), asyn
   try {
     const quotation = await Quotation.findOne({
       _id: req.params.id,
-      branch: req.branchId,
+      branch: req.branchScope,
       ...quotationActorScope(req),
     }).lean();
     if (!quotation) throw routeError(404, 'Quotation not found.');
@@ -1600,7 +1600,7 @@ router.patch('/:id/hold/extend', requirePermission('quotation.management'), asyn
     }
     const version = Math.max(1, Number(current.holdExpiryVersion || 0)) + 1;
     const quotation = await Quotation.findOneAndUpdate(
-      { _id: current._id, branch: req.branchId, holdExpiryVersion: current.holdExpiryVersion, ...quotationActorScope(req) },
+      { _id: current._id, branch: req.branchScope, holdExpiryVersion: current.holdExpiryVersion, ...quotationActorScope(req) },
       {
         $set: {
           holdExpiresAt: requested,
@@ -1634,7 +1634,7 @@ router.get('/:id/split-family', requirePermission('quotation.management'), async
   try {
     const quotation = await Quotation.findOne({
       _id: req.params.id,
-      branch: req.branchId,
+      branch: req.branchScope,
       ...quotationActorScope(req),
     }).select('branch splitGroupId splitRole splitFromQuotation splitQuotations').lean();
     if (!quotation) throw routeError(404, 'Quotation not found.');

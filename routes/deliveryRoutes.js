@@ -28,7 +28,7 @@ router.patch('/:id/fail', requirePermission('delivery.fail'));
 const terminalStatuses = ['delivered', 'partially_delivered', 'failed'];
 const isSupervisor = user => String(user?.role ?? '').toLowerCase() === 'supervisor';
 const deliveryScope = req => ({
-  branch: req.branchId,
+  branch: req.branchScope,
   ...(!isSupervisor(req.user) ? { deliveryExecutive: req.user._id } : {}),
 });
 const findAccessibleDelivery = (req, id) => Delivery.findOne({ _id: id, ...deliveryScope(req) });
@@ -140,17 +140,17 @@ router.post('/', async (req, res) => {
     }
     const trip = await DispatchTrip.findOne({
       _id: req.body.dispatchTrip,
-      branch: req.branchId,
+      branch: req.branchScope,
       status: { $in: ['dispatched', 'in_transit'] },
       'orders.salesOrder': req.body.salesOrder,
       stockDeductedAt: { $ne: null },
     });
     if (!trip) return res.status(409).json({ success: false, message: 'Delivery can only be assigned after the linked trip is dispatched and stock is consumed.' });
     const tripOrder = trip.orders.find(order => String(order.salesOrder) === String(req.body.salesOrder));
-    const salesOrder = await SalesOrder.findOne({ _id: req.body.salesOrder, branch: req.branchId }).lean();
+    const salesOrder = await SalesOrder.findOne({ _id: req.body.salesOrder, branch: req.branchScope }).lean();
     if (!tripOrder || !salesOrder) return res.status(404).json({ success: false, message: 'Linked trip order or sales order was not found.' });
 
-    const existing = await Delivery.findOne({ branch: req.branchId, dispatchTrip: trip._id, salesOrder: salesOrder._id });
+    const existing = await Delivery.findOne({ branch: req.branchScope, dispatchTrip: trip._id, salesOrder: salesOrder._id });
     if (existing) {
       // Assignment identity is owned by the trip/vehicle relationship. Do not
       // accept a client-supplied name that can disagree with User Management.
@@ -160,7 +160,7 @@ router.post('/', async (req, res) => {
       return res.json({ success: true, message: `Delivery ${existing.deliveryNumber} assignment updated.`, data: safeDelivery(existing) });
     }
 
-    const pickList = tripOrder.pickList ? await PickList.findOne({ _id: tripOrder.pickList, branch: req.branchId }).lean() : null;
+    const pickList = tripOrder.pickList ? await PickList.findOne({ _id: tripOrder.pickList, branch: req.branchScope }).lean() : null;
     const unfulfilledQty = pickList?.items?.reduce((sum, item) => sum + Number(item.shortQty || 0) + Number(item.damagedQty || 0), 0) || 0;
     const deliveryItems = (pickList?.items || []).filter(item => Number(item.dispatchedQty || 0) > QUANTITY_TOLERANCE).map(item => ({
       pickList: pickList._id, pickListItem: item._id, salesOrderItem: item.salesOrderItem,
@@ -173,7 +173,7 @@ router.post('/', async (req, res) => {
     const deliveryNumber = await generateBranchNumber(req.branchId, 'delivery', new Date());
     const delivery = await Delivery.create({
       deliveryNumber,
-      branch: req.branchId,
+      branch: req.branchScope,
       salesOrder: salesOrder._id,
       orderNumber: tripOrder.orderNumber || salesOrder.orderNumber,
       dispatchTrip: trip._id,

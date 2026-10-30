@@ -20,6 +20,11 @@ router.get('/', requirePermission('dealer.master'), async (req, res) => {
     if (status) filter.status = status;
     if (source) filter.source = source;
 
+    // NOTE: customers are intentionally NOT branch-filtered. `Customer` has no
+    // branch column and none of the current rows carry an assigned sales
+    // executive, so any branch predicate empties the list in every branch. The
+    // dealer master does carry that link and is filtered (see masterRoutes).
+
     const [data, total] = await Promise.all([
       Customer.find(filter).sort({ createdAt: -1 }).skip((p-1)*l).limit(l)
         .populate('assignedSalesExecutive', 'name').lean(),

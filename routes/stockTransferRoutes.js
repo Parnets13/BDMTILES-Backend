@@ -40,7 +40,7 @@ router.get('/', async (req, res) => {
     const { page = 1, limit = 20, search, status, fromWarehouse, toWarehouse } = req.query;
     const p = Math.max(1, Number.parseInt(page, 10) || 1);
     const l = Math.min(100, Number.parseInt(limit, 10) || 20);
-    const branchScope = { $or: [{ sourceBranch: req.branchId }, { destinationBranch: req.branchId }] };
+    const branchScope = { $or: [{ sourceBranch: req.branchScope }, { destinationBranch: req.branchScope }] };
     const clauses = [branchScope];
     if (search) {
       const regex = new RegExp(escapeRegex(search), 'i');
@@ -68,7 +68,7 @@ router.get('/', async (req, res) => {
 
 router.get('/stats', async (req, res) => {
   try {
-    const scope = { $or: [{ sourceBranch: req.branchId }, { destinationBranch: req.branchId }] };
+    const scope = { $or: [{ sourceBranch: req.branchScope }, { destinationBranch: req.branchScope }] };
     const [total, requested, approved, dispatched, inTransit, received, completed, rejected, cancelled] = await Promise.all([
       StockTransfer.countDocuments(scope),
       StockTransfer.countDocuments({ ...scope, status: 'requested' }),
@@ -90,7 +90,7 @@ router.get('/:id', async (req, res) => {
   try {
     const transfer = await StockTransfer.findOne({
       _id: req.params.id,
-      $or: [{ sourceBranch: req.branchId }, { destinationBranch: req.branchId }],
+      $or: [{ sourceBranch: req.branchScope }, { destinationBranch: req.branchScope }],
     })
       .populate('fromWarehouse', 'name address')
       .populate('toWarehouse', 'name address')
@@ -198,7 +198,7 @@ router.patch('/:id/approve', async (req, res) => {
     await session.withTransaction(async () => {
       const { action, remarks } = req.body;
       if (!['approve', 'reject'].includes(action)) throw routeError(422, 'action must be approve or reject.');
-      transfer = await StockTransfer.findOne({ _id: req.params.id, sourceBranch: req.branchId }).session(session);
+      transfer = await StockTransfer.findOne({ _id: req.params.id, sourceBranch: req.branchScope }).session(session);
       if (!transfer) throw routeError(404, 'Not found in the active source branch.');
       if (transfer.status === (action === 'approve' ? 'approved' : 'rejected')) return;
       if (transfer.status !== 'requested') throw routeError(409, `Cannot ${action}; status is ${transfer.status}.`);
@@ -255,7 +255,7 @@ router.patch('/:id/dispatch', async (req, res) => {
   try {
     let transfer;
     await session.withTransaction(async () => {
-      transfer = await StockTransfer.findOne({ _id: req.params.id, sourceBranch: req.branchId }).session(session);
+      transfer = await StockTransfer.findOne({ _id: req.params.id, sourceBranch: req.branchScope }).session(session);
       if (!transfer) throw routeError(404, 'Not found in the active source branch.');
       if (transfer.status !== 'approved') throw routeError(409, 'Transfer must be approved first.');
 
@@ -393,7 +393,7 @@ router.patch('/:id/receive', async (req, res) => {
   try {
     let transfer;
     await session.withTransaction(async () => {
-      transfer = await StockTransfer.findOne({ _id: req.params.id, destinationBranch: req.branchId }).session(session);
+      transfer = await StockTransfer.findOne({ _id: req.params.id, destinationBranch: req.branchScope }).session(session);
       if (!transfer) throw routeError(404, 'Not found in the active destination branch.');
       if (transfer.status !== 'in_transit') throw routeError(409, 'Transfer must be in transit.');
 
@@ -511,7 +511,7 @@ router.patch('/:id/cancel', async (req, res) => {
   try {
     let transfer;
     await session.withTransaction(async () => {
-      transfer = await StockTransfer.findOne({ _id: req.params.id, sourceBranch: req.branchId }).session(session);
+      transfer = await StockTransfer.findOne({ _id: req.params.id, sourceBranch: req.branchScope }).session(session);
       if (!transfer) throw routeError(404, 'Not found in the active source branch.');
       if (transfer.status === 'cancelled') return;
       if (!['requested', 'approved'].includes(transfer.status)) {

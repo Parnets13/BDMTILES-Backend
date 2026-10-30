@@ -213,9 +213,19 @@ router.get('/', async (req, res) => {
       effectiveBranch = firstBranch?._id || null;
     }
 
-    const branchScope = effectiveBranch && mongoose.isValidObjectId(effectiveBranch)
-      ? { branch: new mongoose.Types.ObjectId(String(effectiveBranch)) }
-      : {};
+    // "All Branches" must sum stock across every branch the user may read. The
+    // fallback chain below deliberately lands on ONE branch (needed for dealer
+    // pricing), so the stock scope has to be widened before it is used —
+    // otherwise the All Branches view silently reported the default branch's
+    // balance and looked identical to a single branch.
+    const allBranchesStockScope = req.allBranches && req.branchIds?.length
+      ? { branch: { $in: req.branchIds.map((id) => new mongoose.Types.ObjectId(String(id))) } }
+      : null;
+
+    const branchScope = allBranchesStockScope
+      || (effectiveBranch && mongoose.isValidObjectId(effectiveBranch)
+        ? { branch: new mongoose.Types.ObjectId(String(effectiveBranch)) }
+        : {});
     const productIds = products.map((product) => product._id);
     const stockRows = productIds.length ? await Stock.aggregate([
       { $match: { ...branchScope, product: { $in: productIds } } },
@@ -442,7 +452,7 @@ router.post('/options', async (req, res) => {
     }
 
     await ProductOption.create({
-      branch: req.branchId,
+      branch: req.branchScope,
       field,
       value,
       createdBy: req.user?._id,
@@ -488,7 +498,7 @@ router.delete('/options/:id', async (req, res) => {
     if (!mongoose.isValidObjectId(req.params.id)) {
       return res.status(422).json({ success: false, message: 'Invalid option id.' });
     }
-    const option = await ProductOption.findOne({ _id: req.params.id, branch: req.branchId }).lean();
+    const option = await ProductOption.findOne({ _id: req.params.id, branch: req.branchScope }).lean();
     if (!option) {
       return res.status(404).json({
         success: false,
@@ -498,7 +508,7 @@ router.delete('/options/:id', async (req, res) => {
 
     const usageFilter = productUsageFilter(option.field, option.value);
     const inUse = usageFilter
-      ? await Product.countDocuments({ branch: req.branchId, ...usageFilter })
+      ? await Product.countDocuments({ branch: req.branchScope, ...usageFilter })
       : 0;
 
     if (inUse > 0) {
@@ -559,9 +569,16 @@ router.get('/:id', async (req, res) => {
       effectiveBranch = firstBranch?._id || null;
     }
 
-    const branchScope = effectiveBranch && mongoose.isValidObjectId(effectiveBranch)
-      ? { branch: new mongoose.Types.ObjectId(String(effectiveBranch)), product: new mongoose.Types.ObjectId(String(product._id)) }
-      : { product: new mongoose.Types.ObjectId(String(product._id)) };
+    // Same widening as the list route: All Branches = stock from every branch.
+    const allBranchesStockScope = req.allBranches && req.branchIds?.length
+      ? { branch: { $in: req.branchIds.map((id) => new mongoose.Types.ObjectId(String(id))) } }
+      : null;
+
+    const branchScope = allBranchesStockScope
+      ? { ...allBranchesStockScope, product: new mongoose.Types.ObjectId(String(product._id)) }
+      : effectiveBranch && mongoose.isValidObjectId(effectiveBranch)
+        ? { branch: new mongoose.Types.ObjectId(String(effectiveBranch)), product: new mongoose.Types.ObjectId(String(product._id)) }
+        : { product: new mongoose.Types.ObjectId(String(product._id)) };
 
     const stockRows = await Stock.aggregate([
       { $match: branchScope },
@@ -811,6 +828,56 @@ router.post('/bulk-price-update', canUpdateProduct, async (req, res) => {
     }
 
     res.json({ success: true, message: `${updatedCount} products updated.`, data: { updatedCount, totalFound: products.length } });
+  } catch (error) {
+    res.status(500).json({ success: false, message: error.message });
+  }
+});
+
+// PATCH /api/v1/products/bulk-min-stock — set minStockLevel and/or reorderLevel for many products at once
+// Body: { updates: [{ productId, minStockLevel, reorderLevel }] }
+// Each row may omit either field; only the supplied fields are written.
+// Useful for the Min Stock grid editor rather than opening each product's full form.
+router.patch('/bulk-min-stock', canUpdateProduct, async (req, res) => {
+  try {
+    const { updates } = req.body;
+    if (!Array.isArray(updates) || updates.length === 0) {
+      return res.status(400).json({ success: false, message: 'Provide an "updates" array.' });
+    }
+    if (updates.length > 500) {
+      return res.status(400).json({ success: false, message: 'Maximum 500 rows per request.' });
+    }
+
+    let updatedCount = 0;
+    const errors = [];
+
+    for (const row of updates) {
+      if (!mongoose.isValidObjectId(row.productId)) {
+        errors.push({ productId: row.productId, error: 'Invalid id.' });
+        continue;
+      }
+      const patch = {};
+      if (row.minStockLevel !== undefined) {
+        const v = Number(row.minStockLevel);
+        if (isNaN(v) || v < 0) { errors.push({ productId: row.productId, error: 'minStockLevel must be ≥ 0.' }); continue; }
+        patch.minStockLevel = v;
+      }
+      if (row.reorderLevel !== undefined) {
+        const v = Number(row.reorderLevel);
+        if (isNaN(v) || v < 0) { errors.push({ productId: row.productId, error: 'reorderLevel must be ≥ 0.' }); continue; }
+        patch.reorderLevel = v;
+      }
+      if (Object.keys(patch).length === 0) continue;
+
+      const result = await Product.updateOne({ _id: row.productId }, { $set: patch });
+      if (result.matchedCount) updatedCount++;
+      else errors.push({ productId: row.productId, error: 'Product not found.' });
+    }
+
+    res.json({
+      success: true,
+      message: `${updatedCount} product${updatedCount === 1 ? '' : 's'} updated.`,
+      data: { updatedCount, errors },
+    });
   } catch (error) {
     res.status(500).json({ success: false, message: error.message });
   }

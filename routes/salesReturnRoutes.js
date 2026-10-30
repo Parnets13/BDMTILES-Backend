@@ -148,7 +148,7 @@ router.get('/', requirePermission('credit.note'), async (req, res) => {
     const { page = 1, limit = 20, search, status, dealer } = req.query;
     const p = Math.max(1, Number.parseInt(page, 10) || 1);
     const l = Math.min(100, Number.parseInt(limit, 10) || 20);
-    const filter = { branch: req.branchId };
+    const filter = { branch: req.branchScope };
     if (search) {
       const escaped = String(search).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
       const regex = new RegExp(escaped, 'i');
@@ -173,7 +173,7 @@ router.get('/', requirePermission('credit.note'), async (req, res) => {
 
 router.get('/stats', requirePermission('credit.note'), async (req, res) => {
   try {
-    const scope = { branch: req.branchId };
+    const scope = { branch: req.branchScope };
     const [total, draft, approved, creditIssued, refundPending, replacementPending, cancelled, reversed, totalValue] = await Promise.all([
       SalesReturn.countDocuments(scope),
       SalesReturn.countDocuments({ ...scope, status: 'draft' }),
@@ -200,7 +200,7 @@ router.get('/stats', requirePermission('credit.note'), async (req, res) => {
 router.get('/orders-for-dealer/:dealerId', requirePermission('credit.note'), async (req, res) => {
   try {
     const invoices = await Invoice.find({
-      branch: req.branchId,
+      branch: req.branchScope,
       dealer: req.params.dealerId,
       status: { $in: ACTIVE_INVOICE_STATUSES },
       invoiceType: 'tax_invoice',
@@ -210,14 +210,14 @@ router.get('/orders-for-dealer/:dealerId', requirePermission('credit.note'), asy
       .sort({ invoiceDate: -1 }).limit(50).lean();
     const eligibleOrders = await SalesOrder.find({
       _id: { $in: invoices.map((invoice) => invoice.salesOrder) },
-      branch: req.branchId,
+      branch: req.branchScope,
       dealer: req.params.dealerId,
       status: { $in: ['dispatched', 'delivered', 'partially_closed', 'partial_dispatch'] },
     }).select('_id').lean();
     const eligibleOrderIds = new Set(eligibleOrders.map((order) => String(order._id)));
     const eligibleInvoices = invoices.filter((invoice) => eligibleOrderIds.has(String(invoice.salesOrder)));
     const existing = await SalesReturn.find({
-      branch: req.branchId,
+      branch: req.branchScope,
       dealer: req.params.dealerId,
       invoice: { $in: eligibleInvoices.map((invoice) => invoice._id) },
       status: { $nin: ['cancelled', 'reversed'] },
@@ -254,7 +254,7 @@ router.get('/orders-for-dealer/:dealerId', requirePermission('credit.note'), asy
 
 router.get('/:id', requirePermission('credit.note'), async (req, res) => {
   try {
-    const salesReturn = await SalesReturn.findOne({ _id: req.params.id, branch: req.branchId })
+    const salesReturn = await SalesReturn.findOne({ _id: req.params.id, branch: req.branchScope })
       .populate('dealer', 'businessName dealerCode mobile city')
       .populate('salesOrder', 'orderNumber orderDate grandTotal items')
       .populate('invoice', 'invoiceNumber invoiceDate status')
@@ -276,7 +276,7 @@ router.post('/', requirePermission('credit.note'), async (req, res) => {
   const sourceKey = `${String(req.branchId)}:${rawIdempotencyKey}`;
   const requestFingerprint = fingerprintRequest(req.body);
   try {
-    const existingReturn = await SalesReturn.findOne({ branch: req.branchId, sourceKey });
+    const existingReturn = await SalesReturn.findOne({ branch: req.branchScope, sourceKey });
     if (existingReturn) {
       if (existingReturn.requestFingerprint && existingReturn.requestFingerprint !== requestFingerprint) {
         throw routeError(409, 'This Idempotency-Key was already used with a different request payload.');
@@ -287,10 +287,10 @@ router.post('/', requirePermission('credit.note'), async (req, res) => {
     if (!dealer) throw routeError(404, 'Dealer not found.');
     if (!req.body.salesOrder || !req.body.invoice) throw routeError(422, 'An active sales invoice is required.');
     const [order, invoice] = await Promise.all([
-      SalesOrder.findOne({ _id: req.body.salesOrder, branch: req.branchId, dealer: dealer._id }).lean(),
+      SalesOrder.findOne({ _id: req.body.salesOrder, branch: req.branchScope, dealer: dealer._id }).lean(),
       Invoice.findOne({
         _id: req.body.invoice,
-        branch: req.branchId,
+        branch: req.branchScope,
         dealer: dealer._id,
         status: { $in: ACTIVE_INVOICE_STATUSES },
         invoiceType: 'tax_invoice',
@@ -308,7 +308,7 @@ router.post('/', requirePermission('credit.note'), async (req, res) => {
 
     const data = {
       ...req.body,
-      branch: req.branchId,
+      branch: req.branchScope,
       dealer: dealer._id,
       dealerName: dealer.businessName,
       dealerCode: dealer.dealerCode,
@@ -352,7 +352,7 @@ router.post('/', requirePermission('credit.note'), async (req, res) => {
     return res.status(201).json({ success: true, message: 'Invoice-linked Sales Return created.', data: salesReturn });
   } catch (error) {
     if (error.code === 11000) {
-      const existingReturn = await SalesReturn.findOne({ branch: req.branchId, sourceKey });
+      const existingReturn = await SalesReturn.findOne({ branch: req.branchScope, sourceKey });
       if (existingReturn) {
         if (existingReturn.requestFingerprint && existingReturn.requestFingerprint !== requestFingerprint) {
           return res.status(409).json({ success: false, message: 'This Idempotency-Key was already used with a different request payload.' });
@@ -370,11 +370,11 @@ router.patch('/:id/approve', requirePermission('credit.note'), async (req, res) 
   try {
     let salesReturn;
     await session.withTransaction(async () => {
-      const current = await SalesReturn.findOne({ _id: req.params.id, branch: req.branchId }).session(session);
+      const current = await SalesReturn.findOne({ _id: req.params.id, branch: req.branchScope }).session(session);
       if (!current) throw routeError(404, 'Sales Return not found.');
       salesReturn = await approveSalesReturn({
         current,
-        branchId: req.branchId,
+        branchId: req.branchScope,
         approver: req.user._id,
         remarks: req.body.remarks,
         session,
@@ -396,7 +396,7 @@ router.patch('/:id/reverse', requirePermission('credit.note'), async (req, res) 
   try {
     let salesReturn;
     await session.withTransaction(async () => {
-      const current = await SalesReturn.findOne({ _id: req.params.id, branch: req.branchId }).session(session);
+      const current = await SalesReturn.findOne({ _id: req.params.id, branch: req.branchScope }).session(session);
       if (!current) throw routeError(404, 'Sales Return not found.');
       if (current.status === 'reversed') {
         salesReturn = current;
@@ -410,7 +410,7 @@ router.patch('/:id/reverse', requirePermission('credit.note'), async (req, res) 
         throw routeError(403, 'Maker-checker violation: the Sales Return creator or approver cannot reverse it.');
       }
 
-      const order = await SalesOrder.findOne({ _id: current.salesOrder, branch: req.branchId }).session(session);
+      const order = await SalesOrder.findOne({ _id: current.salesOrder, branch: req.branchScope }).session(session);
       if (!order) throw routeError(409, 'The source Sales Order is unavailable for return reversal.');
       await lockSalesReturnLineage(current.items, req.branchId, session);
       for (const item of current.items) {
@@ -449,7 +449,7 @@ router.patch('/:id/reverse', requirePermission('credit.note'), async (req, res) 
       if (current.adjustmentType === 'credit_note' && current.grandTotal > 0) {
         await postSubledgerEntry({
           session,
-          branch: req.branchId,
+          branch: req.branchScope,
           partyType: 'dealer',
           partyId: current.dealer,
           postingKey: `sales-return:${current._id}:credit-note:reversal`,
@@ -504,12 +504,12 @@ router.patch('/:id/reverse', requirePermission('credit.note'), async (req, res) 
 router.patch('/:id/cancel', requirePermission('credit.note'), async (req, res) => {
   try {
     const salesReturn = await SalesReturn.findOneAndUpdate(
-      { _id: req.params.id, branch: req.branchId, status: 'draft' },
+      { _id: req.params.id, branch: req.branchScope, status: 'draft' },
       { $set: { status: 'cancelled' } },
       { new: true, runValidators: true }
     );
     if (salesReturn) return res.json({ success: true, message: 'Sales Return cancelled.', data: salesReturn });
-    const current = await SalesReturn.findOne({ _id: req.params.id, branch: req.branchId });
+    const current = await SalesReturn.findOne({ _id: req.params.id, branch: req.branchScope });
     if (!current) return res.status(404).json({ success: false, message: 'Sales Return not found.' });
     if (current.status === 'cancelled') return res.json({ success: true, message: 'Sales Return is already cancelled.', data: current });
     return res.status(409).json({ success: false, message: `Cannot cancel a sales return in ${current.status} status without reversal.` });

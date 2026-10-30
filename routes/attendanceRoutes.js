@@ -207,7 +207,7 @@ router.post('/checkout', async (req, res) => {
     const today = new Date();
     today.setHours(0, 0, 0, 0);
     const attendance = await Attendance.findOne({
-      branch: req.branchId,
+      branch: req.branchScope,
       employee: employee._id,
       date: today,
     });

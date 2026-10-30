@@ -59,7 +59,7 @@ router.use(requirePermission('access.policy.manage'));
 
 router.get('/', async (req, res) => {
   try {
-    const policies = await AccessPolicy.find({ branch: req.branchId })
+    const policies = await AccessPolicy.find({ branch: req.branchScope })
       .sort({ module: 1, resourceKey: 1 })
       .populate('updatedBy', 'name role')
       .lean();
@@ -78,10 +78,10 @@ router.put('/:module/:resourceKey', async (req, res) => {
     if (validationError) return res.status(422).json({ success: false, message: validationError });
 
     const policy = await AccessPolicy.findOneAndUpdate(
-      { branch: req.branchId, module, resourceKey },
+      { branch: req.branchScope, module, resourceKey },
       {
         $set: { ...pick(req.body), module, resourceKey, updatedBy: req.user._id },
-        $setOnInsert: { branch: req.branchId },
+        $setOnInsert: { branch: req.branchScope },
       },
       { upsert: true, new: true, setDefaultsOnInsert: true, runValidators: true }
     );
@@ -93,7 +93,7 @@ router.put('/:module/:resourceKey', async (req, res) => {
 
 router.delete('/:id', async (req, res) => {
   try {
-    const policy = await AccessPolicy.findOneAndDelete({ _id: req.params.id, branch: req.branchId });
+    const policy = await AccessPolicy.findOneAndDelete({ _id: req.params.id, branch: req.branchScope });
     if (!policy) return res.status(404).json({ success: false, message: 'Access policy not found.' });
     return res.json({ success: true, message: 'Access policy deleted.', data: { _id: policy._id } });
   } catch (error) {

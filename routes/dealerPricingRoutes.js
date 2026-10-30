@@ -233,7 +233,7 @@ router.get('/', requirePermission('dealer.discounts'), async (req, res) => {
     const { dealer, dealerType, scope, product, page = 1, limit = 50, isActive } = req.query;
     const p = Math.max(1, Number.parseInt(page, 10) || 1);
     const l = Math.min(200, Math.max(1, Number.parseInt(limit, 10) || 50));
-    const filter = { branch: req.branchId };
+    const filter = { branch: req.branchScope };
     if (scope === 'dealer') filter.$or = [{ scope: 'dealer' }, { scope: { $exists: false } }];
     else if (scope) filter.scope = scope;
     if (dealer) filter.dealer = dealer;
@@ -256,7 +256,7 @@ router.get('/effective-rate', requireAnyPermission('sales.order.create', 'quotat
     if (!req.query.product) throw routeError(422, 'product is required.');
     const target = parseTarget(req.query);
     const result = await resolvePricing({
-      branchId: req.branchId, product: req.query.product,
+      branchId: req.branchScope, product: req.query.product,
       dealerId: target.scope === 'dealer' ? target.dealer : undefined,
       dealerTypeId: target.scope === 'dealer_type' ? target.dealerType : undefined,
       scope: target.scope, quantity: req.query.quantity || 1,
@@ -283,7 +283,7 @@ router.get('/catalog', requirePermission('dealer.discounts'), async (req, res) =
     const data = await mapWithConcurrency(products, 16, async (product) => {
       const [result, targetOverride] = await Promise.all([
         resolvePricing({
-          branchId: req.branchId,
+          branchId: req.branchScope,
           dealerId: target.scope === 'dealer' ? target.dealer : undefined,
           dealerTypeId: target.scope === 'dealer_type' ? target.dealerType : undefined,
           scope: target.scope, product, quantity,
@@ -335,7 +335,7 @@ router.post('/apply-bulk', requirePermission('dealer.discounts'), async (req, re
       const applyAt = new Date(body.applyAt);
       if (Number.isNaN(applyAt.getTime()) || applyAt <= new Date()) throw routeError(422, 'A future applyAt is required when applyImmediately is false.');
       const schedule = await DealerPricingSchedule.create({
-        branch: req.branchId, ...targetFields(preview.target), scope: preview.target.scope,
+        branch: req.branchScope, ...targetFields(preview.target), scope: preview.target.scope,
         products: preview.rows.map((row) => row.product),
         expectedRates: preview.rows.map((row) => ({ product: row.product, oldRate: row.oldRate, newRate: row.newRate })),
         filters: { search: body.search, brand: body.brand, category: body.category, subcategory: body.subcategory },
@@ -352,7 +352,7 @@ router.post('/apply-bulk', requirePermission('dealer.discounts'), async (req, re
         preview = await previewBulk(req.branchId, body, session);
         assertExpectedRates(body.expectedRates, preview.rows);
         applied = await applyPreview({
-          branchId: req.branchId, preview, body, userId: req.user._id,
+          branchId: req.branchScope, preview, body, userId: req.user._id,
           action: 'bulk', session,
         });
       });
@@ -368,7 +368,7 @@ router.get('/history', requirePermission('dealer.discounts'), async (req, res) =
   try {
     const p = Math.max(1, Number.parseInt(req.query.page, 10) || 1);
     const l = Math.min(200, Math.max(1, Number.parseInt(req.query.limit, 10) || 50));
-    const filter = { branch: req.branchId };
+    const filter = { branch: req.branchScope };
     if (req.query.scope) filter.scope = req.query.scope;
     if (req.query.product) filter.product = req.query.product;
     if (req.query.dealer) filter.dealer = req.query.dealer;
@@ -387,7 +387,7 @@ router.get('/schedules', requirePermission('dealer.discounts'), async (req, res)
   try {
     const p = Math.max(1, Number.parseInt(req.query.page, 10) || 1);
     const l = Math.min(200, Math.max(1, Number.parseInt(req.query.limit, 10) || 50));
-    const filter = { branch: req.branchId };
+    const filter = { branch: req.branchScope };
     if (req.query.status) filter.status = req.query.status;
     if (req.query.scope) {
       if (!SCOPES.has(req.query.scope)) throw routeError(422, 'scope must be dealer, dealer_type, or walk_in.');
@@ -414,7 +414,7 @@ router.get('/schedules', requirePermission('dealer.discounts'), async (req, res)
 router.delete('/schedules/:id', requirePermission('dealer.discounts'), async (req, res) => {
   try {
     const schedule = await DealerPricingSchedule.findOneAndUpdate(
-      { _id: req.params.id, branch: req.branchId, status: 'pending' },
+      { _id: req.params.id, branch: req.branchScope, status: 'pending' },
       { $set: { status: 'cancelled', cancelledBy: req.user._id, cancelledAt: new Date() } },
       { new: true, runValidators: true }
     );
@@ -425,7 +425,7 @@ router.delete('/schedules/:id', requirePermission('dealer.discounts'), async (re
 
 router.post('/apply-due-schedules', requirePermission('dealer.discounts'), async (req, res) => {
   try {
-    const due = await DealerPricingSchedule.find({ branch: req.branchId, status: 'pending', applyAt: { $lte: new Date() } }).sort({ applyAt: 1 });
+    const due = await DealerPricingSchedule.find({ branch: req.branchScope, status: 'pending', applyAt: { $lte: new Date() } }).sort({ applyAt: 1 });
     const results = [];
     for (const schedule of due) {
       const body = {
@@ -439,12 +439,12 @@ router.post('/apply-due-schedules', requirePermission('dealer.discounts'), async
       try {
         let count = 0;
         await session.withTransaction(async () => {
-          const claimed = await DealerPricingSchedule.findOne({ _id: schedule._id, branch: req.branchId, status: 'pending' }).session(session);
+          const claimed = await DealerPricingSchedule.findOne({ _id: schedule._id, branch: req.branchScope, status: 'pending' }).session(session);
           if (!claimed) throw routeError(409, 'Schedule was already actioned.');
           const preview = await previewBulk(req.branchId, body, session);
           assertExpectedRates(body.expectedRates, preview.rows);
           const applied = await applyPreview({
-            branchId: req.branchId, preview, body, userId: req.user._id,
+            branchId: req.branchScope, preview, body, userId: req.user._id,
             action: 'scheduled_application', scheduleId: schedule._id, session,
           });
           count = applied.length;
@@ -454,7 +454,7 @@ router.post('/apply-due-schedules', requirePermission('dealer.discounts'), async
         results.push({ schedule: schedule._id, status: 'applied', count });
       } catch (error) {
         await DealerPricingSchedule.updateOne(
-          { _id: schedule._id, branch: req.branchId, status: 'pending' },
+          { _id: schedule._id, branch: req.branchScope, status: 'pending' },
           { $set: { status: 'failed', error: error.message, appliedBy: req.user._id, appliedAt: new Date() } }
         );
         results.push({ schedule: schedule._id, status: 'failed', error: error.message });
@@ -479,7 +479,7 @@ router.post('/', requirePermission('dealer.discounts'), async (req, res) => {
       const filter = targetFilter(req.branchId, target, product._id);
       pricing = await DealerPricing.findOne(filter).session(session);
       before = pricing ? snapshot(pricing) : null;
-      if (!pricing) pricing = new DealerPricing({ branch: req.branchId, product: product._id, createdBy: req.user._id });
+      if (!pricing) pricing = new DealerPricing({ branch: req.branchScope, product: product._id, createdBy: req.user._id });
       const editable = ['customRate', 'discountPercent', 'discountFlat', 'schemeDiscount', 'minQty', 'slabs', 'validFrom', 'validTo', 'isActive', 'remarks'];
       Object.assign(pricing, Object.fromEntries(editable.filter((key) => Object.hasOwn(req.body, key)).map((key) => [key, req.body[key]])));
       Object.assign(pricing, targetFields(target), {
@@ -487,7 +487,7 @@ router.post('/', requirePermission('dealer.discounts'), async (req, res) => {
       });
       await pricing.validate();
       const resolved = await resolvePricing({
-        branchId: req.branchId, dealerId: target.scope === 'dealer' ? target.dealer : undefined,
+        branchId: req.branchScope, dealerId: target.scope === 'dealer' ? target.dealer : undefined,
         dealerTypeId: target.scope === 'dealer_type' ? target.dealerType : undefined,
         scope: target.scope, product, quantity: req.body.quantity || Math.max(1, pricing.minQty || 1),
         proposedOverride: pricing.toObject(), session,
@@ -495,7 +495,7 @@ router.post('/', requirePermission('dealer.discounts'), async (req, res) => {
       if (resolved.belowMinimum) throw routeError(422, `Effective rate ${resolved.effectiveRate} is below minimum selling rate ${resolved.minimumSellingRate}.`);
       await pricing.save({ session });
       await historyEntry({
-        branch: req.branchId, pricing: pricing._id, action: before ? 'update' : 'create', target,
+        branch: req.branchScope, pricing: pricing._id, action: before ? 'update' : 'create', target,
         product: product._id, before, after: snapshot(pricing), reason: auditReason,
         notes: req.body.notes, user: req.user._id, session,
       });
@@ -512,7 +512,7 @@ router.put('/:id', requirePermission('dealer.discounts'), async (req, res) => {
     if (!auditReason) throw routeError(422, 'A fresh audit reason is required.');
     let pricing;
     await session.withTransaction(async () => {
-      pricing = await DealerPricing.findOne({ _id: req.params.id, branch: req.branchId }).session(session);
+      pricing = await DealerPricing.findOne({ _id: req.params.id, branch: req.branchScope }).session(session);
       if (!pricing) throw routeError(404, 'Pricing override not found.');
       const before = snapshot(pricing);
       const currentTarget = parseTarget({
@@ -530,7 +530,7 @@ router.put('/:id', requirePermission('dealer.discounts'), async (req, res) => {
       await pricing.validate();
       if (pricing.isActive) {
         const resolved = await resolvePricing({
-          branchId: req.branchId, dealerId: target.scope === 'dealer' ? target.dealer : undefined,
+          branchId: req.branchScope, dealerId: target.scope === 'dealer' ? target.dealer : undefined,
           dealerTypeId: target.scope === 'dealer_type' ? target.dealerType : undefined,
           scope: target.scope, product, quantity: req.body.quantity || Math.max(1, pricing.minQty || 1),
           proposedOverride: pricing.toObject(), session,
@@ -539,7 +539,7 @@ router.put('/:id', requirePermission('dealer.discounts'), async (req, res) => {
       }
       await pricing.save({ session });
       const action = Object.hasOwn(req.body, 'isActive') && Object.keys(req.body).every((key) => ['isActive', 'reason', 'notes'].includes(key)) ? 'toggle' : 'update';
-      await historyEntry({ branch: req.branchId, pricing: pricing._id, action, target, product: product._id, before, after: snapshot(pricing), reason: auditReason, notes: req.body.notes, user: req.user._id, session });
+      await historyEntry({ branch: req.branchScope, pricing: pricing._id, action, target, product: product._id, before, after: snapshot(pricing), reason: auditReason, notes: req.body.notes, user: req.user._id, session });
     });
     return res.json({ success: true, message: 'Pricing override updated.', data: pricing });
   } catch (error) { return sendError(res, error); }
@@ -551,13 +551,13 @@ router.delete('/:id', requirePermission('dealer.discounts'), async (req, res) =>
   try {
     let pricing;
     await session.withTransaction(async () => {
-      pricing = await DealerPricing.findOne({ _id: req.params.id, branch: req.branchId }).session(session);
+      pricing = await DealerPricing.findOne({ _id: req.params.id, branch: req.branchScope }).session(session);
       if (!pricing) throw routeError(404, 'Pricing override not found.');
       const before = snapshot(pricing);
       pricing.isActive = false; pricing.updatedBy = req.user._id;
       await pricing.save({ session });
       const target = parseTarget({ scope: pricing.scope || 'dealer', dealer: pricing.dealer || pricing.customerId, dealerType: pricing.dealerType });
-      await historyEntry({ branch: req.branchId, pricing: pricing._id, action: 'toggle', target, product: pricing.product, before, after: snapshot(pricing), reason: req.body?.reason || 'Deactivated', notes: req.body?.notes, user: req.user._id, session });
+      await historyEntry({ branch: req.branchScope, pricing: pricing._id, action: 'toggle', target, product: pricing.product, before, after: snapshot(pricing), reason: req.body?.reason || 'Deactivated', notes: req.body?.notes, user: req.user._id, session });
     });
     return res.json({ success: true, message: 'Pricing override deactivated.', data: pricing });
   } catch (error) { return sendError(res, error); }
@@ -567,7 +567,7 @@ router.delete('/:id', requirePermission('dealer.discounts'), async (req, res) =>
 router.get('/bulk-by-dealer/:dealerId', requirePermission('dealer.discounts'), async (req, res) => {
   try {
     const target = await validateTarget({ scope: 'dealer', dealer: req.params.dealerId });
-    const overrides = await DealerPricing.find({ branch: req.branchId, dealer: target.dealer, isActive: true })
+    const overrides = await DealerPricing.find({ branch: req.branchScope, dealer: target.dealer, isActive: true })
       .populate('product', 'productCode itemName tileSize finish unit dealerRate mrp minimumSellingRate').lean();
     return res.json({ success: true, data: overrides });
   } catch (error) { return sendError(res, error); }

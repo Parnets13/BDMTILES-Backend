@@ -271,6 +271,20 @@ const validId = (value, name) => {
   if (!mongoose.isValidObjectId(value)) throw serviceError(422, `${name} must be a valid identifier.`);
   return new mongoose.Types.ObjectId(String(value));
 };
+
+/**
+ * Branch matcher that also accepts the "All Branches" scope.
+ *
+ * Callers normally pass one branch id. In the header's All Branches mode the
+ * route hands over `{ $in: [...] }` instead, so the same aggregate/find widens
+ * to every branch the user may read without a second code path here.
+ */
+const branchScopeMatch = (value) => {
+  const raw = Array.isArray(value?.$in) ? value.$in : [value];
+  const ids = raw.filter(Boolean).map((id) => new mongoose.Types.ObjectId(String(id?._id || id)));
+  if (!ids.length) throw serviceError(422, 'branch must be a valid identifier.');
+  return ids.length === 1 ? ids[0] : { $in: ids };
+};
 const finiteFilter = (value, name) => {
   if (value === undefined || value === '') return undefined;
   const parsed = Number(value);
@@ -296,7 +310,7 @@ const listFilter = value => String(value || '').split(',').map(item => item.trim
 
 export async function listStocks(branchId, query = {}) {
   const { page, limit } = pagination(query);
-  const match = { branch: validId(branchId, 'branch') };
+  const match = { branch: branchScopeMatch(branchId) };
   for (const [field, name] of [['product', 'product'], ['warehouse', 'warehouse']]) {
     if (query[field]) match[field] = validId(query[field], name);
   }
@@ -370,7 +384,7 @@ export async function listStocks(branchId, query = {}) {
 }
 
 export async function getStockSummary(branchId) {
-  const branch = validId(branchId, 'branch');
+  const branch = branchScopeMatch(branchId);
   const [summary] = await Stock.aggregate([
     { $match: { branch } },
     { $lookup: { from: 'products', localField: 'product', foreignField: '_id', as: 'product' } },
@@ -397,7 +411,7 @@ export async function getStockSummary(branchId) {
 }
 
 async function buildMovementFilter(branchId, query = {}, exactStockId = null) {
-  const filter = { branch: validId(branchId, 'branch') };
+  const filter = { branch: branchScopeMatch(branchId) };
   if (exactStockId) filter.stock = validId(exactStockId, 'stock');
   for (const [field, name] of [['product', 'product'], ['warehouse', 'warehouse'], ['sourceId', 'sourceId'], ['actor', 'actor']]) {
     if (query[field]) filter[field] = validId(query[field], name);

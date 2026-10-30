@@ -45,7 +45,7 @@ router.get('/', requirePermission('invoice'), async (req, res) => {
     const p = Math.max(1, parseInt(page));
     const l = Math.min(100, parseInt(limit) || 20);
 
-    let filter = { branch: req.branchId };
+    let filter = { branch: req.branchScope };
     if (search) {
       const regex = new RegExp(search, 'i');
       filter.$or = [{ invoiceNumber: regex }, { buyerName: regex }, { buyerCode: regex }, { orderNumber: regex }];
@@ -74,7 +74,7 @@ router.get('/', requirePermission('invoice'), async (req, res) => {
 // GET /api/v1/invoices/stats
 router.get('/stats', requirePermission('invoice'), async (req, res) => {
   try {
-    const scope = { branch: req.branchId };
+    const scope = { branch: req.branchScope };
     const [total, generated, sent, cancelled, totalValue] = await Promise.all([
       Invoice.countDocuments(scope),
       Invoice.countDocuments({ ...scope, status: 'generated' }),
@@ -105,12 +105,12 @@ router.get('/pending-orders', requirePermission('invoice'), async (req, res) => 
   try {
     const { search = '', limit = 200 } = req.query;
 
-    const invoiced = await Invoice.find({ branch: req.branchId, status: { $ne: 'cancelled' } })
+    const invoiced = await Invoice.find({ branch: req.branchScope, status: { $ne: 'cancelled' } })
       .select('salesOrder').lean();
     const invoicedIds = new Set(invoiced.map(row => String(row.salesOrder)).filter(Boolean));
 
     // The sorting queue is the whole candidate set.
-    const pickLists = await PickList.find({ branch: req.branchId, status: { $in: SORTING_PIPELINE } })
+    const pickLists = await PickList.find({ branch: req.branchScope, status: { $in: SORTING_PIPELINE } })
       .select('salesOrder pickListNumber status totalBoxes totalPickedQty deliveryRoute items.salesOrderItem items.sortedQty items.pickedQty')
       .lean();
     const liveLists = pickLists.filter(list => !invoicedIds.has(String(list.salesOrder)));
@@ -119,7 +119,7 @@ router.get('/pending-orders', requirePermission('invoice'), async (req, res) => 
     }
 
     const orderIds = [...new Set(liveLists.map(list => String(list.salesOrder)))];
-    const orders = await SalesOrder.find({ branch: req.branchId, _id: { $in: orderIds } })
+    const orders = await SalesOrder.find({ branch: req.branchScope, _id: { $in: orderIds } })
       .select('orderNumber dealerName dealerCode customerName status orderDate grandTotal items dealer')
       .populate('dealer', 'businessName dealerCode gstin state')
       .lean();
@@ -229,7 +229,7 @@ router.post('/generate-from-so/:soId', requirePermission('invoice'), async (req,
   const sourceKey = `${String(req.branchId)}:${rawIdempotencyKey}`;
   const requestFingerprint = fingerprintRequest({ salesOrder: req.params.soId, ...req.body });
   try {
-    const so = await SalesOrder.findOne({ _id: req.params.soId, branch: req.branchId })
+    const so = await SalesOrder.findOne({ _id: req.params.soId, branch: req.branchScope })
       .populate('dealer', 'businessName dealerCode gstin pan address city state mobile creditDays paymentTerms')
       .populate('items.product', 'productCode itemName hsnCode images piecesPerBox sqftPerBox')
       .lean();
@@ -237,7 +237,7 @@ router.post('/generate-from-so/:soId', requirePermission('invoice'), async (req,
     if (!so) return res.status(404).json({ success: false, message: 'Sales Order not found.' });
 
     // A previously generated active invoice is always the authoritative retry result.
-    const existing = await Invoice.findOne({ branch: req.branchId, salesOrder: so._id, status: { $ne: 'cancelled' } }).lean();
+    const existing = await Invoice.findOne({ branch: req.branchScope, salesOrder: so._id, status: { $ne: 'cancelled' } }).lean();
     if (existing) {
       if (existing.sourceKey === sourceKey && existing.requestFingerprint
         && existing.requestFingerprint !== requestFingerprint) {
@@ -277,7 +277,7 @@ router.post('/generate-from-so/:soId', requirePermission('invoice'), async (req,
 
     if (incompleteLine) {
       sortingPickLists = await PickList.find({
-        branch: req.branchId,
+        branch: req.branchScope,
         salesOrder: so._id,
         status: { $in: ['sorted', 'packed', 'ready_for_dispatch'] },
         stockConsumedAt: null,
@@ -293,7 +293,7 @@ router.post('/generate-from-so/:soId', requirePermission('invoice'), async (req,
       billedFromSorting = true;
     } else {
       dispatchTrips = await DispatchTrip.find({
-        branch: req.branchId,
+        branch: req.branchScope,
         status: { $in: ['dispatched', 'in_transit', 'completed'] },
         stockDeductedAt: { $ne: null },
         'orders.salesOrder': so._id,
@@ -417,7 +417,7 @@ router.post('/generate-from-so/:soId', requirePermission('invoice'), async (req,
 
     if (!items.length) return res.status(409).json({ success: false, code: 'NO_DISPATCHED_QUANTITY', message: 'A final invoice requires at least one billable line.' });
     // Determine interstate treatment from GST jurisdiction codes, never from missing/free-text state names.
-    const branchSettings = await BranchSettings.findOne({ branch: req.branchId }).lean();
+    const branchSettings = await BranchSettings.findOne({ branch: req.branchScope }).lean();
     const isInterState = buyerStateCode !== sellerStateCode;
 
     // If inter-state, convert CGST+SGST to IGST
@@ -462,7 +462,7 @@ router.post('/generate-from-so/:soId', requirePermission('invoice'), async (req,
       sourceKey,
       requestFingerprint,
       activeSalesOrderKey: `${String(req.branchId)}:${String(so._id)}`,
-      branch: req.branchId,
+      branch: req.branchScope,
       invoiceDate,
       invoiceType: 'tax_invoice',
       gstType: 'output', // Sales invoice = Output GST
@@ -530,7 +530,7 @@ router.post('/generate-from-so/:soId', requirePermission('invoice'), async (req,
 
     if (dispatchTrips.length) {
       await DispatchTrip.updateMany(
-        { _id: { $in: dispatchTrips.map(trip => trip._id) }, branch: req.branchId, 'orders.salesOrder': so._id },
+        { _id: { $in: dispatchTrips.map(trip => trip._id) }, branch: req.branchScope, 'orders.salesOrder': so._id },
         { $set: { 'orders.$[order].invoice': invoice._id, 'orders.$[order].invoiceNumber': invoice.invoiceNumber } },
         { arrayFilters: [{ 'order.salesOrder': so._id }] }
       );
@@ -539,7 +539,7 @@ router.post('/generate-from-so/:soId', requirePermission('invoice'), async (req,
     res.status(201).json({ success: true, message: `Invoice ${invoiceNumber} generated.`, data: invoice });
   } catch (e) {
     if (e.code === 11000) {
-      const existing = await Invoice.findOne({ branch: req.branchId, salesOrder: req.params.soId, status: { $ne: 'cancelled' } }).lean();
+      const existing = await Invoice.findOne({ branch: req.branchScope, salesOrder: req.params.soId, status: { $ne: 'cancelled' } }).lean();
       if (existing) return res.json({ success: true, message: `Invoice ${existing.invoiceNumber} already exists for this order.`, data: existing });
     }
     return res.status(e.status || 500).json({ success: false, message: e.message });
@@ -549,7 +549,7 @@ router.post('/generate-from-so/:soId', requirePermission('invoice'), async (req,
 // GET /api/v1/invoices/:id — get single invoice (full detail for PDF)
 router.get('/:id', requirePermission('invoice'), async (req, res) => {
   try {
-    const invoice = await Invoice.findOne({ _id: req.params.id, branch: req.branchId })
+    const invoice = await Invoice.findOne({ _id: req.params.id, branch: req.branchScope })
       .populate('dealer', 'businessName dealerCode gstin address city state mobile')
       .populate('salesOrder', 'orderNumber orderDate')
       .populate('createdBy', 'name')
@@ -567,13 +567,13 @@ router.patch('/:id/status', requirePermission('invoice'), async (req, res) => {
       return res.status(422).json({ success: false, message: 'Invoice status must be sent or cancelled.' });
     }
     if (status === 'cancelled') {
-      const invoiceToCancel = await Invoice.findOne({ _id: req.params.id, branch: req.branchId }).lean();
+      const invoiceToCancel = await Invoice.findOne({ _id: req.params.id, branch: req.branchScope }).lean();
       if (!invoiceToCancel) return res.status(404).json({ success: false, message: 'Invoice not found.' });
       if (Number(invoiceToCancel.paidAmount || 0) > 0.01) {
         return res.status(409).json({ success: false, message: 'A paid or partially paid invoice cannot be cancelled. Reverse its payments first.' });
       }
       const allocatedPayment = await Payment.exists({
-        branch: req.branchId,
+        branch: req.branchScope,
         status: { $in: ['pending', 'confirmed'] },
         againstOrders: { $elemMatch: { order: invoiceToCancel._id, orderModel: 'Invoice' } },
       });
@@ -593,7 +593,7 @@ router.patch('/:id/status', requirePermission('invoice'), async (req, res) => {
       if (cancelReason) update.$set.cancelReason = cancelReason;
     }
     const invoice = await Invoice.findOneAndUpdate(
-      { _id: req.params.id, branch: req.branchId, status: { $in: allowedSourceStatuses } },
+      { _id: req.params.id, branch: req.branchScope, status: { $in: allowedSourceStatuses } },
       update,
       { new: true, runValidators: true }
     );
@@ -601,7 +601,7 @@ router.patch('/:id/status', requirePermission('invoice'), async (req, res) => {
       return res.json({ success: true, message: `Invoice ${status}.`, data: invoice });
     }
 
-    const existing = await Invoice.findOne({ _id: req.params.id, branch: req.branchId });
+    const existing = await Invoice.findOne({ _id: req.params.id, branch: req.branchScope });
     if (!existing) return res.status(404).json({ success: false, message: 'Invoice not found.' });
     if (status === 'sent' && existing.status === 'sent') {
       return res.json({ success: true, message: 'Invoice already sent.', data: existing });
@@ -616,7 +616,7 @@ router.patch('/:id/status', requirePermission('invoice'), async (req, res) => {
 // DELETE — not allowed for generated invoices, only draft
 router.delete('/:id', requirePermission('invoice'), async (req, res) => {
   try {
-    const invoice = await Invoice.findOne({ _id: req.params.id, branch: req.branchId });
+    const invoice = await Invoice.findOne({ _id: req.params.id, branch: req.branchScope });
     if (!invoice) return res.status(404).json({ success: false, message: 'Not found.' });
     if (invoice.status !== 'draft') {
       return res.status(400).json({ success: false, message: 'Only draft invoices can be deleted. Cancel generated invoices instead.' });
@@ -627,7 +627,7 @@ router.delete('/:id', requirePermission('invoice'), async (req, res) => {
       module: 'invoice',
       titleField: 'buyerName',
       codeField: 'invoiceNumber',
-      scope: { branch: req.branchId },
+      scope: { branch: req.branchScope },
     });
     res.status(result.status || 200).json(result);
   } catch (e) { res.status(500).json({ success: false, message: e.message }); }

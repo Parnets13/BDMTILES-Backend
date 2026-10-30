@@ -26,7 +26,7 @@ const FINANCE_DECISIONS = ['approved', 'partial_approved', 'rejected', 'hold'];
 const ADJUSTMENT_TYPES = ['credit_note', 'refund', 'replacement'];
 const getComplaintScope = (req, resourceKey = '*') => getAccessPolicyScope({
   user: req.user,
-  branchId: req.branchId,
+  branchId: req.branchScope,
   module: 'complaint',
   resourceKey,
 });
@@ -184,7 +184,7 @@ router.post('/evidence', requireAnyPermission('complaint.management', 'warehouse
     if (!req.files?.length) return res.status(400).json({ success: false, message: 'At least one evidence image is required.' });
     try {
       const documents = await ComplaintEvidence.insertMany(req.files.map((file) => ({
-        branch: req.branchId,
+        branch: req.branchScope,
         uploadedBy: req.user._id,
         url: `/uploads/complaints/${file.filename}`,
         originalName: file.originalname,
@@ -205,7 +205,7 @@ router.post('/evidence', requireAnyPermission('complaint.management', 'warehouse
 router.get('/sources/dealer/:dealerId', requirePermission('complaint.management'), async (req, res) => {
   try {
     const invoices = await Invoice.find({
-      branch: req.branchId,
+      branch: req.branchScope,
       dealer: req.params.dealerId,
       status: { $in: ['generated', 'sent'] },
       invoiceType: 'tax_invoice',
@@ -213,7 +213,7 @@ router.get('/sources/dealer/:dealerId', requirePermission('complaint.management'
     }).select('invoiceNumber invoiceDate salesOrder orderNumber items status').sort({ invoiceDate: -1 }).limit(50).lean();
     const orders = await SalesOrder.find({
       _id: { $in: invoices.map((invoice) => invoice.salesOrder) },
-      branch: req.branchId,
+      branch: req.branchScope,
       dealer: req.params.dealerId,
       status: { $in: ['dispatched', 'delivered'] },
     }).select('_id').lean();
@@ -252,7 +252,7 @@ router.post('/', requirePermission('complaint.management'), async (req, res) => 
       : [];
     if (rawComplaintPhotos.length > 10) throw routeError(422, 'A complaint can include at most 10 evidence images.');
     const data = {
-      branch: req.branchId,
+      branch: req.branchScope,
       dealer: req.body.dealer,
       salesOrder: req.body.salesOrder,
       invoice: req.body.invoice,
@@ -284,7 +284,7 @@ router.post('/', requirePermission('complaint.management'), async (req, res) => 
     });
     const evidenceRecords = evidenceSelectors.length
       ? await ComplaintEvidence.find({
-        branch: req.branchId,
+        branch: req.branchScope,
         uploadedBy: req.user._id,
         status: 'uploaded',
         $or: evidenceSelectors,
@@ -310,19 +310,19 @@ router.post('/', requirePermission('complaint.management'), async (req, res) => 
     let order = null;
     let invoice = null;
     if (data.salesOrder) {
-      order = await SalesOrder.findOne({ _id: data.salesOrder, branch: req.branchId }).select('orderNumber dealer dealerName status').lean();
+      order = await SalesOrder.findOne({ _id: data.salesOrder, branch: req.branchScope }).select('orderNumber dealer dealerName status').lean();
       if (!order) throw routeError(422, 'Sales Order is not available in the selected branch.');
     }
     if (data.invoice) {
       invoice = await Invoice.findOne({
         _id: data.invoice,
-        branch: req.branchId,
+        branch: req.branchScope,
         status: { $in: ['generated', 'sent'] },
         invoiceType: 'tax_invoice',
       }).lean();
       if (!invoice) throw routeError(422, 'An active tax invoice is required in the selected branch.');
       if (!order && invoice.salesOrder) {
-        order = await SalesOrder.findOne({ _id: invoice.salesOrder, branch: req.branchId, dealer: invoice.dealer })
+        order = await SalesOrder.findOne({ _id: invoice.salesOrder, branch: req.branchScope, dealer: invoice.dealer })
           .select('orderNumber dealer dealerName status').lean();
       }
     }
@@ -412,7 +412,7 @@ router.post('/', requirePermission('complaint.management'), async (req, res) => 
         const evidenceUpdate = await ComplaintEvidence.updateMany(
           {
             _id: { $in: resolvedEvidence.map((evidence) => evidence._id) },
-            branch: req.branchId,
+            branch: req.branchScope,
             uploadedBy: req.user._id,
             status: 'uploaded',
           },
@@ -427,7 +427,7 @@ router.post('/', requirePermission('complaint.management'), async (req, res) => 
       await session.endSession();
     }
     await emitNotification({
-      branch: req.branchId,
+      branch: req.branchScope,
       module: 'complaint',
       event: 'complaint_raised',
       eventKey: `complaint:${complaint._id}:raised`,
@@ -505,14 +505,14 @@ router.patch('/:id/send-to-warehouse', requirePermission('complaint.management')
       const [invoice, order, committed, pending] = await Promise.all([
         Invoice.findOne({
           _id: current.invoice,
-          branch: req.branchId,
+          branch: req.branchScope,
           dealer: current.dealer,
           status: { $in: ['generated', 'sent'] },
           invoiceType: 'tax_invoice',
         }).session(session).lean(),
         SalesOrder.findOne({
           _id: current.salesOrder,
-          branch: req.branchId,
+          branch: req.branchScope,
           dealer: current.dealer,
           status: { $in: ['dispatched', 'delivered'] },
         }).session(session).lean(),
@@ -587,7 +587,7 @@ router.patch('/:id/warehouse-verify', requirePermission('warehouse.verification'
     }
     const evidenceRecords = await ComplaintEvidence.find({
       _id: { $in: evidenceIds },
-      branch: req.branchId,
+      branch: req.branchScope,
       uploadedBy: req.user._id,
       status: 'uploaded',
     }).lean();
@@ -680,7 +680,7 @@ router.patch('/:id/warehouse-verify', requirePermission('warehouse.verification'
         const evidenceUpdate = await ComplaintEvidence.updateMany(
           {
             _id: { $in: evidenceIds },
-            branch: req.branchId,
+            branch: req.branchScope,
             uploadedBy: req.user._id,
             status: 'uploaded',
           },
@@ -691,7 +691,7 @@ router.patch('/:id/warehouse-verify', requirePermission('warehouse.verification'
           throw routeError(409, 'One or more evidence images were already attached; upload fresh evidence and retry.');
         }
         updated = await Complaint.findOneAndUpdate(
-          { _id: complaint._id, branch: req.branchId, status: 'warehouse_pending', __v: complaint.__v },
+          { _id: complaint._id, branch: req.branchScope, status: 'warehouse_pending', __v: complaint.__v },
           {
             $set: { warehouseVerification, status: 'finance_review', returnReceived: true },
             $push: {

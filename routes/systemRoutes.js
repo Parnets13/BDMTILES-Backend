@@ -56,7 +56,7 @@ router.get('/recycle-bin', canViewRecycleBin, async (req, res) => {
     const { page = 1, limit = 20, search, module } = req.query;
     const p = Math.max(1, Number.parseInt(page, 10) || 1);
     const l = Math.min(100, Math.max(1, Number.parseInt(limit, 10) || 20));
-    const filter = { branch: req.branchId };
+    const filter = { branch: req.branchScope };
     if (search) {
       const regex = new RegExp(String(search).replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'i');
       filter.$or = [
@@ -81,7 +81,7 @@ router.get('/recycle-bin', canViewRecycleBin, async (req, res) => {
 
 router.get('/recycle-bin/stats', canViewRecycleBin, async (req, res) => {
   try {
-    const branchMatch = { branch: req.branchId };
+    const branchMatch = { branch: req.branchScope };
     // The collection has a 30-day TTL, so anything deleted 23+ days ago is inside
     // its final week. Nothing warned anyone about that before.
     const RETENTION_DAYS = 30;
@@ -110,7 +110,7 @@ router.post('/recycle-bin/:id/restore', canRestoreFromBin, async (req, res) => {
     binId: req.params.id,
     models: MODELS,
     user: req.user,
-    branch: req.branchId,
+    branch: req.branchScope,
     req,
   });
   return res.status(result.status || 200).json(result);
@@ -121,7 +121,7 @@ router.delete('/recycle-bin/:id', canPurgeFromBin, async (req, res) => {
   const result = await permanentDelete({
     binId: req.params.id,
     user: req.user,
-    branch: req.branchId,
+    branch: req.branchScope,
     req,
   });
   return res.status(result.status || 200).json(result);
@@ -133,7 +133,7 @@ router.post('/recycle-bin/cleanup', canPurgeFromBin, async (req, res) => {
   const result = await manualCleanup({
     olderThanDays: days,
     user: req.user,
-    branch: req.branchId,
+    branch: req.branchScope,
     req,
   });
   return res.status(result.status || 200).json(result);
@@ -156,7 +156,7 @@ router.get('/activity-logs', LOG_VIEW_PERMISSIONS, async (req, res) => {
     const { page = 1, limit = 30, search, action, module, user: userId, dateFrom, dateTo } = req.query;
     const p = Math.max(1, Number.parseInt(page, 10) || 1);
     const l = Math.min(100, Math.max(1, Number.parseInt(limit, 10) || 30));
-    const filter = { branch: req.branchId };
+    const filter = { branch: req.branchScope };
     if (search) {
       const regex = new RegExp(String(search).replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'i');
       filter.$or = [{ userName: regex }, { description: regex }, { recordTitle: regex }, { module: regex }];
@@ -194,7 +194,7 @@ router.get('/activity-logs/stats', LOG_VIEW_PERMISSIONS, async (req, res) => {
   try {
     const today = new Date();
     today.setHours(0, 0, 0, 0);
-    const branchMatch = { branch: req.branchId };
+    const branchMatch = { branch: req.branchScope };
     const [total, todayCount, byAction, byModule] = await Promise.all([
       ActivityLog.countDocuments(branchMatch),
       ActivityLog.countDocuments({ ...branchMatch, timestamp: { $gte: today } }),
@@ -222,7 +222,7 @@ router.post('/activity-logs/cleanup', requirePermission('users.manage'), async (
     const days = Number.parseInt(req.body.olderThanDays, 10) || 60;
     const cutoff = new Date(Date.now() - days * 24 * 60 * 60 * 1000);
     const result = await ActivityLog.deleteMany({
-      branch: req.branchId,
+      branch: req.branchScope,
       timestamp: { $lt: cutoff },
     });
 
@@ -231,7 +231,7 @@ router.post('/activity-logs/cleanup', requirePermission('users.manage'), async (
       action: 'permanent_delete',
       module: 'activity_log',
       description: `Manual cleanup: removed ${result.deletedCount} logs older than ${days} days`,
-      branch: req.branchId,
+      branch: req.branchScope,
       req,
     });
 
@@ -247,7 +247,7 @@ router.post('/activity-logs/cleanup', requirePermission('users.manage'), async (
 
 router.post('/inventory/release-expired-reservations', requirePermission('system.management'), async (req, res) => {
   try {
-    const summary = await releaseExpiredApprovalReservations({ branch: req.branchId, actor: req.user._id, now: new Date() });
+    const summary = await releaseExpiredApprovalReservations({ branch: req.branchScope, actor: req.user._id, now: new Date() });
     return res.json({ success: true, message: `${summary.released} expired reservation(s) released.`, data: summary });
   } catch (error) {
     return res.status(error.status || 500).json({ success: false, message: error.message });
@@ -262,7 +262,7 @@ router.post('/inventory/release-expired-reservations', requirePermission('system
 
 router.get('/health', requirePermission('system.management'), async (req, res) => {
   try {
-    const data = await systemDiagnostics({ branchId: req.branchId });
+    const data = await systemDiagnostics({ branchId: req.branchScope });
     return res.json({ success: true, data });
   } catch (error) {
     return res.status(500).json({ success: false, message: error.message });

@@ -68,7 +68,7 @@ const requireAssignedPickList = async (req, res, next) => {
       if (staticPaths.has(req.params.id)) return next();
       return res.status(400).json({ success: false, message: 'Invalid _id' });
     }
-    const assigned = await PickList.exists({ _id: req.params.id, branch: req.branchId, assignedTo: req.user._id });
+    const assigned = await PickList.exists({ _id: req.params.id, branch: req.branchScope, assignedTo: req.user._id });
     if (!assigned) return res.status(404).json({ success: false, message: 'Pick list not found.' });
     return next();
   } catch (error) {
@@ -100,7 +100,7 @@ router.get('/', async (req, res) => {
     const { page = 1, limit = 20, search, status, assignedTo, priority } = req.query;
     const p = Math.max(1, parseInt(page));
     const l = Math.min(100, parseInt(limit) || 20);
-    const filter = { branch: req.branchId };
+    const filter = { branch: req.branchScope };
     if (!canViewUnassignedWorkflowOrders(req.user)) filter.assignedTo = req.user._id;
     if (search) {
       const regex = new RegExp(search, 'i');
@@ -126,7 +126,7 @@ router.get('/', async (req, res) => {
 
 router.get('/stats', async (req, res) => {
   try {
-    const scope = { branch: req.branchId };
+    const scope = { branch: req.branchScope };
     if (!canViewUnassignedWorkflowOrders(req.user)) scope.assignedTo = req.user._id;
     const statuses = ['generated', 'assigned', 'in_progress', 'picked', 'verified', 'sorted', 'packed', 'ready_for_dispatch', 'loaded'];
     const [total, ...counts] = await Promise.all([
@@ -144,7 +144,7 @@ router.post('/reserve-backorder/:soId', requireAnyPermission('sales.order.approv
   try {
     let order;
     await session.withTransaction(async () => {
-      order = await SalesOrder.findOne({ _id: req.params.soId, branch: req.branchId }).session(session);
+      order = await SalesOrder.findOne({ _id: req.params.soId, branch: req.branchScope }).session(session);
       if (!order) throw Object.assign(new Error('Sales Order not found.'), { status: 404 });
       if (!['confirmed', 'approved', 'processing', 'partial_dispatch'].includes(order.status)) {
         throw Object.assign(new Error(`Cannot reserve a backorder for a Sales Order in "${order.status}" status.`), { status: 409 });
@@ -172,7 +172,7 @@ router.get('/generatable-orders', async (req, res) => {
     const search = String(req.query.search || '').trim();
     const limit = Math.min(50, Math.max(1, parseInt(req.query.limit) || 20));
     const filter = {
-      branch: req.branchId,
+      branch: req.branchScope,
       status: { $in: ['confirmed', 'approved', 'processing', 'partial_dispatch'] },
       reservationStatus: { $in: ['reserved', 'partial'] },
     };
@@ -233,7 +233,7 @@ router.post('/generate/:soId', async (req, res) => {
     const pickListNumber = await generateBranchNumber(req.branchId, 'pickList', new Date());
     let pickList;
     await session.withTransaction(async () => {
-      const so = await SalesOrder.findOne({ _id: req.params.soId, branch: req.branchId })
+      const so = await SalesOrder.findOne({ _id: req.params.soId, branch: req.branchScope })
         .session(session)
         .populate('items.product', 'productCode itemName images hsnCode barcode')
         .populate('items.warehouse', 'name');
@@ -340,7 +340,7 @@ router.get('/assignable-staff', async (req, res) => {
 
     const users = await User.find({
       status: 'Active',
-      assignedBranches: req.branchId,
+      assignedBranches: req.branchScope,
       $or: [
         { permissions: { $in: [...WAREHOUSE_PERMS, '*'] } },
         { role: { $in: warehouseRoles } },
@@ -362,7 +362,7 @@ router.get('/delivery-executives', async (req, res) => {
     const users = await User.find({
       status: 'Active',
       role: 'delivery_executive',
-      assignedBranches: req.branchId,
+      assignedBranches: req.branchScope,
     })
       .select('name phone email')
       .sort({ name: 1 })
@@ -390,7 +390,7 @@ router.get('/available-vehicles', async (req, res) => {
 
 router.get('/:id', async (req, res) => {
   try {
-    const pickList = await PickList.findOne({ _id: req.params.id, branch: req.branchId })
+    const pickList = await PickList.findOne({ _id: req.params.id, branch: req.branchScope })
       .populate('assignedTo', 'name phone')
       .populate('sortedBy', 'name')
       .populate('packedBy', 'name')
@@ -407,7 +407,7 @@ router.get('/:id', async (req, res) => {
 
 router.patch('/:id/assign', async (req, res) => {
   try {
-    const pickList = await PickList.findOne({ _id: req.params.id, branch: req.branchId });
+    const pickList = await PickList.findOne({ _id: req.params.id, branch: req.branchScope });
     if (!pickList) return res.status(404).json({ success: false, message: 'Pick list not found.' });
     if (pickList.status === 'assigned') return res.json({ success: true, message: 'Picker already assigned.', data: pickList });
     if (pickList.status !== 'generated') return stateError(res, pickList, 'generated', 'assign picker');
@@ -422,7 +422,7 @@ router.patch('/:id/assign', async (req, res) => {
 
 router.patch('/:id/start', async (req, res) => {
   try {
-    const pickList = await PickList.findOne({ _id: req.params.id, branch: req.branchId });
+    const pickList = await PickList.findOne({ _id: req.params.id, branch: req.branchScope });
     if (!pickList) return res.status(404).json({ success: false, message: 'Pick list not found.' });
     if (pickList.status === 'in_progress') return res.json({ success: true, message: 'Picking already started.', data: pickList });
     if (pickList.status !== 'assigned') return stateError(res, pickList, 'assigned', 'start picking');
@@ -438,7 +438,7 @@ router.patch('/:id/complete-picking', async (req, res) => {
   try {
     let completed;
     await session.withTransaction(async () => {
-      const current = await PickList.findOne({ _id: req.params.id, branch: req.branchId }).session(session);
+      const current = await PickList.findOne({ _id: req.params.id, branch: req.branchScope }).session(session);
       if (!current) throw Object.assign(new Error('Pick list not found.'), { status: 404 });
       if (current.status === 'picked') { completed = current; return; }
       if (current.status !== 'in_progress') throw Object.assign(new Error(`Cannot complete picking while pick list is "${current.status}". Expected "in_progress".`), { status: 409 });
@@ -450,12 +450,12 @@ router.patch('/:id/complete-picking', async (req, res) => {
       if (submittedById.size !== current.items.length) throw Object.assign(new Error('Every pick-list item must appear exactly once.'), { status: 400 });
 
       const claimed = await PickList.findOneAndUpdate(
-        { _id: current._id, branch: req.branchId, status: 'in_progress', pickingCompletionProcessing: { $ne: true } },
+        { _id: current._id, branch: req.branchScope, status: 'in_progress', pickingCompletionProcessing: { $ne: true } },
         { $set: { pickingCompletionProcessing: true, reservationState: 'adjusting' } },
         { new: true, session }
       );
       if (!claimed) throw Object.assign(new Error('Picking completion is already being processed. Refresh before retrying.'), { status: 409 });
-      const order = await SalesOrder.findOne({ _id: claimed.salesOrder, branch: req.branchId }).session(session);
+      const order = await SalesOrder.findOne({ _id: claimed.salesOrder, branch: req.branchScope }).session(session);
       if (!order) throw Object.assign(new Error('Linked Sales Order not found.'), { status: 409 });
 
       for (const pickItem of claimed.items) {
@@ -493,7 +493,7 @@ router.patch('/:id/complete-picking', async (req, res) => {
             correlationKey: stockOperationKey('pick-list', claimed._id, 'completion'),
             movementType: type === 'short' ? 'pick_short_release' : 'pick_damage',
             phase: type === 'short' ? 'released' : 'reclassified',
-            branch: req.branchId, product: pickItem.product, warehouse: pickItem.warehouse,
+            branch: req.branchScope, product: pickItem.product, warehouse: pickItem.warehouse,
             shade: pickItem.shade || '', batch: pickItem.batch || '', deltas: quantityMove,
             enteredQuantity: quantity, ...snapshot, baseQuantity,
             sourceType: 'PickList', sourceModel: 'PickList', sourceId: claimed._id, sourceLineId: pickItem._id,
@@ -544,7 +544,7 @@ router.patch('/:id/complete-picking', async (req, res) => {
 
 router.patch('/:id/verify', async (req, res) => {
   try {
-    const pickList = await PickList.findOne({ _id: req.params.id, branch: req.branchId });
+    const pickList = await PickList.findOne({ _id: req.params.id, branch: req.branchScope });
     if (!pickList) return res.status(404).json({ success: false, message: 'Pick list not found.' });
     if (pickList.status === 'verified') return res.json({ success: true, message: 'Pick list already verified.', data: pickList });
     if (pickList.status !== 'picked') return stateError(res, pickList, 'picked', 'verify pick list');
@@ -566,7 +566,7 @@ router.patch('/:id/verify', async (req, res) => {
 // stock is moved here; reservation reconciliation happens at complete-picking.
 router.patch('/:id/mark-short', async (req, res) => {
   try {
-    const pickList = await PickList.findOne({ _id: req.params.id, branch: req.branchId });
+    const pickList = await PickList.findOne({ _id: req.params.id, branch: req.branchScope });
     if (!pickList) return res.status(404).json({ success: false, message: 'Pick list not found.' });
     if (!['in_progress', 'picked', 'verified'].includes(pickList.status)) {
       return res.status(409).json({
@@ -607,7 +607,7 @@ router.patch('/:id/sort', async (req, res) => {
   try {
     let sorted;
     await session.withTransaction(async () => {
-      const current = await PickList.findOne({ _id: req.params.id, branch: req.branchId }).session(session);
+      const current = await PickList.findOne({ _id: req.params.id, branch: req.branchScope }).session(session);
       if (!current) throw Object.assign(new Error('Pick list not found.'), { status: 404 });
       if (current.status === 'sorted' && current.sortingPostedAt) { sorted = current; return; }
       if (current.sortingPostedAt) throw Object.assign(new Error('Posted sorting reconciliation is immutable and cannot be edited.'), { status: 409 });
@@ -619,12 +619,12 @@ router.patch('/:id/sort', async (req, res) => {
       const submittedById = new Map(submitted.map(item => [String(item._id), item]));
       if (submittedById.size !== current.items.length) throw Object.assign(new Error('Every pick-list item must appear exactly once.'), { status: 400 });
       const claimed = await PickList.findOneAndUpdate(
-        { _id: current._id, branch: req.branchId, status: 'verified', sortingVerificationProcessing: { $ne: true } },
+        { _id: current._id, branch: req.branchScope, status: 'verified', sortingVerificationProcessing: { $ne: true } },
         { $set: { sortingVerificationProcessing: true, sortingStartTime: current.sortingStartTime || new Date() } },
         { new: true, session }
       );
       if (!claimed) throw Object.assign(new Error('Sorting verification is already being processed. Refresh before retrying.'), { status: 409 });
-      const order = await SalesOrder.findOne({ _id: claimed.salesOrder, branch: req.branchId }).session(session);
+      const order = await SalesOrder.findOne({ _id: claimed.salesOrder, branch: req.branchScope }).session(session);
       if (!order) throw Object.assign(new Error('Linked Sales Order not found.'), { status: 409 });
       const sortingVersion = Number(claimed.sortingVersion || 0) + 1;
 
@@ -662,7 +662,7 @@ router.patch('/:id/sort', async (req, res) => {
             operationKey: stockOperationKey('pick-list', claimed._id, item._id, 'sorting-short', sortingVersion),
             correlationKey: stockOperationKey('pick-list', claimed._id, 'sorting', sortingVersion),
             movementType: 'sorting_short', phase: 'reclassified',
-            branch: req.branchId, product: item.product, warehouse: item.warehouse, shade: item.shade || '', batch: item.batch || '',
+            branch: req.branchScope, product: item.product, warehouse: item.warehouse, shade: item.shade || '', batch: item.batch || '',
             deltas: { reservedQty: -baseQuantity, totalQty: -baseQuantity, shortQty: baseQuantity },
             enteredQuantity: sortingShortQty, ...snapshot, baseQuantity,
             sourceType: 'PickList', sourceModel: 'PickList', sourceId: claimed._id, sourceLineId: item._id,
@@ -678,7 +678,7 @@ router.patch('/:id/sort', async (req, res) => {
             operationKey: stockOperationKey('pick-list', claimed._id, item._id, 'sorting-damage', sortingVersion),
             correlationKey: stockOperationKey('pick-list', claimed._id, 'sorting', sortingVersion),
             movementType: 'sorting_damage', phase: 'reclassified',
-            branch: req.branchId, product: item.product, warehouse: item.warehouse, shade: item.shade || '', batch: item.batch || '',
+            branch: req.branchScope, product: item.product, warehouse: item.warehouse, shade: item.shade || '', batch: item.batch || '',
             deltas: { reservedQty: -baseQuantity, damagedQty: baseQuantity },
             enteredQuantity: sortingDamagedQty, ...snapshot, baseQuantity,
             sourceType: 'PickList', sourceModel: 'PickList', sourceId: claimed._id, sourceLineId: item._id,
@@ -737,7 +737,7 @@ router.patch('/:id/sort', async (req, res) => {
 
 router.patch('/:id/pack', async (req, res) => {
   try {
-    const pickList = await PickList.findOne({ _id: req.params.id, branch: req.branchId });
+    const pickList = await PickList.findOne({ _id: req.params.id, branch: req.branchScope });
     if (!pickList) return res.status(404).json({ success: false, message: 'Pick list not found.' });
     if (pickList.status === 'packed') return res.json({ success: true, message: 'Pick list already packed.', data: pickList });
     if (pickList.status !== 'sorted') return stateError(res, pickList, 'sorted', 'pack pick list');
@@ -794,7 +794,7 @@ router.patch('/:id/pack', async (req, res) => {
 
 router.patch('/:id/ready', async (req, res) => {
   try {
-    const pickList = await PickList.findOne({ _id: req.params.id, branch: req.branchId });
+    const pickList = await PickList.findOne({ _id: req.params.id, branch: req.branchScope });
     if (!pickList) return res.status(404).json({ success: false, message: 'Pick list not found.' });
     if (pickList.status === 'ready_for_dispatch') return res.json({ success: true, message: 'Pick list already ready for dispatch.', data: pickList });
     if (pickList.status !== 'packed') return stateError(res, pickList, 'packed', 'mark ready for dispatch');
@@ -817,7 +817,7 @@ router.patch('/:id/verify-loading', async (req, res) => {
   try {
     let loaded;
     await session.withTransaction(async () => {
-      const current = await PickList.findOne({ _id: req.params.id, branch: req.branchId }).session(session);
+      const current = await PickList.findOne({ _id: req.params.id, branch: req.branchScope }).session(session);
       if (!current) throw Object.assign(new Error('Pick list not found.'), { status: 404 });
       if (current.status === 'loaded') { loaded = current; return; }
       if (current.status !== 'ready_for_dispatch') {
@@ -831,7 +831,7 @@ router.patch('/:id/verify-loading', async (req, res) => {
       if (submittedById.size !== current.items.length) throw Object.assign(new Error('Every pick-list item must appear exactly once.'), { status: 400 });
 
       const claimed = await PickList.findOneAndUpdate(
-        { _id: current._id, branch: req.branchId, status: 'ready_for_dispatch', loadingVerificationProcessing: { $ne: true } },
+        { _id: current._id, branch: req.branchScope, status: 'ready_for_dispatch', loadingVerificationProcessing: { $ne: true } },
         { $set: { loadingVerificationProcessing: true } },
         { new: true, session }
       );
@@ -913,7 +913,7 @@ router.patch('/:id/verify-loading', async (req, res) => {
         if (req.body.driverName)    tripUpdate.driverName    = req.body.driverName;
         if (req.body.driverPhone)   tripUpdate.driverPhone   = req.body.driverPhone;
         await DispatchTrip.updateOne(
-          { _id: claimed.dispatchTrip, branch: req.branchId },
+          { _id: claimed.dispatchTrip, branch: req.branchScope },
           { $set: tripUpdate },
           { session }
         );
@@ -933,7 +933,7 @@ router.patch('/:id/verify-loading', async (req, res) => {
           if (tripUpdate.driverPhone)   deliveryUpdate.driverPhone   = tripUpdate.driverPhone;
           await Delivery.updateMany(
             {
-              branch: req.branchId,
+              branch: req.branchScope,
               dispatchTrip: claimed.dispatchTrip,
               // Only update deliveries that haven't been completed yet
               status: { $nin: ['delivered', 'partially_delivered', 'failed'] },

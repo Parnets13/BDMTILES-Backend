@@ -5,7 +5,7 @@ export const isSalesExecutive = (user) => user?.role === 'sales_executive';
 export const getLeadRecordPredicate = async (req, resourceKey = '*') => {
   const policyScope = await getAccessPolicyScope({
     user: req.user,
-    branchId: req.branchId,
+    branchId: req.branchScope,
     module: 'lead',
     resourceKey,
   });
@@ -16,7 +16,7 @@ export const getLeadRecordPredicate = async (req, resourceKey = '*') => {
 };
 
 export const getLeadCreateScope = (req) => ({
-  branch: req.branchId,
+  branch: req.branchScope,
   createdBy: req.user._id,
   createdByName: req.user.name,
 });

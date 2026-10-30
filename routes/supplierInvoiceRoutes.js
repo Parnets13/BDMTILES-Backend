@@ -169,7 +169,7 @@ router.get('/', requirePermission('invoice'), async (req, res) => {
   try {
     const page = Math.max(1, Number.parseInt(req.query.page, 10) || 1);
     const limit = Math.min(100, Math.max(1, Number.parseInt(req.query.limit, 10) || 20));
-    const filter = { branch: req.branchId };
+    const filter = { branch: req.branchScope };
     if (req.query.search) {
       const escaped = String(req.query.search).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
       const regex = new RegExp(escaped, 'i');
@@ -188,7 +188,7 @@ router.get('/', requirePermission('invoice'), async (req, res) => {
 
 router.get('/stats', requirePermission('invoice'), async (req, res) => {
   try {
-    const scope = { branch: req.branchId };
+    const scope = { branch: req.branchScope };
     const [total, draft, pendingVerification, verified, partial, paid, totalValue, outstanding] = await Promise.all([
       SupplierInvoice.countDocuments(scope),
       SupplierInvoice.countDocuments({ ...scope, status: 'draft' }),
@@ -213,15 +213,15 @@ router.get('/stats', requirePermission('invoice'), async (req, res) => {
 router.get('/available-grns', requirePermission('invoice'), async (req, res) => {
   try {
     if (!mongoose.isValidObjectId(req.query.supplier)) throw invoiceError(422, 'A valid supplier is required.');
-    const usedGRNs = await SupplierInvoice.distinct('linkedGRNs', { branch: req.branchId, status: { $ne: 'cancelled' } });
+    const usedGRNs = await SupplierInvoice.distinct('linkedGRNs', { branch: req.branchScope, status: { $ne: 'cancelled' } });
     const grns = await GRN.find({
-      branch: req.branchId,
+      branch: req.branchScope,
       supplier: req.query.supplier,
       status: { $in: ['approved', 'posted'] },
       _id: { $nin: usedGRNs },
     }).sort({ grnDate: 1 });
     const poIds = [...new Set(grns.map(grn => idText(grn.purchaseOrder)))];
-    const purchaseOrders = await PurchaseOrder.find({ _id: { $in: poIds }, branch: req.branchId });
+    const purchaseOrders = await PurchaseOrder.find({ _id: { $in: poIds }, branch: req.branchScope });
     const poMap = new Map(purchaseOrders.map(po => [idText(po._id), po]));
     const data = grns.map(grn => {
       const po = poMap.get(idText(grn.purchaseOrder));
@@ -242,7 +242,7 @@ router.get('/available-grns', requirePermission('invoice'), async (req, res) => 
 
 router.get('/:id', requirePermission('invoice'), async (req, res) => {
   try {
-    const invoice = await SupplierInvoice.findOne({ _id: req.params.id, branch: req.branchId })
+    const invoice = await SupplierInvoice.findOne({ _id: req.params.id, branch: req.branchScope })
       .populate('supplier', 'companyName supplierCode mobile')
       .populate('linkedGRNs', 'grnNumber grnDate poNumber status')
       .populate('items.product', 'productCode itemName tileSize images')
@@ -262,7 +262,7 @@ router.post('/', requirePermission('invoice'), async (req, res) => {
     let result;
     let replayed = false;
     await session.withTransaction(async () => {
-      const existing = await SupplierInvoice.findOne({ branch: req.branchId, sourceKey }).session(session);
+      const existing = await SupplierInvoice.findOne({ branch: req.branchScope, sourceKey }).session(session);
       if (existing) {
         if (existing.requestFingerprint && existing.requestFingerprint !== requestFingerprint) {
           throw invoiceError(409, 'This Idempotency-Key was already used with a different payload.');
@@ -277,7 +277,7 @@ router.post('/', requirePermission('invoice'), async (req, res) => {
       const supplier = await Supplier.findOne({ _id: req.body.supplier, status: 'active' }).session(session).lean();
       if (!supplier) throw invoiceError(404, 'Active supplier not found.');
       const duplicate = await SupplierInvoice.findOne({
-        branch: req.branchId,
+        branch: req.branchScope,
         supplier: supplier._id,
         invoiceNumber,
         status: { $ne: 'cancelled' },
@@ -285,7 +285,7 @@ router.post('/', requirePermission('invoice'), async (req, res) => {
       if (duplicate) throw invoiceError(409, 'This supplier invoice number already exists for the supplier.');
 
       const { expected } = await loadInvoiceSources({
-        branchId: req.branchId,
+        branchId: req.branchScope,
         supplierId: supplier._id,
         linkedGRNs: req.body.linkedGRNs,
         session,
@@ -305,7 +305,7 @@ router.post('/', requirePermission('invoice'), async (req, res) => {
         || new Date(new Date(invoiceDate).getTime() + supplierCreditDays * 24 * 60 * 60 * 1000);
       [result] = await SupplierInvoice.create([{
         invoiceRefNumber,
-        branch: req.branchId,
+        branch: req.branchScope,
         sourceKey,
         requestFingerprint,
         invoiceNumber,
@@ -346,7 +346,7 @@ router.patch('/:id/verify', requirePermission('invoice'), async (req, res) => {
     let replayed = false;
     let mismatch = false;
     await session.withTransaction(async () => {
-      const invoice = await SupplierInvoice.findOne({ _id: req.params.id, branch: req.branchId }).session(session);
+      const invoice = await SupplierInvoice.findOne({ _id: req.params.id, branch: req.branchScope }).session(session);
       if (!invoice) throw invoiceError(404, 'Supplier invoice not found.');
       if (['verified', 'partial', 'paid'].includes(invoice.status)) {
         result = invoice;
@@ -358,7 +358,7 @@ router.patch('/:id/verify', requirePermission('invoice'), async (req, res) => {
       }
 
       const { grns, expected } = await loadInvoiceSources({
-        branchId: req.branchId,
+        branchId: req.branchScope,
         supplierId: invoice.supplier,
         linkedGRNs: invoice.linkedGRNs,
         session,
@@ -382,7 +382,7 @@ router.patch('/:id/verify', requirePermission('invoice'), async (req, res) => {
 
       const legacyKeys = grns.map(grn => `grn:${grn._id}:approved`);
       const legacyEntries = await SupplierLedger.find({
-        branch: req.branchId,
+        branch: req.branchScope,
         supplier: invoice.supplier,
         postingKey: { $in: legacyKeys },
       }).session(session).lean();
@@ -417,7 +417,7 @@ router.patch('/:id/verify', requirePermission('invoice'), async (req, res) => {
       if (payableDelta > MATCH_TOLERANCE) {
         await postSubledgerEntry({
           session,
-          branch: req.branchId,
+          branch: req.branchScope,
           partyType: 'supplier',
           partyId: invoice.supplier,
           amount: payableDelta,
@@ -439,7 +439,7 @@ router.patch('/:id/verify', requirePermission('invoice'), async (req, res) => {
       invoice.verifiedAt = new Date();
       await invoice.save({ session });
       await GRN.updateMany(
-        { _id: { $in: invoice.linkedGRNs }, branch: req.branchId },
+        { _id: { $in: invoice.linkedGRNs }, branch: req.branchScope },
         { $set: { payableRecognition: 'invoice' } },
         { session }
       );

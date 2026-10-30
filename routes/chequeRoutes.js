@@ -284,7 +284,7 @@ router.get('/', requirePermission('cheque.view'), async (req, res) => {
     const { page = 1, limit = 20, search, status, chequeType, dateFrom, dateTo } = req.query;
     const p = Math.max(1, Number.parseInt(page, 10) || 1);
     const l = Math.min(100, Math.max(1, Number.parseInt(limit, 10) || 20));
-    const filter = { branch: req.branchId };
+    const filter = { branch: req.branchScope };
     if (search) {
       const regex = new RegExp(escapeRegex(search), 'i');
       filter.$or = [{ chequeNumber: regex }, { partyName: regex }, { bankName: regex }, { paymentNumber: regex }];
@@ -301,7 +301,7 @@ router.get('/', requirePermission('cheque.view'), async (req, res) => {
       Cheque.find(filter).sort({ chequeDate: -1, createdAt: -1 }).skip((p - 1) * l).limit(l)
         .populate('dealer', 'businessName dealerCode')
         .populate('supplier', 'companyName supplierCode')
-        .populate({ path: 'payment', match: { branch: req.branchId }, select: 'paymentNumber paymentType paymentMode status amount chequeNumber createdBy' })
+        .populate({ path: 'payment', match: { branch: req.branchScope }, select: 'paymentNumber paymentType paymentMode status amount chequeNumber createdBy' })
         .lean(),
       Cheque.countDocuments(filter),
     ]);
@@ -341,7 +341,7 @@ router.get('/linkable-payments', requirePermission('cheque.create'), async (req,
     const { chequeType, dealer, supplier } = req.query;
     if (!['received', 'issued'].includes(chequeType)) throw routeError(422, 'A valid chequeType is required.');
     const filter = {
-      branch: req.branchId,
+      branch: req.branchScope,
       paymentMode: 'cheque',
       status: 'pending',
       cheque: null,
@@ -354,7 +354,7 @@ router.get('/linkable-payments', requirePermission('cheque.create'), async (req,
       if (!supplier) throw routeError(422, 'supplier is required.');
       filter.supplier = supplier;
     }
-    const linkedIds = await Cheque.find({ branch: req.branchId, payment: { $ne: null } }).distinct('payment');
+    const linkedIds = await Cheque.find({ branch: req.branchScope, payment: { $ne: null } }).distinct('payment');
     if (linkedIds.length) filter._id = { $nin: linkedIds };
     const payments = await Payment.find(filter)
       .select('paymentNumber paymentType paymentDate amount bankName chequeNumber chequeDate dealer supplier status')
@@ -365,11 +365,11 @@ router.get('/linkable-payments', requirePermission('cheque.create'), async (req,
 
 router.get('/:id/re-deposit-candidates', requirePermission('cheque.return'), async (req, res) => {
   try {
-    const cheque = await Cheque.findOne({ _id: req.params.id, branch: req.branchId }).lean();
+    const cheque = await Cheque.findOne({ _id: req.params.id, branch: req.branchScope }).lean();
     if (!cheque) throw routeError(404, 'Cheque not found in the active branch.');
     ensureTransition(cheque, 'reDeposit');
     const filter = {
-      branch: req.branchId,
+      branch: req.branchScope,
       paymentMode: 'cheque',
       status: 'pending',
       cheque: null,
@@ -379,7 +379,7 @@ router.get('/:id/re-deposit-candidates', requirePermission('cheque.return'), asy
       chequeNumber: { $regex: `^${escapeRegex(cheque.chequeNumber)}$`, $options: 'i' },
       _id: { $ne: cheque.payment },
     };
-    const linkedIds = await Cheque.find({ branch: req.branchId, payment: { $ne: null }, _id: { $ne: cheque._id } }).distinct('payment');
+    const linkedIds = await Cheque.find({ branch: req.branchScope, payment: { $ne: null }, _id: { $ne: cheque._id } }).distinct('payment');
     if (linkedIds.length) filter._id = { $nin: [...linkedIds, cheque.payment].filter(Boolean) };
     const payments = await Payment.find(filter)
       .select('paymentNumber paymentDate amount bankName chequeNumber chequeDate status dealer')
@@ -391,14 +391,14 @@ router.get('/:id/re-deposit-candidates', requirePermission('cheque.return'), asy
 // GET /api/v1/cheques/:id — authoritative detail with branch-safe linkage and actors
 router.get('/:id', requirePermission('cheque.view'), async (req, res) => {
   try {
-    const cheque = await Cheque.findOne({ _id: req.params.id, branch: req.branchId })
+    const cheque = await Cheque.findOne({ _id: req.params.id, branch: req.branchScope })
       .populate('dealer', 'businessName dealerCode mobile status')
       .populate('supplier', 'companyName supplierCode mobile status')
       .populate('createdBy', 'name email role')
       .populate('timeline.performedBy', 'name email role')
       .populate({
         path: 'payment',
-        match: { branch: req.branchId },
+        match: { branch: req.branchScope },
         select: 'paymentNumber branch cheque paymentDate paymentType dealer supplier partyName againstOrders amount paymentMode bankName chequeNumber chequeDate transactionRef status bounceReason bounceCharges remarks createdBy createdAt updatedAt',
         populate: [
           { path: 'dealer', select: 'businessName dealerCode mobile' },
@@ -476,7 +476,7 @@ router.patch('/:id/deposit', requirePermission('cheque.deposit'), async (req, re
       });
     }
     const updated = await Cheque.findOneAndUpdate(
-      { _id: current._id, branch: req.branchId, status: current.status },
+      { _id: current._id, branch: req.branchScope, status: current.status },
       {
         $set: {
           status: 'deposited', depositedDate, depositedBank,
@@ -519,7 +519,7 @@ router.patch('/:id/clear', requirePermission('cheque.clear'), async (req, res) =
         if (payment.status === 'pending') {
           await validatePaymentData(payment.toObject(), session, { allowLegacySalesOrder: true });
           payment = await Payment.findOneAndUpdate(
-            { _id: payment._id, branch: req.branchId, status: 'pending' },
+            { _id: payment._id, branch: req.branchScope, status: 'pending' },
             { $set: { status: 'confirmed', confirmedAt: clearedDate, bouncedAt: null, cancelledAt: null } },
             { new: true, runValidators: true, session }
           );
@@ -532,7 +532,7 @@ router.patch('/:id/clear', requirePermission('cheque.clear'), async (req, res) =
       }
 
       cheque = await Cheque.findOneAndUpdate(
-        { _id: current._id, branch: req.branchId, status: current.status },
+        { _id: current._id, branch: req.branchScope, status: current.status },
         {
           $set: {
             status: 'cleared', clearedDate,
@@ -582,7 +582,7 @@ router.patch('/:id/bounce', requirePermission('cheque.bounce'), async (req, res)
         const previousPaymentStatus = payment.status;
         if (previousPaymentStatus !== 'bounced') {
           payment = await Payment.findOneAndUpdate(
-            { _id: payment._id, branch: req.branchId, status: previousPaymentStatus },
+            { _id: payment._id, branch: req.branchScope, status: previousPaymentStatus },
             { $set: { status: 'bounced', bouncedAt: bounceDate, bounceReason: reason, bounceCharges: charges } },
             { new: true, runValidators: true, session }
           );
@@ -599,7 +599,7 @@ router.patch('/:id/bounce', requirePermission('cheque.bounce'), async (req, res)
       }
 
       cheque = await Cheque.findOneAndUpdate(
-        { _id: current._id, branch: req.branchId, status: current.status },
+        { _id: current._id, branch: req.branchScope, status: current.status },
         {
           $set: { status: 'bounced', bounceDate, bounceReason: reason, bounceCharges: charges },
           $inc: { bounceCount: 1 },
@@ -661,7 +661,7 @@ router.patch('/:id/re-deposit', requirePermission('cheque.return'), async (req, 
         ? `Old Payment ${oldPayment?.paymentNumber || 'none'} remains bounced; replacement Payment ${replacementPayment.paymentNumber} is pending and will be applied only on clearance.`
         : 'Standalone cheque re-deposited; no ledger/accounting entry was posted.';
       cheque = await Cheque.findOneAndUpdate(
-        { _id: current._id, branch: req.branchId, status: 'bounced' },
+        { _id: current._id, branch: req.branchScope, status: 'bounced' },
         {
           $set: {
             status: 're_deposited', reDepositDate, depositedDate: reDepositDate,
@@ -710,7 +710,7 @@ router.patch('/:id/return', requirePermission('cheque.return'), async (req, res)
         payment = await claimPaymentLink(payment, current._id, req.branchId, session);
         if (payment.status === 'pending') {
           payment = await Payment.findOneAndUpdate(
-            { _id: payment._id, branch: req.branchId, status: 'pending' },
+            { _id: payment._id, branch: req.branchScope, status: 'pending' },
             { $set: { status: 'cancelled', cancelledAt: returnedDate } },
             { new: true, runValidators: true, session }
           );
@@ -722,7 +722,7 @@ router.patch('/:id/return', requirePermission('cheque.return'), async (req, res)
       }
 
       cheque = await Cheque.findOneAndUpdate(
-        { _id: current._id, branch: req.branchId, status: current.status },
+        { _id: current._id, branch: req.branchScope, status: current.status },
         {
           $set: { status: 'returned', returnedDate, returnReason: reason },
           $push: { timeline: timelineEntry(

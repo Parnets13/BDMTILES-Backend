@@ -65,8 +65,8 @@ const emitNotification = async (payload) => {
   catch (error) { console.error('Lead notification error:', error.message); }
 };
 const emitChange = ({ req, lead, action, recipients = [] }) => {
-  publishLeadEvent({ branchId: req.branchId, event: 'lead.changed', data: { action } });
-  if (recipients.length) publishLeadEvent({ branchId: req.branchId, userIds: recipients, event: `lead.${action}`, data: { leadId: lead._id, action } });
+  publishLeadEvent({ branchId: req.branchScope, event: 'lead.changed', data: { action } });
+  if (recipients.length) publishLeadEvent({ branchId: req.branchScope, userIds: recipients, event: `lead.${action}`, data: { leadId: lead._id, action } });
 };
 const validateId = (id, label = 'identifier') => {
   if (!mongoose.isValidObjectId(id)) throw Object.assign(new Error(`Invalid ${label}.`), { status: 422 });
@@ -88,12 +88,12 @@ router.get('/events', requireAnyPermission('lead.view', 'lead.app'), (req, res) 
     'X-Accel-Buffering': 'no',
   });
   res.flushHeaders?.();
-  const cleanup = addLeadEventClient({ branchId: req.branchId, userId: req.user._id, role: req.user.role, response: res });
+  const cleanup = addLeadEventClient({ branchId: req.branchScope, userId: req.user._id, role: req.user.role, response: res });
   req.on('close', cleanup);
 });
 
 router.get('/settings', requirePermission('lead.assign'), asyncRoute(async (req, res) => {
-  res.json({ success: true, data: await getLeadOperationsSetting(req.branchId) });
+  res.json({ success: true, data: await getLeadOperationsSetting(req.branchScope) });
 }));
 
 router.patch('/settings', requirePermission('lead.assign'), asyncRoute(async (req, res) => {
@@ -106,21 +106,21 @@ router.patch('/settings', requirePermission('lead.assign'), asyncRoute(async (re
     return res.status(422).json({ success: false, message: 'Workload limit must be 1–500.' });
   }
   const settings = await LeadOperationsSetting.findOneAndUpdate(
-    { branch: req.branchId },
-    { $set: { acceptanceDeadlineMinutes, maxActiveLeads, updatedBy: req.user._id }, $setOnInsert: { branch: req.branchId } },
+    { branch: req.branchScope },
+    { $set: { acceptanceDeadlineMinutes, maxActiveLeads, updatedBy: req.user._id }, $setOnInsert: { branch: req.branchScope } },
     { upsert: true, new: true, runValidators: true }
   );
   res.json({ success: true, message: 'Lead operation settings saved.', data: settings });
 }));
 
 router.post('/assignments/process-timeouts', requirePermission('lead.assign'), asyncRoute(async (req, res) => {
-  const expired = await expireAssignments({ branchId: req.branchId, actor: req.user });
+  const expired = await expireAssignments({ branchId: req.branchScope, actor: req.user });
   res.json({ success: true, message: `${expired.length} assignment(s) expired.`, data: { expired } });
 }));
 
 router.get('/availability/me', requireAnyPermission('lead.app', 'lead.respond'), asyncRoute(async (req, res) => {
-  const availability = await LeadExecutiveAvailability.findOne({ branch: req.branchId, user: req.user._id }).lean();
-  res.json({ success: true, data: availability || { user: req.user._id, branch: req.branchId, status: 'offline', reason: '' } });
+  const availability = await LeadExecutiveAvailability.findOne({ branch: req.branchScope, user: req.user._id }).lean();
+  res.json({ success: true, data: availability || { user: req.user._id, branch: req.branchScope, status: 'offline', reason: '' } });
 }));
 
 router.patch('/availability/me', requireAnyPermission('lead.app', 'lead.respond'), asyncRoute(async (req, res) => {
@@ -129,17 +129,17 @@ router.patch('/availability/me', requireAnyPermission('lead.app', 'lead.respond'
   const data = pick(req.body, ['status', 'reason']);
   const now = new Date();
   const availability = await LeadExecutiveAvailability.findOneAndUpdate(
-    { branch: req.branchId, user: req.user._id },
-    { $set: { ...data, updatedBy: req.user._id, statusUpdatedAt: now, lastSeenAt: now }, $setOnInsert: { branch: req.branchId, user: req.user._id } },
+    { branch: req.branchScope, user: req.user._id },
+    { $set: { ...data, updatedBy: req.user._id, statusUpdatedAt: now, lastSeenAt: now }, $setOnInsert: { branch: req.branchScope, user: req.user._id } },
     { upsert: true, new: true, runValidators: true }
   );
-  publishLeadEvent({ branchId: req.branchId, event: 'availability.changed', data: { userId: req.user._id, status: availability.status } });
+  publishLeadEvent({ branchId: req.branchScope, event: 'availability.changed', data: { userId: req.user._id, status: availability.status } });
   res.json({ success: true, message: 'Availability updated.', data: availability });
 }));
 
 router.patch('/availability/:userId', requirePermission('lead.assign'), asyncRoute(async (req, res) => {
   validateId(req.params.userId, 'user identifier');
-  const executive = await User.findOne({ _id: req.params.userId, role: 'sales_executive', status: 'Active', assignedBranches: req.branchId }).select('_id');
+  const executive = await User.findOne({ _id: req.params.userId, role: 'sales_executive', status: 'Active', assignedBranches: req.branchScope }).select('_id');
   if (!executive) return res.status(404).json({ success: false, message: 'Sales Executive not found in this branch.' });
   const allowed = ['available', 'busy', 'attending', 'travelling', 'on_break', 'offline'];
   if (!allowed.includes(req.body.status) || !String(req.body.reason || '').trim()) {
@@ -147,24 +147,24 @@ router.patch('/availability/:userId', requirePermission('lead.assign'), asyncRou
   }
   const now = new Date();
   const availability = await LeadExecutiveAvailability.findOneAndUpdate(
-    { branch: req.branchId, user: executive._id },
-    { $set: { status: req.body.status, reason: req.body.reason.trim(), updatedBy: req.user._id, statusUpdatedAt: now, lastSeenAt: now }, $setOnInsert: { branch: req.branchId, user: executive._id } },
+    { branch: req.branchScope, user: executive._id },
+    { $set: { status: req.body.status, reason: req.body.reason.trim(), updatedBy: req.user._id, statusUpdatedAt: now, lastSeenAt: now }, $setOnInsert: { branch: req.branchScope, user: executive._id } },
     { upsert: true, new: true, runValidators: true }
   );
-  publishLeadEvent({ branchId: req.branchId, userIds: [executive._id], event: 'availability.changed', data: { userId: executive._id, status: availability.status } });
+  publishLeadEvent({ branchId: req.branchScope, userIds: [executive._id], event: 'availability.changed', data: { userId: executive._id, status: availability.status } });
   res.json({ success: true, message: 'Executive availability overridden.', data: availability });
 }));
 
 router.get('/se-status', requirePermission('lead.assign'), asyncRoute(async (req, res) => {
-  await expireAssignments({ branchId: req.branchId });
+  await expireAssignments({ branchId: req.branchScope });
   const [executives, counts, availability, settings] = await Promise.all([
-    User.find({ role: 'sales_executive', status: 'Active', assignedBranches: req.branchId }).select('name phone assignedRegions').lean(),
+    User.find({ role: 'sales_executive', status: 'Active', assignedBranches: req.branchScope }).select('name phone assignedRegions').lean(),
     Lead.aggregate([
-      { $match: { branch: req.branchId, assignmentStatus: { $in: ['pending', 'accepted'] }, status: { $nin: TERMINAL_STATUSES } } },
+      { $match: { branch: req.branchScope, assignmentStatus: { $in: ['pending', 'accepted'] }, status: { $nin: TERMINAL_STATUSES } } },
       { $group: { _id: '$assignedTo', activeLeads: { $sum: 1 }, pendingResponse: { $sum: { $cond: [{ $eq: ['$assignmentStatus', 'pending'] }, 1, 0] } } } },
     ]),
-    LeadExecutiveAvailability.find({ branch: req.branchId }).lean(),
-    getLeadOperationsSetting(req.branchId),
+    LeadExecutiveAvailability.find({ branch: req.branchScope }).lean(),
+    getLeadOperationsSetting(req.branchScope),
   ]);
   const countMap = new Map(counts.map((row) => [String(row._id), row]));
   const availabilityMap = new Map(availability.map((row) => [String(row.user), row]));
@@ -192,7 +192,7 @@ router.get('/se-status', requirePermission('lead.assign'), asyncRoute(async (req
 }));
 
 router.get('/stats', requirePermission('lead.view'), asyncRoute(async (req, res) => {
-  await expireAssignments({ branchId: req.branchId });
+  await expireAssignments({ branchId: req.branchScope });
   const scope = await getLeadRecordPredicate(req, 'stats');
   const today = new Date();
   today.setHours(0, 0, 0, 0);
@@ -214,7 +214,7 @@ router.get('/stats', requirePermission('lead.view'), asyncRoute(async (req, res)
 }));
 
 router.get('/my-leads', requirePermission('lead.app'), asyncRoute(async (req, res) => {
-  await expireAssignments({ branchId: req.branchId });
+  await expireAssignments({ branchId: req.branchScope });
   const scope = await getLeadRecordPredicate(req, 'app');
   const leads = await Lead.aggregate([
     { $match: { ...scope, status: { $nin: TERMINAL_STATUSES } } },
@@ -236,7 +236,7 @@ router.get('/my-leads', requirePermission('lead.app'), asyncRoute(async (req, re
 }));
 
 router.get('/', requirePermission('lead.view'), asyncRoute(async (req, res) => {
-  await expireAssignments({ branchId: req.branchId });
+  await expireAssignments({ branchId: req.branchScope });
   const { page = 1, limit = 20, search, status, customerType, assignedTo, assignmentStatus, priority, sortBy = 'queue' } = req.query;
   const p = Math.max(1, Number.parseInt(page, 10) || 1);
   const l = Math.min(100, Number.parseInt(limit, 10) || 20);
@@ -311,16 +311,16 @@ router.post('/', requirePermission('lead.create'), asyncRoute(async (req, res) =
 
   if (assignToSelf) {
     await LeadExecutiveAvailability.findOneAndUpdate(
-      { branch: req.branchId, user: req.user._id },
-      { $set: { status: 'attending', currentLead: lead._id, updatedBy: req.user._id, statusUpdatedAt: now, lastSeenAt: now }, $setOnInsert: { branch: req.branchId, user: req.user._id } },
+      { branch: req.branchScope, user: req.user._id },
+      { $set: { status: 'attending', currentLead: lead._id, updatedBy: req.user._id, statusUpdatedAt: now, lastSeenAt: now }, $setOnInsert: { branch: req.branchScope, user: req.user._id } },
       { upsert: true }
     );
-    publishLeadEvent({ branchId: req.branchId, event: 'availability.changed', data: { userId: req.user._id, status: 'attending' } });
+    publishLeadEvent({ branchId: req.branchScope, event: 'availability.changed', data: { userId: req.user._id, status: 'attending' } });
   }
 
-  await appendLeadActivity({ branch: req.branchId, lead, type: 'created', summary: `Lead ${lead.leadNumber} created${assignToSelf ? ' and assigned to self' : ''}`, actor: req.user });
+  await appendLeadActivity({ branch: req.branchScope, lead, type: 'created', summary: `Lead ${lead.leadNumber} created${assignToSelf ? ' and assigned to self' : ''}`, actor: req.user });
   await emitNotification({
-    branch: req.branchId, module: 'lead', event: 'lead_created', eventKey: `lead:${lead._id}:created`,
+    branch: req.branchScope, module: 'lead', event: 'lead_created', eventKey: `lead:${lead._id}:created`,
     title: `Lead ${lead.leadNumber} created`, body: `${lead.name} was added as a new lead.`,
     deepLink: `/crm/lead-management?lead=${lead._id}`, data: { leadId: lead._id, leadNumber: lead.leadNumber }, actor: req.user._id,
   });
@@ -330,7 +330,7 @@ router.post('/', requirePermission('lead.create'), asyncRoute(async (req, res) =
 
 router.get('/:id/visits', requireAnyPermission('lead.view', 'lead.app'), asyncRoute(async (req, res) => {
   const { lead } = await leadOr404(req, 'visits');
-  const visits = await LeadVisit.find({ branch: req.branchId, lead: lead._id })
+  const visits = await LeadVisit.find({ branch: req.branchScope, lead: lead._id })
     .sort({ scheduledAt: -1 }).populate('assignedTo', 'name phone').lean();
   res.json({ success: true, data: visits });
 }));
@@ -341,10 +341,10 @@ router.post('/:id/visits', requirePermission('lead.followup'), asyncRoute(async 
   if (!assignedTo || (req.user.role === 'sales_executive' && String(assignedTo) !== String(req.user._id))) {
     return res.status(422).json({ success: false, message: 'Visit owner must be the currently assigned executive.' });
   }
-  const executive = await User.findOne({ _id: assignedTo, role: 'sales_executive', status: 'Active', assignedBranches: req.branchId }).select('_id');
+  const executive = await User.findOne({ _id: assignedTo, role: 'sales_executive', status: 'Active', assignedBranches: req.branchScope }).select('_id');
   if (!executive) return res.status(422).json({ success: false, message: 'Visit executive is unavailable in this branch.' });
   const visit = await LeadVisit.create({
-    branch: req.branchId,
+    branch: req.branchScope,
     lead: lead._id,
     assignedTo,
     scheduledAt: req.body.scheduledAt,
@@ -356,7 +356,7 @@ router.post('/:id/visits', requirePermission('lead.followup'), asyncRoute(async 
     createdBy: req.user._id,
     transitions: [{ to: 'scheduled', by: req.user._id, byName: req.user.name, remarks: req.body.remarks || '' }],
   });
-  await appendLeadActivity({ branch: req.branchId, lead, visit, type: 'visit_created', summary: 'Visit scheduled', actor: req.user, data: { scheduledAt: visit.scheduledAt } });
+  await appendLeadActivity({ branch: req.branchScope, lead, visit, type: 'visit_created', summary: 'Visit scheduled', actor: req.user, data: { scheduledAt: visit.scheduledAt } });
   emitChange({ req, lead, action: 'visit_created', recipients: [assignedTo] });
   res.status(201).json({ success: true, message: 'Visit scheduled.', data: visit });
 }));
@@ -364,7 +364,7 @@ router.post('/:id/visits', requirePermission('lead.followup'), asyncRoute(async 
 router.patch('/:id/visits/:visitId/status', requirePermission('lead.followup'), asyncRoute(async (req, res) => {
   const { lead } = await leadOr404(req, 'visits');
   validateId(req.params.visitId, 'visit identifier');
-  const filter = { _id: req.params.visitId, branch: req.branchId, lead: lead._id };
+  const filter = { _id: req.params.visitId, branch: req.branchScope, lead: lead._id };
   if (req.user.role === 'sales_executive') filter.assignedTo = req.user._id;
   const visit = await LeadVisit.findOne(filter);
   if (!visit) return res.status(404).json({ success: false, message: 'Visit not found.' });
@@ -392,23 +392,23 @@ router.patch('/:id/visits/:visitId/status', requirePermission('lead.followup'), 
   if (!transitionedVisit) return res.status(409).json({ success: false, message: 'Visit changed before this transition. Refresh and retry.' });
   if (['travelling', 'attending'].includes(next)) {
     await LeadExecutiveAvailability.findOneAndUpdate(
-      { branch: req.branchId, user: transitionedVisit.assignedTo },
-      { $set: { status: next, currentLead: lead._id, currentVisit: transitionedVisit._id, updatedBy: req.user._id, statusUpdatedAt: now, lastSeenAt: now }, $setOnInsert: { branch: req.branchId, user: transitionedVisit.assignedTo } },
+      { branch: req.branchScope, user: transitionedVisit.assignedTo },
+      { $set: { status: next, currentLead: lead._id, currentVisit: transitionedVisit._id, updatedBy: req.user._id, statusUpdatedAt: now, lastSeenAt: now }, $setOnInsert: { branch: req.branchScope, user: transitionedVisit.assignedTo } },
       { upsert: true, runValidators: true }
     );
   } else if (['completed', 'cancelled', 'no_show'].includes(next)) {
     await LeadExecutiveAvailability.updateOne(
-      { branch: req.branchId, user: transitionedVisit.assignedTo, currentVisit: transitionedVisit._id },
+      { branch: req.branchScope, user: transitionedVisit.assignedTo, currentVisit: transitionedVisit._id },
       { $set: { status: 'available', currentLead: null, currentVisit: null, updatedBy: req.user._id, statusUpdatedAt: now, lastSeenAt: now } }
     );
   }
-  await appendLeadActivity({ branch: req.branchId, lead, visit: transitionedVisit, type: 'visit_transition', summary: `Visit ${previous} → ${next}`, actor: req.user, fromStatus: previous, toStatus: next, data: { outcome: transitionedVisit.outcome, nextAction: transitionedVisit.nextAction } });
+  await appendLeadActivity({ branch: req.branchScope, lead, visit: transitionedVisit, type: 'visit_transition', summary: `Visit ${previous} → ${next}`, actor: req.user, fromStatus: previous, toStatus: next, data: { outcome: transitionedVisit.outcome, nextAction: transitionedVisit.nextAction } });
   emitChange({ req, lead, action: 'visit_transition', recipients: [transitionedVisit.assignedTo] });
   res.json({ success: true, message: `Visit marked ${next}.`, data: transitionedVisit });
 }));
 
 router.get('/:id', requireAnyPermission('lead.view', 'lead.app'), asyncRoute(async (req, res) => {
-  await expireAssignments({ branchId: req.branchId });
+  await expireAssignments({ branchId: req.branchScope });
   const { lead } = await leadOr404(req, 'detail');
   await lead.populate([
     { path: 'assignedTo', select: 'name phone role' },
@@ -419,8 +419,8 @@ router.get('/:id', requireAnyPermission('lead.view', 'lead.app'), asyncRoute(asy
     { path: 'incentiveEarning' },
   ]);
   const [visits, activities] = await Promise.all([
-    LeadVisit.find({ branch: req.branchId, lead: lead._id }).sort({ scheduledAt: -1 }).populate('assignedTo', 'name phone').lean(),
-    LeadActivity.find({ branch: req.branchId, lead: lead._id }).sort({ createdAt: -1 }).populate('actor', 'name role').lean(),
+    LeadVisit.find({ branch: req.branchScope, lead: lead._id }).sort({ scheduledAt: -1 }).populate('assignedTo', 'name phone').lean(),
+    LeadActivity.find({ branch: req.branchScope, lead: lead._id }).sort({ createdAt: -1 }).populate('actor', 'name role').lean(),
   ]);
   res.json({ success: true, data: { ...lead.toObject(), visits, activities } });
 }));
@@ -429,7 +429,7 @@ router.put('/:id', requirePermission('lead.update'), asyncRoute(async (req, res)
   const { lead } = await leadOr404(req, 'update');
   Object.assign(lead, pick(req.body, UPDATE_FIELDS));
   await lead.save();
-  await appendLeadActivity({ branch: req.branchId, lead, type: 'updated', summary: 'Lead details updated', actor: req.user });
+  await appendLeadActivity({ branch: req.branchScope, lead, type: 'updated', summary: 'Lead details updated', actor: req.user });
   emitChange({ req, lead, action: 'updated', recipients: lead.assignedTo ? [lead.assignedTo] : [] });
   res.json({ success: true, message: 'Lead updated.', data: lead });
 }));
@@ -439,7 +439,7 @@ router.patch('/:id/assign', requirePermission('lead.assign'), asyncRoute(async (
   const lead = await assignLeadAtomically({
     leadId: req.params.id,
     scope,
-    branchId: req.branchId,
+    branchId: req.branchScope,
     assignedTo: req.body.assignedTo,
     actor: req.user,
     expectedVersion: Number(req.body.expectedVersion),
@@ -452,20 +452,20 @@ router.patch('/:id/assign', requirePermission('lead.assign'), asyncRoute(async (
 
 router.patch('/:id/accept', requirePermission('lead.respond'), asyncRoute(async (req, res) => {
   const scope = await getLeadRecordPredicate(req, 'respond');
-  const lead = await respondToAssignment({ leadId: req.params.id, scope, branchId: req.branchId, actor: req.user, action: 'accepted', expectedVersion: Number(req.body.expectedVersion) });
+  const lead = await respondToAssignment({ leadId: req.params.id, scope, branchId: req.branchScope, actor: req.user, action: 'accepted', expectedVersion: Number(req.body.expectedVersion) });
   const now = new Date();
   await LeadExecutiveAvailability.findOneAndUpdate(
-    { branch: req.branchId, user: req.user._id },
-    { $set: { status: 'attending', currentLead: lead._id, updatedBy: req.user._id, statusUpdatedAt: now, lastSeenAt: now }, $setOnInsert: { branch: req.branchId, user: req.user._id } },
+    { branch: req.branchScope, user: req.user._id },
+    { $set: { status: 'attending', currentLead: lead._id, updatedBy: req.user._id, statusUpdatedAt: now, lastSeenAt: now }, $setOnInsert: { branch: req.branchScope, user: req.user._id } },
     { upsert: true }
   );
-  publishLeadEvent({ branchId: req.branchId, event: 'availability.changed', data: { userId: req.user._id, status: 'attending' } });
+  publishLeadEvent({ branchId: req.branchScope, event: 'availability.changed', data: { userId: req.user._id, status: 'attending' } });
   res.json({ success: true, message: 'Lead accepted.', data: lead });
 }));
 
 router.patch('/:id/decline', requirePermission('lead.respond'), asyncRoute(async (req, res) => {
   const scope = await getLeadRecordPredicate(req, 'respond');
-  const lead = await respondToAssignment({ leadId: req.params.id, scope, branchId: req.branchId, actor: req.user, action: 'declined', reason: req.body.reason, expectedVersion: Number(req.body.expectedVersion) });
+  const lead = await respondToAssignment({ leadId: req.params.id, scope, branchId: req.branchScope, actor: req.user, action: 'declined', reason: req.body.reason, expectedVersion: Number(req.body.expectedVersion) });
   res.json({ success: true, message: 'Lead declined for reassignment.', data: lead });
 }));
 
@@ -490,22 +490,22 @@ router.patch('/:id/followup', requirePermission('lead.followup'), asyncRoute(asy
 
   const now = new Date();
   if (req.body.outcome === 'converted') {
-    const result = await markLeadWon({ lead, actor: req.user, branchId: req.branchId, conversionValue: req.body.conversionValue, source: 'followup' });
-    await appendLeadActivity({ branch: req.branchId, lead: result.lead, type: 'followup', summary: 'Follow-up: converted', actor: req.user, fromStatus: previous, toStatus: 'won', data: { notes: req.body.notes || '', nextFollowupDate: result.lead.nextFollowupDate } });
+    const result = await markLeadWon({ lead, actor: req.user, branchId: req.branchScope, conversionValue: req.body.conversionValue, source: 'followup' });
+    await appendLeadActivity({ branch: req.branchScope, lead: result.lead, type: 'followup', summary: 'Follow-up: converted', actor: req.user, fromStatus: previous, toStatus: 'won', data: { notes: req.body.notes || '', nextFollowupDate: result.lead.nextFollowupDate } });
     await LeadExecutiveAvailability.updateOne(
-      { branch: req.branchId, user: req.user._id, status: { $in: ['attending', 'busy'] } },
+      { branch: req.branchScope, user: req.user._id, status: { $in: ['attending', 'busy'] } },
       { $set: { status: 'available', currentLead: null, updatedBy: req.user._id, statusUpdatedAt: now, lastSeenAt: now } }
     );
-    publishLeadEvent({ branchId: req.branchId, event: 'availability.changed', data: { userId: req.user._id, status: 'available' } });
+    publishLeadEvent({ branchId: req.branchScope, event: 'availability.changed', data: { userId: req.user._id, status: 'available' } });
     return res.json({ success: true, message: 'Follow-up recorded and lead converted.', data: result.lead, incentiveStatus: result.incentiveStatus });
   }
   await lead.save();
   await LeadExecutiveAvailability.updateOne(
-    { branch: req.branchId, user: req.user._id, status: { $in: ['attending', 'busy'] } },
+    { branch: req.branchScope, user: req.user._id, status: { $in: ['attending', 'busy'] } },
     { $set: { status: 'available', currentLead: null, updatedBy: req.user._id, statusUpdatedAt: now, lastSeenAt: now } }
   );
-  publishLeadEvent({ branchId: req.branchId, event: 'availability.changed', data: { userId: req.user._id, status: 'available' } });
-  await appendLeadActivity({ branch: req.branchId, lead, type: 'followup', summary: `Follow-up: ${req.body.outcome || 'callback'}`, actor: req.user, fromStatus: previous, toStatus: lead.status, data: { notes: req.body.notes || '', nextFollowupDate: lead.nextFollowupDate } });
+  publishLeadEvent({ branchId: req.branchScope, event: 'availability.changed', data: { userId: req.user._id, status: 'available' } });
+  await appendLeadActivity({ branch: req.branchScope, lead, type: 'followup', summary: `Follow-up: ${req.body.outcome || 'callback'}`, actor: req.user, fromStatus: previous, toStatus: lead.status, data: { notes: req.body.notes || '', nextFollowupDate: lead.nextFollowupDate } });
   emitChange({ req, lead, action: 'followup', recipients: lead.assignedTo ? [lead.assignedTo] : [] });
   res.json({ success: true, message: 'Follow-up recorded.', data: lead });
 }));
@@ -517,7 +517,7 @@ router.patch('/:id/status', requirePermission('lead.update'), asyncRoute(async (
   const { lead } = await leadOr404(req, 'status');
   if (req.body.status === 'won') {
     const result = await markLeadWon({
-      lead, actor: req.user, branchId: req.branchId, conversionValue: req.body.conversionValue,
+      lead, actor: req.user, branchId: req.branchScope, conversionValue: req.body.conversionValue,
       convertedToDealer: req.body.convertedToDealer, convertedToCustomer: req.body.convertedToCustomer, source: 'status',
     });
     return res.json({ success: true, message: 'Lead marked won.', data: result.lead, incentiveStatus: result.incentiveStatus });
@@ -526,7 +526,7 @@ router.patch('/:id/status', requirePermission('lead.update'), asyncRoute(async (
   lead.status = req.body.status;
   if (req.body.status === 'lost') lead.lostReason = req.body.lostReason || '';
   await lead.save();
-  await appendLeadActivity({ branch: req.branchId, lead, type: 'status_changed', summary: `Status ${previous} → ${lead.status}`, actor: req.user, fromStatus: previous, toStatus: lead.status });
+  await appendLeadActivity({ branch: req.branchScope, lead, type: 'status_changed', summary: `Status ${previous} → ${lead.status}`, actor: req.user, fromStatus: previous, toStatus: lead.status });
   emitChange({ req, lead, action: 'status_changed', recipients: lead.assignedTo ? [lead.assignedTo] : [] });
   res.json({ success: true, message: `Status → ${lead.status}`, data: lead });
 }));
@@ -534,7 +534,7 @@ router.patch('/:id/status', requirePermission('lead.update'), asyncRoute(async (
 router.patch('/:id/convert', requirePermission('lead.convert'), asyncRoute(async (req, res) => {
   const { lead } = await leadOr404(req, 'convert');
   const result = await markLeadWon({
-    lead, actor: req.user, branchId: req.branchId, conversionValue: req.body.conversionValue,
+    lead, actor: req.user, branchId: req.branchScope, conversionValue: req.body.conversionValue,
     convertedToDealer: req.body.convertedToDealer, convertedToCustomer: req.body.convertedToCustomer, source: 'convert',
   });
   res.json({
@@ -557,7 +557,7 @@ router.delete('/:id', requirePermission('lead.delete'), asyncRoute(async (req, r
     scope,
   });
   if (result.success) {
-    await appendLeadActivity({ branch: req.branchId, lead, type: 'deleted', summary: `Lead ${lead.leadNumber} deleted`, actor: req.user });
+    await appendLeadActivity({ branch: req.branchScope, lead, type: 'deleted', summary: `Lead ${lead.leadNumber} deleted`, actor: req.user });
     emitChange({ req, lead, action: 'deleted', recipients: lead.assignedTo ? [lead.assignedTo] : [] });
   }
   res.status(result.status || 200).json(result);

@@ -32,7 +32,7 @@ router.get('/job-openings', ...jobAccess, async (req, res) => {
     const { page = 1, limit = 20, search, status, department } = req.query;
     const p = Math.max(1, parseInt(page) || 1);
     const l = Math.min(100, Math.max(1, parseInt(limit) || 20));
-    const filter = { branchId: req.branchId };
+    const filter = { branchId: req.branchScope };
     if (search) {
       const regex = new RegExp(escapeRegex(search), 'i');
       filter.$or = [{ title: regex }, { department: regex }, { designation: regex }, { jobCode: regex }];
@@ -60,7 +60,7 @@ router.get('/job-openings', ...jobAccess, async (req, res) => {
 
 router.get('/job-openings/options', ...jobAccess, async (req, res) => {
   try {
-    const openings = await JobOpening.find({ branchId: req.branchId, status: 'open' })
+    const openings = await JobOpening.find({ branchId: req.branchScope, status: 'open' })
       .select('jobCode title department designation').sort({ createdAt: -1 }).lean();
     res.json({ success: true, data: openings });
   } catch (error) { sendError(res, error); }
@@ -68,7 +68,7 @@ router.get('/job-openings/options', ...jobAccess, async (req, res) => {
 
 router.get('/job-openings/stats', ...jobAccess, async (req, res) => {
   try {
-    const filter = { branchId: req.branchId };
+    const filter = { branchId: req.branchScope };
     const [total, open, onHold, closed] = await Promise.all([
       JobOpening.countDocuments(filter),
       JobOpening.countDocuments({ ...filter, status: 'open' }),
@@ -105,7 +105,7 @@ router.post('/job-openings', requirePermission('job.opening.manage'), async (req
       keywords: Array.isArray(keywords) ? keywords : [],
       // Explicit boolean, because publishing to a public website must be an opt-in act.
       publicVisible: publicVisible === true,
-      branchId: req.branchId, createdBy: req.user._id,
+      branchId: req.branchScope, createdBy: req.user._id,
     });
     res.status(201).json({ success: true, message: 'Job opening created.', data: opening });
   } catch (error) { sendError(res, error); }
@@ -141,7 +141,7 @@ router.put('/job-openings/:id', requirePermission('job.opening.manage'), async (
     if (Object.prototype.hasOwnProperty.call(updates, 'keywords') && !Array.isArray(updates.keywords)) {
       updates.keywords = [];
     }
-    const opening = await JobOpening.findOneAndUpdate({ _id: req.params.id, branchId: req.branchId }, updates, { new: true, runValidators: true });
+    const opening = await JobOpening.findOneAndUpdate({ _id: req.params.id, branchId: req.branchScope }, updates, { new: true, runValidators: true });
     if (!opening) throw routeError(404, 'Job opening not found.');
     res.json({ success: true, message: 'Job opening updated.', data: opening });
   } catch (error) { sendError(res, error); }
@@ -152,7 +152,7 @@ router.delete('/job-openings/:id', requirePermission('job.opening.manage'), asyn
     if (!validObjectId(req.params.id)) throw routeError(400, 'Invalid job opening id.');
     const inUse = await Candidate.countDocuments({ jobOpening: req.params.id });
     if (inUse > 0) throw routeError(409, `Cannot delete: ${inUse} candidate(s) reference this opening. Close it instead.`);
-    const opening = await JobOpening.findOneAndDelete({ _id: req.params.id, branchId: req.branchId });
+    const opening = await JobOpening.findOneAndDelete({ _id: req.params.id, branchId: req.branchScope });
     if (!opening) throw routeError(404, 'Job opening not found.');
     res.json({ success: true, message: 'Job opening deleted.' });
   } catch (error) { sendError(res, error); }
@@ -168,7 +168,7 @@ router.get('/candidates', ...candidateAccess, async (req, res) => {
     const { page = 1, limit = 20, search, status, jobOpening, talentPool, sortBy } = req.query;
     const p = Math.max(1, parseInt(page) || 1);
     const l = Math.min(100, Math.max(1, parseInt(limit) || 20));
-    const filter = { branchId: req.branchId };
+    const filter = { branchId: req.branchScope };
     if (search) {
       const regex = new RegExp(escapeRegex(search), 'i');
       filter.$or = [{ name: regex }, { mobile: regex }, { email: regex }, { candidateCode: regex }, { qualification: regex }, { tags: regex }];
@@ -227,7 +227,7 @@ router.get('/candidates', ...candidateAccess, async (req, res) => {
 
 router.get('/candidates/stats', ...candidateAccess, async (req, res) => {
   try {
-    const filter = { branchId: req.branchId };
+    const filter = { branchId: req.branchScope };
     const [total, applied, shortlisted, interview, selected, rejected, talentPool] = await Promise.all([
       Candidate.countDocuments(filter),
       Candidate.countDocuments({ ...filter, status: 'Applied' }),
@@ -244,7 +244,7 @@ router.get('/candidates/stats', ...candidateAccess, async (req, res) => {
 router.get('/candidates/:id', ...candidateAccess, async (req, res) => {
   try {
     if (!validObjectId(req.params.id)) throw routeError(400, 'Invalid candidate id.');
-    const candidate = await Candidate.findOne({ _id: req.params.id, branchId: req.branchId })
+    const candidate = await Candidate.findOne({ _id: req.params.id, branchId: req.branchScope })
       .populate('jobOpening', 'jobCode title department designation experienceRequired salaryRange requirements keywords')
       .populate('convertedToEmployee', 'empId name designation department')
       .lean();
@@ -277,7 +277,7 @@ router.post('/candidates', ...candidateAccess, async (req, res) => {
       qualification, experience, currentEmployer, expectedSalary,
       source, jobOpening: jobOpening || undefined,
       tags: Array.isArray(tags) ? tags : [],
-      notes, branchId: req.branchId, createdBy: req.user._id,
+      notes, branchId: req.branchScope, createdBy: req.user._id,
     });
     res.status(201).json({ success: true, message: 'Candidate added.', data: candidate });
   } catch (error) { sendError(res, error); }
@@ -292,7 +292,7 @@ router.put('/candidates/:id', ...candidateAccess, async (req, res) => {
       return acc;
     }, {});
     if (updates.jobOpening && !validObjectId(updates.jobOpening)) throw routeError(422, 'Invalid job opening reference.');
-    const candidate = await Candidate.findOneAndUpdate({ _id: req.params.id, branchId: req.branchId }, updates, { new: true, runValidators: true });
+    const candidate = await Candidate.findOneAndUpdate({ _id: req.params.id, branchId: req.branchScope }, updates, { new: true, runValidators: true });
     if (!candidate) throw routeError(404, 'Candidate not found.');
     res.json({ success: true, message: 'Candidate updated.', data: candidate });
   } catch (error) { sendError(res, error); }
@@ -307,7 +307,7 @@ router.patch('/candidates/:id/status', ...candidateAccess, async (req, res) => {
     if (!validObjectId(req.params.id)) throw routeError(400, 'Invalid candidate id.');
     const { status, rejectionReason } = req.body;
     if (!STATUS_FLOW.includes(status)) throw routeError(422, `Status must be one of: ${STATUS_FLOW.join(', ')}`);
-    const candidate = await Candidate.findOne({ _id: req.params.id, branchId: req.branchId });
+    const candidate = await Candidate.findOne({ _id: req.params.id, branchId: req.branchScope });
     if (!candidate) throw routeError(404, 'Candidate not found.');
     if (candidate.convertedToEmployee) throw routeError(409, 'Candidate has already been converted to an employee.');
     candidate.status = status;
@@ -321,7 +321,7 @@ router.patch('/candidates/:id/talent-pool', ...candidateAccess, async (req, res)
   try {
     if (!validObjectId(req.params.id)) throw routeError(400, 'Invalid candidate id.');
     const candidate = await Candidate.findOneAndUpdate(
-      { _id: req.params.id, branchId: req.branchId },
+      { _id: req.params.id, branchId: req.branchScope },
       { talentPool: Boolean(req.body.talentPool) },
       { new: true }
     );
@@ -333,7 +333,7 @@ router.patch('/candidates/:id/talent-pool', ...candidateAccess, async (req, res)
 router.delete('/candidates/:id', ...candidateAccess, async (req, res) => {
   try {
     if (!validObjectId(req.params.id)) throw routeError(400, 'Invalid candidate id.');
-    const candidate = await Candidate.findOne({ _id: req.params.id, branchId: req.branchId });
+    const candidate = await Candidate.findOne({ _id: req.params.id, branchId: req.branchScope });
     if (!candidate) throw routeError(404, 'Candidate not found.');
     if (candidate.convertedToEmployee) throw routeError(409, 'Cannot delete a candidate already converted to an employee.');
     if (candidate.resume?.url) {
@@ -352,7 +352,7 @@ router.post('/candidates/:id/resume', ...candidateAccess, (req, res) => {
     try {
       if (!validObjectId(req.params.id)) throw routeError(400, 'Invalid candidate id.');
       if (!req.file) throw routeError(422, 'A resume file is required.');
-      const candidate = await Candidate.findOne({ _id: req.params.id, branchId: req.branchId });
+      const candidate = await Candidate.findOne({ _id: req.params.id, branchId: req.branchScope });
       if (!candidate) throw routeError(404, 'Candidate not found.');
       // Remove the previous resume file, if any, so uploads don't leak disk space.
       if (candidate.resume?.url) {
@@ -369,7 +369,7 @@ router.post('/candidates/:id/resume', ...candidateAccess, (req, res) => {
 router.get('/candidates/:id/resume', ...candidateAccess, async (req, res) => {
   try {
     if (!validObjectId(req.params.id)) throw routeError(400, 'Invalid candidate id.');
-    const candidate = await Candidate.findOne({ _id: req.params.id, branchId: req.branchId }).select('resume name').lean();
+    const candidate = await Candidate.findOne({ _id: req.params.id, branchId: req.branchScope }).select('resume name').lean();
     if (!candidate?.resume?.url) throw routeError(404, 'No resume on file for this candidate.');
     const storedName = path.basename(candidate.resume.url);
     if (storedName !== candidate.resume.url) throw routeError(409, 'Stored resume reference is invalid.');
@@ -394,7 +394,7 @@ router.post('/candidates/:id/interviews', requireAnyPermission('candidate.interv
     if (!validObjectId(req.params.id)) throw routeError(400, 'Invalid candidate id.');
     const { scheduledAt, mode, location, interviewer, round } = req.body;
     if (!scheduledAt) throw routeError(422, 'Interview date/time is required.');
-    const candidate = await Candidate.findOne({ _id: req.params.id, branchId: req.branchId });
+    const candidate = await Candidate.findOne({ _id: req.params.id, branchId: req.branchScope });
     if (!candidate) throw routeError(404, 'Candidate not found.');
     candidate.interviews.push({
       scheduledAt: new Date(scheduledAt), mode, location, interviewer,
@@ -411,7 +411,7 @@ router.post('/candidates/:id/interviews', requireAnyPermission('candidate.interv
 router.patch('/candidates/:id/interviews/:interviewId', requireAnyPermission('candidate.interview', 'candidate.manage'), async (req, res) => {
   try {
     if (!validObjectId(req.params.id) || !validObjectId(req.params.interviewId)) throw routeError(400, 'Invalid identifier.');
-    const candidate = await Candidate.findOne({ _id: req.params.id, branchId: req.branchId });
+    const candidate = await Candidate.findOne({ _id: req.params.id, branchId: req.branchScope });
     if (!candidate) throw routeError(404, 'Candidate not found.');
     const interview = candidate.interviews.id(req.params.interviewId);
     if (!interview) throw routeError(404, 'Interview not found.');
@@ -438,7 +438,7 @@ router.post('/candidates/:id/convert', requirePermission('candidate.convert'), a
 
     let employee;
     await session.withTransaction(async () => {
-      const candidate = await Candidate.findOne({ _id: req.params.id, branchId: req.branchId }).session(session);
+      const candidate = await Candidate.findOne({ _id: req.params.id, branchId: req.branchScope }).session(session);
       if (!candidate) throw routeError(404, 'Candidate not found.');
       if (candidate.convertedToEmployee) throw routeError(409, 'Candidate has already been converted to an employee.');
       if (candidate.status !== 'Selected') throw routeError(409, 'Only candidates marked Selected can be converted to an employee.');
@@ -461,7 +461,7 @@ router.post('/candidates/:id/convert', requirePermission('candidate.convert'), a
         basicSalary: basicSalary || 0,
         workLocation: workLocation || '',
         reportingManager: reportingManager || '',
-        branchId: req.branchId,
+        branchId: req.branchScope,
         // Carry the resume forward as the employee's first document.
         documents: candidate.resume?.url
           ? [{ name: candidate.resume.name || 'Resume', url: candidate.resume.url, uploadDate: candidate.resume.uploadDate || new Date() }]

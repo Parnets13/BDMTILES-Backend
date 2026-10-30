@@ -15,7 +15,7 @@ router.get('/', requirePermission('expense.management'), async (req, res) => {
     const { page = 1, limit = 20, search, status, category, employee, dateFrom, dateTo } = req.query;
     const p = Math.max(1, parseInt(page));
     const l = Math.min(100, parseInt(limit) || 20);
-    let filter = { branch: req.branchId };
+    let filter = { branch: req.branchScope };
     if (search) { const r = new RegExp(search, 'i'); filter.$or = [{ expenseNumber: r }, { employeeName: r }, { description: r }]; }
     if (status) filter.status = status;
     if (category) filter.category = category;
@@ -37,7 +37,7 @@ router.get('/', requirePermission('expense.management'), async (req, res) => {
 // GET /api/v1/expenses/stats
 router.get('/stats', requirePermission('expense.management'), async (req, res) => {
   try {
-    const scope = { branch: req.branchId };
+    const scope = { branch: req.branchScope };
     const [total, pending, approved, rejected, reimbursed] = await Promise.all([
       Expense.countDocuments(scope),
       Expense.countDocuments({ ...scope, status: 'pending' }),
@@ -60,7 +60,7 @@ router.get('/stats', requirePermission('expense.management'), async (req, res) =
 // GET /api/v1/expenses/:id
 router.get('/:id', requirePermission('expense.management'), async (req, res) => {
   try {
-    const expense = await Expense.findOne({ _id: req.params.id, branch: req.branchId })
+    const expense = await Expense.findOne({ _id: req.params.id, branch: req.branchScope })
       .populate('employee', 'name employeeCode department mobile')
       .populate('approvalManager', 'name email')
       .populate('approvedBy', 'name email')
@@ -76,7 +76,7 @@ router.get('/:id', requirePermission('expense.management'), async (req, res) => 
 // POST /api/v1/expenses
 router.post('/', requirePermission('expense.management'), async (req, res) => {
   try {
-    const data = { ...req.body, branch: req.branchId, createdBy: req.user._id };
+    const data = { ...req.body, branch: req.branchScope, createdBy: req.user._id };
     data.expenseNumber = await generateBranchNumber(req.branchId, 'expense', data.expenseDate || new Date());
     if (data.employee) {
       const emp = await Employee.findById(data.employee).lean();
@@ -90,7 +90,7 @@ router.post('/', requirePermission('expense.management'), async (req, res) => {
 // PATCH /api/v1/expenses/:id/approve
 router.patch('/:id/approve', requirePermission('expense.approve'), async (req, res) => {
   try {
-    const exp = await Expense.findOne({ _id: req.params.id, branch: req.branchId });
+    const exp = await Expense.findOne({ _id: req.params.id, branch: req.branchScope });
     if (!exp) return res.status(404).json({ success: false, message: 'Not found.' });
     exp.status = 'approved';
     exp.approvedBy = req.user._id;
@@ -103,7 +103,7 @@ router.patch('/:id/approve', requirePermission('expense.approve'), async (req, r
 // PATCH /api/v1/expenses/:id/reject
 router.patch('/:id/reject', requirePermission('expense.approve'), async (req, res) => {
   try {
-    const exp = await Expense.findOneAndUpdate({ _id: req.params.id, branch: req.branchId }, {
+    const exp = await Expense.findOneAndUpdate({ _id: req.params.id, branch: req.branchScope }, {
       status: 'rejected', rejectionReason: req.body.reason || '', approvedBy: req.user._id, approvedAt: new Date(),
     }, { new: true });
     res.json({ success: true, message: 'Expense rejected.', data: exp });
@@ -113,7 +113,7 @@ router.patch('/:id/reject', requirePermission('expense.approve'), async (req, re
 // PATCH /api/v1/expenses/:id/reimburse
 router.patch('/:id/reimburse', requirePermission('expense.approve'), async (req, res) => {
   try {
-    const exp = await Expense.findOneAndUpdate({ _id: req.params.id, branch: req.branchId }, {
+    const exp = await Expense.findOneAndUpdate({ _id: req.params.id, branch: req.branchScope }, {
       status: 'reimbursed', reimbursementDate: new Date(), reimbursementRef: req.body.ref || '',
     }, { new: true });
     res.json({ success: true, message: 'Marked as reimbursed.', data: exp });

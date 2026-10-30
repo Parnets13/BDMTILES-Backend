@@ -186,7 +186,7 @@ router.get('/', readApprovalPermissions, async (req, res) => {
     }
 
     const filter = {
-      branch: req.branchId,
+      branch: req.branchScope,
       type: type || { $in: allowedTypes },
       ...(status ? { status } : {}),
     };
@@ -212,7 +212,7 @@ router.get('/', readApprovalPermissions, async (req, res) => {
 // GET /api/v1/approvals/stats — declared before /:id so "stats" is never read as an id.
 router.get('/stats', readApprovalPermissions, async (req, res) => {
   try {
-    const visible = { branch: req.branchId, type: { $in: allowedApprovalTypes(req.user) } };
+    const visible = { branch: req.branchScope, type: { $in: allowedApprovalTypes(req.user) } };
     const [total, pending, approved, rejected, byType] = await Promise.all([
       ApprovalRequest.countDocuments(visible),
       ApprovalRequest.countDocuments({ ...visible, status: 'pending' }),
@@ -236,7 +236,7 @@ router.get('/stats', readApprovalPermissions, async (req, res) => {
 router.get('/:id', readApprovalPermissions, async (req, res) => {
   try {
     if (!mongoose.isValidObjectId(req.params.id)) throw routeError(422, 'Approval id is invalid.');
-    const approval = await ApprovalRequest.findOne({ _id: req.params.id, branch: req.branchId })
+    const approval = await ApprovalRequest.findOne({ _id: req.params.id, branch: req.branchScope })
       .populate('requestedBy', 'name email')
       .populate('approvedBy', 'name email')
       .lean();
@@ -296,13 +296,13 @@ const actionApproval = async (req, res, nextStatus) => {
   // Durable stock workflows must always execute their domain action; generic approval
   // is never allowed to update only the ApprovalRequest status.
   try {
-    const current = await ApprovalRequest.findOne({ _id: req.params.id, branch: req.branchId }).lean();
+    const current = await ApprovalRequest.findOne({ _id: req.params.id, branch: req.branchScope }).lean();
     if (current && ['stock_adjustment', 'physical_stock_audit'].includes(current.type)) {
       if (!canActionApproval(req.user, current)) throw routeError(403, 'Access denied for this approval type.');
       if (current.status !== 'pending') throw routeError(409, 'Already actioned.');
       const domainResult = current.type === 'stock_adjustment'
-        ? await actionStockAdjustmentApproval({ branchId: req.branchId, actorId: req.user._id, adjustmentId: current.referenceId, nextStatus, remarks, approvalRequestId: current._id })
-        : await actionPhysicalAuditApproval({ branchId: req.branchId, actorId: req.user._id, auditId: current.referenceId, nextStatus, remarks, approvalRequestId: current._id });
+        ? await actionStockAdjustmentApproval({ branchId: req.branchScope, actorId: req.user._id, adjustmentId: current.referenceId, nextStatus, remarks, approvalRequestId: current._id })
+        : await actionPhysicalAuditApproval({ branchId: req.branchScope, actorId: req.user._id, auditId: current.referenceId, nextStatus, remarks, approvalRequestId: current._id });
       const updatedApproval = await ApprovalRequest.findById(current._id).lean();
       return res.json({
         success: true,
@@ -321,7 +321,7 @@ const actionApproval = async (req, res, nextStatus) => {
   let approval;
   try {
     await session.withTransaction(async () => {
-      const current = await ApprovalRequest.findOne({ _id: req.params.id, branch: req.branchId }).session(session);
+      const current = await ApprovalRequest.findOne({ _id: req.params.id, branch: req.branchScope }).session(session);
       if (!current) throw routeError(404, 'Not found.');
       if (!canActionApproval(req.user, current)) {
         throw routeError(403, 'Access denied for this approval type.');
@@ -330,7 +330,7 @@ const actionApproval = async (req, res, nextStatus) => {
 
       if (current.type === 'sales_order_remaining_cancellation') {
         const result = await actionSalesOrderRemainingCancellation({
-          branchId: req.branchId,
+          branchId: req.branchScope,
           orderId: current.referenceId,
           approvalRequestId: current._id,
           actorId: req.user._id,
@@ -347,7 +347,7 @@ const actionApproval = async (req, res, nextStatus) => {
         && current.referenceId;
       if (purchaseOrderAction) {
         const result = await actionPurchaseOrderApproval({
-          branchId: req.branchId,
+          branchId: req.branchScope,
           poId: current.referenceId,
           actorId: req.user._id,
           nextStatus,
@@ -377,7 +377,7 @@ const actionApproval = async (req, res, nextStatus) => {
       if (cancellationAction) {
         referencedSalesOrder = await SalesOrder.findOne({
           _id: current.referenceId,
-          branch: req.branchId,
+          branch: req.branchScope,
           cancellationRequestStatus: 'pending',
           status: { $in: ['confirmed', 'approved', 'processing'] },
         }).session(session).lean();
@@ -390,7 +390,7 @@ const actionApproval = async (req, res, nextStatus) => {
       if (autoActionSalesOrder) {
         referencedSalesOrder = await SalesOrder.findOne({
           _id: current.referenceId,
-          branch: req.branchId,
+          branch: req.branchScope,
           approvalStatus: 'pending',
         }).session(session).lean();
         if (!referencedSalesOrder) throw routeError(409, 'Referenced sales order is unavailable or no longer pending approval.');
@@ -398,7 +398,7 @@ const actionApproval = async (req, res, nextStatus) => {
       if (autoActionQuotation) {
         referencedQuotation = await Quotation.findOne({
           _id: current.referenceId,
-          branch: req.branchId,
+          branch: req.branchScope,
           status: 'pending_approval',
           approvalStatus: 'pending',
         }).session(session).lean();
@@ -415,7 +415,7 @@ const actionApproval = async (req, res, nextStatus) => {
 
       const actionedAt = new Date();
       approval = await ApprovalRequest.findOneAndUpdate(
-        { _id: current._id, branch: req.branchId, status: 'pending' },
+        { _id: current._id, branch: req.branchScope, status: 'pending' },
         {
           $set: {
             status: nextStatus,
@@ -432,7 +432,7 @@ const actionApproval = async (req, res, nextStatus) => {
         if (nextStatus === 'approved') {
           await releaseSalesOrderReservation(current.referenceId, { session, actor: req.user._id });
           await PickList.updateMany(
-            { branch: req.branchId, salesOrder: current.referenceId, stockConsumedAt: null },
+            { branch: req.branchScope, salesOrder: current.referenceId, stockConsumedAt: null },
             {
               $set: {
                 status: 'cancelled', stockReserved: false, reservationState: 'released',
@@ -445,7 +445,7 @@ const actionApproval = async (req, res, nextStatus) => {
           const cancelledOrder = await SalesOrder.findOneAndUpdate(
             {
               _id: current.referenceId,
-              branch: req.branchId,
+              branch: req.branchScope,
               cancellationRequestStatus: 'pending',
               status: { $in: ['confirmed', 'approved', 'processing'] },
             },
@@ -461,16 +461,16 @@ const actionApproval = async (req, res, nextStatus) => {
           );
           if (!cancelledOrder) throw routeError(409, 'Sales Order cancellation state changed before approval was applied.');
           await ApprovalRequest.updateMany(
-            { branch: req.branchId, referenceModel: 'SalesOrder', referenceId: current.referenceId, type: 'sales_order', status: 'pending' },
+            { branch: req.branchScope, referenceModel: 'SalesOrder', referenceId: current.referenceId, type: 'sales_order', status: 'pending' },
             { $set: { status: 'cancelled' } },
             { session }
           );
           if (cancelledOrder.dealer) {
             const originalPostingKey = `sales-order:${cancelledOrder._id}:confirmed`;
-            const originalPosting = await DealerLedger.findOne({ branch: req.branchId, dealer: cancelledOrder.dealer, postingKey: originalPostingKey }).session(session).select('_id').lean();
+            const originalPosting = await DealerLedger.findOne({ branch: req.branchScope, dealer: cancelledOrder.dealer, postingKey: originalPostingKey }).session(session).select('_id').lean();
             if (originalPosting) {
               await postSubledgerEntry({
-                session, branch: req.branchId, partyType: 'dealer', partyId: cancelledOrder.dealer,
+                session, branch: req.branchScope, partyType: 'dealer', partyId: cancelledOrder.dealer,
                 postingKey: `sales-order:${cancelledOrder._id}:cancelled`, reversalOfPostingKey: originalPostingKey,
                 entryType: 'credit_note', entryDate: actionedAt,
                 description: `Cancellation reversal for Sales Order ${cancelledOrder.orderNumber}`,
@@ -480,7 +480,7 @@ const actionApproval = async (req, res, nextStatus) => {
           }
         } else {
           const rejectedOrder = await SalesOrder.findOneAndUpdate(
-            { _id: current.referenceId, branch: req.branchId, cancellationRequestStatus: 'pending' },
+            { _id: current.referenceId, branch: req.branchScope, cancellationRequestStatus: 'pending' },
             { $set: { cancellationRequestStatus: 'rejected' } },
             { new: true, session }
           );
@@ -518,7 +518,7 @@ const actionApproval = async (req, res, nextStatus) => {
           ? { $set: setFields }
           : { $set: setFields, $unset: { approvedBy: 1, approvalDate: 1 } };
         const updatedOrder = await SalesOrder.findOneAndUpdate(
-          { _id: current.referenceId, branch: req.branchId, approvalStatus: 'pending' },
+          { _id: current.referenceId, branch: req.branchScope, approvalStatus: 'pending' },
           salesOrderUpdate,
           { new: true, runValidators: true, session }
         );
@@ -532,7 +532,7 @@ const actionApproval = async (req, res, nextStatus) => {
           await updatedOrder.save({ session });
           if (updatedOrder.dealer && updatedOrder.grandTotal > 0) {
             await postSubledgerEntry({
-              session, branch: req.branchId, partyType: 'dealer', partyId: updatedOrder.dealer,
+              session, branch: req.branchScope, partyType: 'dealer', partyId: updatedOrder.dealer,
               amount: updatedOrder.grandTotal, side: 'debit', postingKey: `sales-order:${updatedOrder._id}:confirmed`,
               entryType: 'invoice', entryDate: updatedOrder.orderDate,
               description: `Receivable for Sales Order ${updatedOrder.orderNumber}`,
@@ -564,7 +564,7 @@ const actionApproval = async (req, res, nextStatus) => {
         const updatedQuotation = await Quotation.findOneAndUpdate(
           {
             _id: current.referenceId,
-            branch: req.branchId,
+            branch: req.branchScope,
             status: 'pending_approval',
             approvalStatus: 'pending',
           },

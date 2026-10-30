@@ -30,7 +30,7 @@ const access = [requirePermission('hr.template.manage')];
 router.get('/templates', ...access, async (req, res) => {
   try {
     const { search, documentType, isActive } = req.query;
-    const filter = { branch: req.branchId };
+    const filter = { branch: req.branchScope };
     if (search) {
       const regex = new RegExp(escapeRegex(search), 'i');
       filter.$or = [{ templateName: regex }, { templateCode: regex }];
@@ -45,7 +45,7 @@ router.get('/templates', ...access, async (req, res) => {
 router.get('/templates/:id', ...access, async (req, res) => {
   try {
     if (!validObjectId(req.params.id)) throw routeError(400, 'Invalid template id.');
-    const template = await HrDocumentTemplate.findOne({ _id: req.params.id, branch: req.branchId }).lean();
+    const template = await HrDocumentTemplate.findOne({ _id: req.params.id, branch: req.branchScope }).lean();
     if (!template) throw routeError(404, 'Template not found.');
     res.json({ success: true, data: template });
   } catch (error) { sendError(res, error); }
@@ -105,7 +105,7 @@ router.put('/templates/:id', ...access, async (req, res) => {
       updates.content = content;
       updates.variables = extractVariables(content);
     }
-    const template = await HrDocumentTemplate.findOneAndUpdate({ _id: req.params.id, branch: req.branchId }, updates, { new: true, runValidators: true });
+    const template = await HrDocumentTemplate.findOneAndUpdate({ _id: req.params.id, branch: req.branchScope }, updates, { new: true, runValidators: true });
     if (!template) throw routeError(404, 'Template not found.');
     res.json({ success: true, message: 'Template updated.', data: template });
   } catch (error) { sendError(res, error); }
@@ -114,7 +114,7 @@ router.put('/templates/:id', ...access, async (req, res) => {
 router.delete('/templates/:id', ...access, async (req, res) => {
   try {
     if (!validObjectId(req.params.id)) throw routeError(400, 'Invalid template id.');
-    const template = await HrDocumentTemplate.findOneAndDelete({ _id: req.params.id, branch: req.branchId });
+    const template = await HrDocumentTemplate.findOneAndDelete({ _id: req.params.id, branch: req.branchScope });
     if (!template) throw routeError(404, 'Template not found.');
     res.json({ success: true, message: 'Template deleted.' });
   } catch (error) { sendError(res, error); }
@@ -221,7 +221,7 @@ router.get('/starters', ...access, (req, res) => {
 router.post('/templates/seed-starters', ...access, async (req, res) => {
   try {
     const existing = await HrDocumentTemplate
-      .find({ branch: req.branchId })
+      .find({ branch: req.branchScope })
       .select('documentType templateCode')
       .lean();
     const haveType = new Set(existing.map((t) => t.documentType));
@@ -260,9 +260,9 @@ router.post('/templates/:id/preview', ...access, async (req, res) => {
   try {
     if (!validObjectId(req.params.id)) throw routeError(400, 'Invalid template id.');
     if (!validObjectId(req.body.employeeId)) throw routeError(422, 'A valid employeeId is required.');
-    const template = await HrDocumentTemplate.findOne({ _id: req.params.id, branch: req.branchId }).lean();
+    const template = await HrDocumentTemplate.findOne({ _id: req.params.id, branch: req.branchScope }).lean();
     if (!template) throw routeError(404, 'Template not found.');
-    const employee = await Employee.findOne({ _id: req.body.employeeId, branchId: req.branchId }).lean();
+    const employee = await Employee.findOne({ _id: req.body.employeeId, branchId: req.branchScope }).lean();
     if (!employee) throw routeError(404, 'Employee not found in the active branch.');
     const exitCase = await loadLatestExit(employee._id, req.branchId);
     const context = buildEmployeeContext(employee, exitCase);
@@ -276,9 +276,9 @@ router.post('/templates/:id/generate', ...access, async (req, res) => {
   try {
     if (!validObjectId(req.params.id)) throw routeError(400, 'Invalid template id.');
     if (!validObjectId(req.body.employeeId)) throw routeError(422, 'A valid employeeId is required.');
-    const template = await HrDocumentTemplate.findOne({ _id: req.params.id, branch: req.branchId }).lean();
+    const template = await HrDocumentTemplate.findOne({ _id: req.params.id, branch: req.branchScope }).lean();
     if (!template) throw routeError(404, 'Template not found.');
-    const employee = await Employee.findOne({ _id: req.body.employeeId, branchId: req.branchId });
+    const employee = await Employee.findOne({ _id: req.body.employeeId, branchId: req.branchScope });
     if (!employee) throw routeError(404, 'Employee not found in the active branch.');
 
     const exitCase = await loadLatestExit(employee._id, req.branchId);

@@ -48,7 +48,7 @@ async function refreshDeliveryRecoveryStates(delivery, session = null, excludeRe
 
 router.get('/', async (req, res) => {
   try {
-    const data = await DispatchReturn.find({ branch: req.branchId }).sort({ createdAt: -1 })
+    const data = await DispatchReturn.find({ branch: req.branchScope }).sort({ createdAt: -1 })
       .populate('delivery', 'deliveryNumber status').populate('salesOrder', 'orderNumber status')
       .populate('requestedBy warehouseVerifiedBy approvedBy', 'name').lean();
     return res.json({ success: true, data });
@@ -57,7 +57,7 @@ router.get('/', async (req, res) => {
 
 router.get('/:id', async (req, res) => {
   try {
-    const data = await DispatchReturn.findOne({ _id: req.params.id, branch: req.branchId })
+    const data = await DispatchReturn.findOne({ _id: req.params.id, branch: req.branchScope })
       .populate('delivery').populate('salesOrder', 'orderNumber status items')
       .populate('requestedBy warehouseVerifiedBy approvedBy rejectedBy cancelledBy', 'name').lean();
     if (!data) return res.status(404).json({ success: false, message: 'Dispatch return not found.' });
@@ -72,14 +72,14 @@ router.post('/', async (req, res) => {
   try {
     let created;
     await session.withTransaction(async () => {
-      const delivery = await Delivery.findOne({ _id: req.body.delivery, branch: req.branchId }).session(session);
+      const delivery = await Delivery.findOne({ _id: req.body.delivery, branch: req.branchScope }).session(session);
       if (!delivery || !delivery.dispatchTrip || !delivery.salesOrder || !delivery.items?.length) throw error(409, 'An itemized dispatched delivery is required.');
       if (!['assigned', 'in_transit', 'reached', 'partially_delivered', 'failed', 'rescheduled'].includes(delivery.status)) throw error(409, 'Only pre-acceptance or discrepancy delivery states can enter dispatch recovery.');
-      const order = await SalesOrder.findOne({ _id: delivery.salesOrder, branch: req.branchId }).session(session);
+      const order = await SalesOrder.findOne({ _id: delivery.salesOrder, branch: req.branchScope }).session(session);
       if (!order) throw error(409, 'The source Sales Order is unavailable.');
-      const activeInvoice = await Invoice.exists({ branch: req.branchId, salesOrder: delivery.salesOrder, status: { $in: ['generated', 'sent'] } }).session(session);
+      const activeInvoice = await Invoice.exists({ branch: req.branchScope, salesOrder: delivery.salesOrder, status: { $in: ['generated', 'sent'] } }).session(session);
       if (activeInvoice) throw error(409, 'An active invoice exists; use Sales Return instead of dispatched-goods recovery.');
-      const prior = await DispatchReturn.find({ branch: req.branchId, delivery: delivery._id, status: { $in: activeStatuses } }).session(session).lean();
+      const prior = await DispatchReturn.find({ branch: req.branchScope, delivery: delivery._id, status: { $in: activeStatuses } }).session(session).lean();
       const priorByDeliveryItem = new Map();
       for (const record of prior) for (const item of record.items || []) priorByDeliveryItem.set(String(item.deliveryItem), (priorByDeliveryItem.get(String(item.deliveryItem)) || 0) + Number(item.quantity || 0));
       const seen = new Set();
@@ -105,7 +105,7 @@ router.post('/', async (req, res) => {
       });
       const returnNumber = await generateBranchNumber(req.branchId, 'dispatchReturn', new Date(), { session });
       [created] = await DispatchReturn.create([{
-        returnNumber, branch: req.branchId, delivery: delivery._id, dispatchTrip: delivery.dispatchTrip,
+        returnNumber, branch: req.branchScope, delivery: delivery._id, dispatchTrip: delivery.dispatchTrip,
         salesOrder: delivery.salesOrder, items, reason, requestedBy: req.user._id, requestedAt: new Date(), status: 'requested',
       }], { session });
       await refreshDeliveryRecoveryStates(delivery, session);
@@ -118,7 +118,7 @@ router.post('/', async (req, res) => {
 
 router.patch('/:id/verify', async (req, res) => {
   try {
-    const current = await DispatchReturn.findOne({ _id: req.params.id, branch: req.branchId });
+    const current = await DispatchReturn.findOne({ _id: req.params.id, branch: req.branchScope });
     if (!current) return res.status(404).json({ success: false, message: 'Dispatch return not found.' });
     if (current.status === 'warehouse_verified') return res.json({ success: true, message: 'Already warehouse verified.', data: current });
     if (current.status !== 'requested') throw error(409, `Cannot verify a ${current.status} dispatch return.`);
@@ -134,18 +134,18 @@ router.patch('/:id/approve', async (req, res) => {
   try {
     let current;
     await session.withTransaction(async () => {
-      current = await DispatchReturn.findOne({ _id: req.params.id, branch: req.branchId }).session(session);
+      current = await DispatchReturn.findOne({ _id: req.params.id, branch: req.branchScope }).session(session);
       if (!current) throw error(404, 'Dispatch return not found.');
       if (current.status === 'posted') return;
       if (current.status !== 'warehouse_verified') throw error(409, 'Warehouse verification is required before approval.');
       if ([current.requestedBy, current.warehouseVerifiedBy].some(actor => String(actor) === String(req.user._id))) throw error(403, 'Maker-checker violation: requester/verifier cannot approve.');
       const [delivery, order] = await Promise.all([
-        Delivery.findOne({ _id: current.delivery, branch: req.branchId }).session(session),
-        SalesOrder.findOne({ _id: current.salesOrder, branch: req.branchId }).session(session),
+        Delivery.findOne({ _id: current.delivery, branch: req.branchScope }).session(session),
+        SalesOrder.findOne({ _id: current.salesOrder, branch: req.branchScope }).session(session),
       ]);
       if (!delivery || !order) throw error(409, 'Delivery or Sales Order is unavailable.');
       if (!['assigned', 'in_transit', 'reached', 'partially_delivered', 'failed', 'rescheduled'].includes(delivery.status)) throw error(409, 'Delivery reached a customer-accepted or terminal recovery state before posting.');
-      const activeInvoice = await Invoice.exists({ branch: req.branchId, salesOrder: order._id, status: { $in: ['generated', 'sent'] } }).session(session);
+      const activeInvoice = await Invoice.exists({ branch: req.branchScope, salesOrder: order._id, status: { $in: ['generated', 'sent'] } }).session(session);
       if (activeInvoice) throw error(409, 'An active invoice now exists; dispatched recovery cannot be posted.');
       const postedAt = new Date();
       for (const item of current.items) {
@@ -186,7 +186,7 @@ router.patch('/:id/reject', async (req, res) => {
   const reason = String(req.body.reason || '').trim();
   if (!reason) return res.status(422).json({ success: false, message: 'Rejection reason is required.' });
   try {
-    const current = await DispatchReturn.findOne({ _id: req.params.id, branch: req.branchId, status: { $in: ['requested', 'warehouse_verified'] } });
+    const current = await DispatchReturn.findOne({ _id: req.params.id, branch: req.branchScope, status: { $in: ['requested', 'warehouse_verified'] } });
     if (!current) return res.status(409).json({ success: false, message: 'Dispatch return is unavailable or already posted.' });
     if (String(current.requestedBy) === String(req.user._id)) throw error(403, 'Requester cannot reject their own request.');
     current.status = 'rejected'; current.rejectedBy = req.user._id; current.rejectedAt = new Date(); current.rejectionReason = reason;
@@ -199,7 +199,7 @@ router.patch('/:id/reject', async (req, res) => {
 
 router.patch('/:id/cancel', async (req, res) => {
   try {
-    const current = await DispatchReturn.findOne({ _id: req.params.id, branch: req.branchId, status: 'requested', requestedBy: req.user._id });
+    const current = await DispatchReturn.findOne({ _id: req.params.id, branch: req.branchScope, status: 'requested', requestedBy: req.user._id });
     if (!current) return res.status(409).json({ success: false, message: 'Only the requester can cancel an unverified dispatch return.' });
     current.status = 'cancelled'; current.cancelledBy = req.user._id; current.cancelledAt = new Date(); await current.save();
     const delivery = await Delivery.findOne({ _id: current.delivery, branch: current.branch });

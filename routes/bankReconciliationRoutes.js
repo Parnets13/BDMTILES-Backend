@@ -140,7 +140,7 @@ router.get('/', requirePermission('reconciliation'), async (req, res) => {
     const parsedLimit = Number.parseInt(limit, 10);
     const p = Number.isFinite(parsedPage) ? Math.max(1, parsedPage) : 1;
     const l = Number.isFinite(parsedLimit) ? Math.min(100, Math.max(1, parsedLimit)) : 20;
-    const filter = { branch: req.branchId, ...(status ? { status } : {}) };
+    const filter = { branch: req.branchScope, ...(status ? { status } : {}) };
 
     const [data, total] = await Promise.all([
       BankReconciliation.find(filter).sort({ createdAt: -1 }).skip((p - 1) * l).limit(l)
@@ -156,7 +156,7 @@ router.get('/', requirePermission('reconciliation'), async (req, res) => {
 // GET /api/v1/bank-reconciliation/stats
 router.get('/stats', requirePermission('reconciliation'), async (req, res) => {
   try {
-    const branch = { branch: req.branchId };
+    const branch = { branch: req.branchScope };
     const [total, draft, inProgress, completed, approved] = await Promise.all([
       BankReconciliation.countDocuments(branch),
       BankReconciliation.countDocuments({ ...branch, status: 'draft' }),
@@ -197,7 +197,7 @@ router.post('/', requirePermission('reconciliation'), async (req, res) => {
     }
     const entries = (input.entries || []).map((entry, index) => sanitizeEntry(entry, index, statementFrom, statementTo));
     const data = {
-      branch: req.branchId,
+      branch: req.branchScope,
       reconciliationNumber: await generateBranchNumber(req.branchId, 'bankReconciliation', reconciliationDate),
       reconciliationDate,
       bankAccount: input.bankAccount || undefined,
@@ -226,7 +226,7 @@ router.post('/', requirePermission('reconciliation'), async (req, res) => {
 // GET /api/v1/bank-reconciliation/:id
 router.get('/:id', requirePermission('reconciliation'), async (req, res) => {
   try {
-    const recon = await BankReconciliation.findOne({ _id: req.params.id, branch: req.branchId })
+    const recon = await BankReconciliation.findOne({ _id: req.params.id, branch: req.branchScope })
       .populate('createdBy', 'name')
       .populate('completedBy', 'name')
       .lean();
@@ -244,14 +244,14 @@ router.patch('/:id/auto-match', requirePermission('reconciliation'), async (req,
   let matchCount = 0;
   try {
     await session.withTransaction(async () => {
-      recon = await BankReconciliation.findOne({ _id: req.params.id, branch: req.branchId }).session(session);
+      recon = await BankReconciliation.findOne({ _id: req.params.id, branch: req.branchScope }).session(session);
       if (!recon) throw routeError(404, 'Not found.');
       if (!MATCHABLE_STATUSES.includes(recon.status)) {
         throw routeError(409, 'Only draft or in-progress reconciliations can be matched.');
       }
 
       const payments = await Payment.find({
-        branch: req.branchId,
+        branch: req.branchScope,
         paymentDate: { $gte: recon.statementFrom, $lte: parseDate(recon.statementTo, 'statementTo', true) },
         status: 'confirmed',
         paymentMode: { $nin: ['cash', 'adjustment'] },
@@ -332,7 +332,7 @@ router.patch('/:id/match-entry', requirePermission('reconciliation'), async (req
   try {
     await session.withTransaction(async () => {
       const { entryId, paymentId, remarks } = matchInput;
-      recon = await BankReconciliation.findOne({ _id: req.params.id, branch: req.branchId }).session(session);
+      recon = await BankReconciliation.findOne({ _id: req.params.id, branch: req.branchScope }).session(session);
       if (!recon) throw routeError(404, 'Not found.');
       if (!MATCHABLE_STATUSES.includes(recon.status)) {
         throw routeError(409, 'Only draft or in-progress reconciliations can be matched.');
@@ -349,7 +349,7 @@ router.patch('/:id/match-entry', requirePermission('reconciliation'), async (req
 
       const payment = await Payment.findOne({
         _id: paymentId,
-        branch: req.branchId,
+        branch: req.branchScope,
         status: 'confirmed',
         paymentDate: { $gte: recon.statementFrom, $lte: parseDate(recon.statementTo, 'statementTo', true) },
       }).select('paymentNumber amount paymentType').session(session).lean();
@@ -390,7 +390,7 @@ router.patch('/:id/complete', requirePermission('reconciliation'), async (req, r
   let recon;
   try {
     await session.withTransaction(async () => {
-      recon = await BankReconciliation.findOne({ _id: req.params.id, branch: req.branchId }).session(session);
+      recon = await BankReconciliation.findOne({ _id: req.params.id, branch: req.branchScope }).session(session);
       if (!recon) throw routeError(404, 'Not found.');
       if (!MATCHABLE_STATUSES.includes(recon.status)) {
         throw routeError(409, 'Only draft or in-progress reconciliations can be completed.');

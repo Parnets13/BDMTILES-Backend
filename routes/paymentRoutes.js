@@ -399,7 +399,7 @@ router.get('/', requirePermission('payment'), async (req, res) => {
     const { page = 1, limit = 20, search, paymentType, status, paymentMode, dealer, supplier } = req.query;
     const p = Math.max(1, parseInt(page));
     const l = Math.min(100, parseInt(limit) || 20);
-    let filter = { branch: req.branchId };
+    let filter = { branch: req.branchScope };
     if (search) {
       const r = new RegExp(search, 'i');
       filter.$or = [{ paymentNumber: r }, { partyName: r }, { chequeNumber: r }, { transactionRef: r }];
@@ -428,11 +428,11 @@ router.get('/stats', requirePermission('payment'), async (req, res) => {
     const thisMonth = new Date(today.getFullYear(), today.getMonth(), 1);
 
     const [totalReceipts, totalPayments, todayReceipts, monthReceipts, pendingCheques] = await Promise.all([
-      Payment.aggregate([{ $match: { branch: req.branchId, paymentType: 'dealer_receipt', status: 'confirmed' } }, { $group: { _id: null, total: { $sum: '$amount' } } }]),
-      Payment.aggregate([{ $match: { branch: req.branchId, paymentType: 'supplier_payment', status: 'confirmed' } }, { $group: { _id: null, total: { $sum: '$amount' } } }]),
-      Payment.aggregate([{ $match: { branch: req.branchId, paymentType: 'dealer_receipt', status: 'confirmed', paymentDate: { $gte: today } } }, { $group: { _id: null, total: { $sum: '$amount' }, count: { $sum: 1 } } }]),
-      Payment.aggregate([{ $match: { branch: req.branchId, paymentType: 'dealer_receipt', status: 'confirmed', paymentDate: { $gte: thisMonth } } }, { $group: { _id: null, total: { $sum: '$amount' } } }]),
-      Payment.countDocuments({ branch: req.branchId, paymentMode: 'cheque', status: 'pending' }),
+      Payment.aggregate([{ $match: { branch: req.branchScope, paymentType: 'dealer_receipt', status: 'confirmed' } }, { $group: { _id: null, total: { $sum: '$amount' } } }]),
+      Payment.aggregate([{ $match: { branch: req.branchScope, paymentType: 'supplier_payment', status: 'confirmed' } }, { $group: { _id: null, total: { $sum: '$amount' } } }]),
+      Payment.aggregate([{ $match: { branch: req.branchScope, paymentType: 'dealer_receipt', status: 'confirmed', paymentDate: { $gte: today } } }, { $group: { _id: null, total: { $sum: '$amount' }, count: { $sum: 1 } } }]),
+      Payment.aggregate([{ $match: { branch: req.branchScope, paymentType: 'dealer_receipt', status: 'confirmed', paymentDate: { $gte: thisMonth } } }, { $group: { _id: null, total: { $sum: '$amount' } } }]),
+      Payment.countDocuments({ branch: req.branchScope, paymentMode: 'cheque', status: 'pending' }),
     ]);
     res.json({
       success: true,
@@ -452,7 +452,7 @@ router.get('/stats', requirePermission('payment'), async (req, res) => {
 router.get('/dealer-invoices/:dealerId', requirePermission('payment'), async (req, res) => {
   try {
     const invoices = await Invoice.find({
-      branch: req.branchId,
+      branch: req.branchScope,
       dealer: req.params.dealerId,
       status: { $ne: 'cancelled' },
       paymentStatus: { $in: ['pending', 'partial'] },
@@ -467,7 +467,7 @@ router.get('/dealer-invoices/:dealerId', requirePermission('payment'), async (re
 router.get('/supplier-invoices/:supplierId', requirePermission('payment'), async (req, res) => {
   try {
     const invoices = await SupplierInvoice.find({
-      branch: req.branchId,
+      branch: req.branchScope,
       supplier: req.params.supplierId,
       status: { $in: ['verified', 'partial'] },
       balanceAmount: { $gt: 0 },
@@ -480,7 +480,7 @@ router.get('/supplier-invoices/:supplierId', requirePermission('payment'), async
 // GET /api/v1/payments/:id
 router.get('/:id', requirePermission('payment'), async (req, res) => {
   try {
-    const payment = await Payment.findOne({ _id: req.params.id, branch: req.branchId })
+    const payment = await Payment.findOne({ _id: req.params.id, branch: req.branchScope })
       .populate('dealer', 'businessName dealerCode mobile city currentOutstanding')
       .populate('supplier', 'companyName supplierCode mobile')
       .lean();
@@ -497,7 +497,7 @@ router.post('/', requirePermission('payment'), async (req, res) => {
   }
   const sourceKey = `${String(req.branchId)}:payment:${rawIdempotencyKey}`;
   const requestFingerprint = fingerprintRequest(req.body);
-  const existingPayment = await Payment.findOne({ branch: req.branchId, sourceKey });
+  const existingPayment = await Payment.findOne({ branch: req.branchScope, sourceKey });
   if (existingPayment) {
     if (existingPayment.requestFingerprint && existingPayment.requestFingerprint !== requestFingerprint) {
       return res.status(409).json({ success: false, message: 'This Idempotency-Key was already used with a different request payload.' });
@@ -508,7 +508,7 @@ router.post('/', requirePermission('payment'), async (req, res) => {
   try {
     let payment;
     await session.withTransaction(async () => {
-      const validated = await validatePaymentData({ ...req.body, branch: req.branchId }, session);
+      const validated = await validatePaymentData({ ...req.body, branch: req.branchScope }, session);
       const paymentNumber = await generateBranchNumber(req.branchId, 'payment', req.body.paymentDate || new Date(), { session });
       const data = {
         ...req.body,
@@ -516,7 +516,7 @@ router.post('/', requirePermission('payment'), async (req, res) => {
         paymentNumber,
         sourceKey,
         requestFingerprint,
-        branch: req.branchId,
+        branch: req.branchScope,
         transactionRef: req.body.transactionRef ?? req.body.utrNumber,
         status: req.body.paymentMode === 'cheque' ? 'pending' : 'confirmed',
         confirmedAt: req.body.paymentMode === 'cheque' ? null : new Date(),
@@ -532,7 +532,7 @@ router.post('/', requirePermission('payment'), async (req, res) => {
     return res.status(201).json({ success: true, message: 'Payment recorded.', data: payment });
   } catch (error) {
     if (error.code === 11000) {
-      const duplicate = await Payment.findOne({ branch: req.branchId, sourceKey });
+      const duplicate = await Payment.findOne({ branch: req.branchScope, sourceKey });
       if (duplicate) {
         if (duplicate.requestFingerprint && duplicate.requestFingerprint !== requestFingerprint) {
           return res.status(409).json({ success: false, message: 'This Idempotency-Key was already used with a different request payload.' });
@@ -553,7 +553,7 @@ router.patch('/:id/confirm', requirePermission('payment'), async (req, res) => {
     let payment;
     let alreadyConfirmed = false;
     await session.withTransaction(async () => {
-      const current = await Payment.findOne({ _id: req.params.id, branch: req.branchId }).session(session);
+      const current = await Payment.findOne({ _id: req.params.id, branch: req.branchScope }).session(session);
       if (!current) throw paymentError(404, 'Payment not found.');
       if (current.status === 'confirmed') {
         payment = current;
@@ -565,7 +565,7 @@ router.patch('/:id/confirm', requirePermission('payment'), async (req, res) => {
 
       await validatePaymentData(current.toObject(), session, { allowLegacySalesOrder: true });
       payment = await Payment.findOneAndUpdate(
-        { _id: current._id, branch: req.branchId, status: 'pending' },
+        { _id: current._id, branch: req.branchScope, status: 'pending' },
         { $set: { status: 'confirmed', confirmedAt: new Date(), bouncedAt: null, cancelledAt: null } },
         { new: true, runValidators: true, session }
       );
@@ -592,7 +592,7 @@ router.patch('/:id/bounce', requirePermission('payment'), async (req, res) => {
     let payment;
     let alreadyBounced = false;
     await session.withTransaction(async () => {
-      const current = await Payment.findOne({ _id: req.params.id, branch: req.branchId }).session(session);
+      const current = await Payment.findOne({ _id: req.params.id, branch: req.branchScope }).session(session);
       if (!current) throw paymentError(404, 'Payment not found.');
       if (current.paymentMode !== 'cheque') throw paymentError(422, 'Only cheque payments can use the bounce action.');
       if (current.status === 'bounced') {
@@ -608,7 +608,7 @@ router.patch('/:id/bounce', requirePermission('payment'), async (req, res) => {
 
       const previousStatus = current.status;
       payment = await Payment.findOneAndUpdate(
-        { _id: current._id, branch: req.branchId, status: previousStatus },
+        { _id: current._id, branch: req.branchScope, status: previousStatus },
         { $set: { status: 'bounced', bouncedAt: new Date(), bounceReason: req.body.reason || '', bounceCharges } },
         { new: true, runValidators: true, session }
       );

@@ -83,7 +83,7 @@ async function listRequests(req, res, ownerOnly) {
   try {
     const { page, limit } = listPagination(req.query);
     const filter = {
-      branch: req.branchId,
+      branch: req.branchScope,
       ...(ownerOnly ? { salesExecutive: req.user._id } : {}),
     };
     if (req.query.status) {
@@ -211,7 +211,7 @@ router.get('/options/products', requirePermission('dealer.order_request.create')
     ]);
     const productIds = products.map(product => product._id);
     const stockRows = productIds.length ? await Stock.aggregate([
-      { $match: { branch: req.branchId, product: { $in: productIds } } },
+      { $match: { branch: req.branchScope, product: { $in: productIds } } },
       { $group: { _id: '$product', stockAvailable: { $sum: '$availableQty' } } },
     ]) : [];
     const stockByProduct = new Map(stockRows.map(row => [String(row._id), Number(row.stockAvailable || 0)]));
@@ -256,7 +256,7 @@ router.post('/', requirePermission('dealer.order_request.create'), async (req, r
     const items = await buildTrustedRequestItems(req.body?.items);
     const request = await DealerOrderRequest.create({
       requestNumber: await generateBranchNumber(req.branchId, 'dealerOrderRequest'),
-      branch: req.branchId,
+      branch: req.branchScope,
       dealer: dealer._id,
       dealerSnapshot: {
         businessName: dealer.businessName,
@@ -302,7 +302,7 @@ router.get('/mine/:id', requirePermission('dealer.order_request.create'), async 
   try {
     const request = await populateRequest(DealerOrderRequest.findOne({
       _id: req.params.id,
-      branch: req.branchId,
+      branch: req.branchScope,
       salesExecutive: req.user._id,
     })).lean();
     if (!request) throw routeError(404, 'Dealer order request not found.');
@@ -315,7 +315,7 @@ router.get('/mine/:id', requirePermission('dealer.order_request.create'), async 
 router.get('/stats', requirePermission('dealer.order_request.review'), async (req, res) => {
   try {
     const rows = await DealerOrderRequest.aggregate([
-      { $match: { branch: req.branchId } },
+      { $match: { branch: req.branchScope } },
       { $group: { _id: '$status', count: { $sum: 1 } } },
     ]);
     // Spread the Set rather than calling .map() on its iterator — iterator helpers
@@ -337,7 +337,7 @@ router.post('/:id/approve', requirePermission('dealer.order_request.approve'), a
   try {
     const revision = Number(req.body?.revision);
     if (!Number.isInteger(revision) || revision < 0) throw routeError(422, 'A valid revision is required. Refresh the request and try again.');
-    const current = await DealerOrderRequest.findOne({ _id: req.params.id, branch: req.branchId });
+    const current = await DealerOrderRequest.findOne({ _id: req.params.id, branch: req.branchScope });
     if (!current) throw routeError(404, 'Dealer order request not found.');
     if (current.status !== 'submitted') throw routeError(409, `Request is already in "${current.status}" status.`);
     if (current.revision !== revision) throw routeError(409, 'Request changed since it was loaded. Refresh and try again.');
@@ -346,7 +346,7 @@ router.post('/:id/approve', requirePermission('dealer.order_request.approve'), a
     if (!dealer) throw routeError(422, 'The request dealer is no longer active.');
     const refreshed = await refreshAndFingerprintRequest(current);
     const approved = await DealerOrderRequest.findOneAndUpdate(
-      { _id: current._id, branch: req.branchId, status: 'submitted', revision },
+      { _id: current._id, branch: req.branchScope, status: 'submitted', revision },
       {
         $set: {
           status: 'approved',
@@ -374,7 +374,7 @@ router.post('/:id/reject', requirePermission('dealer.order_request.approve'), as
     if (!Number.isInteger(revision) || revision < 0) throw routeError(422, 'A valid revision is required. Refresh the request and try again.');
     if (!reason) throw routeError(422, 'Rejection reason is required.');
     const rejected = await DealerOrderRequest.findOneAndUpdate(
-      { _id: req.params.id, branch: req.branchId, status: 'submitted', revision },
+      { _id: req.params.id, branch: req.branchScope, status: 'submitted', revision },
       {
         $set: { status: 'rejected', rejectedBy: req.user._id, rejectedAt: new Date(), rejectionReason: reason },
         $inc: { revision: 1 },
@@ -406,7 +406,7 @@ router.patch('/:id', requirePermission('dealer.order_request.approve'), async (r
     const revision = Number(req.body?.revision);
     if (!Number.isInteger(revision) || revision < 0) throw routeError(422, 'A valid revision is required. Refresh the request and try again.');
 
-    const current = await DealerOrderRequest.findOne({ _id: req.params.id, branch: req.branchId }).lean();
+    const current = await DealerOrderRequest.findOne({ _id: req.params.id, branch: req.branchScope }).lean();
     if (!current) throw routeError(404, 'Dealer order request not found.');
     if (!['submitted', 'approved'].includes(current.status)) {
       throw routeError(409, `A request in "${current.status}" status can no longer be edited.`);
@@ -474,7 +474,7 @@ router.patch('/:id', requirePermission('dealer.order_request.approve'), async (r
       : undefined;
 
     const updated = await DealerOrderRequest.findOneAndUpdate(
-      { _id: current._id, branch: req.branchId, status: current.status, revision },
+      { _id: current._id, branch: req.branchScope, status: current.status, revision },
       { $set: set, $inc: { revision: 1 }, ...(push ? { $push: push } : {}) },
       { new: true, runValidators: true },
     );
@@ -493,12 +493,12 @@ router.patch('/:id', requirePermission('dealer.order_request.approve'), async (r
 
 router.get('/:id/quotation-prefill', requirePermission('dealer.order_request.review'), async (req, res) => {
   try {
-    const request = await DealerOrderRequest.findOne({ _id: req.params.id, branch: req.branchId }).lean();
+    const request = await DealerOrderRequest.findOne({ _id: req.params.id, branch: req.branchScope }).lean();
     if (!request) throw routeError(404, 'Dealer order request not found.');
     if (request.status === 'quotation_linked' && request.sourceQuotation) {
       const quotation = await Quotation.findOne({
         _id: request.sourceQuotation,
-        branch: req.branchId,
+        branch: req.branchScope,
         sourceDealerOrderRequest: request._id,
       }).select('quotationNumber status grandTotal').lean();
       if (!quotation) throw routeError(409, 'Linked quotation could not be verified.');
@@ -561,7 +561,7 @@ router.post(
       await session.withTransaction(async () => {
         const { request, quotation, plan } = await dealerOrderStockPlan({
           requestId: req.params.id,
-          branchId: req.branchId,
+          branchId: req.branchScope,
           actor: req.user,
           session,
         });
@@ -622,7 +622,7 @@ router.post(
       await session.withTransaction(async () => {
         result = await processDealerOrderRequest({
           requestId: req.params.id,
-          branchId: req.branchId,
+          branchId: req.branchScope,
           actor: req.user,
           planHash: req.body?.planHash,
           shortfallInput: answers,
@@ -681,7 +681,7 @@ router.post(
       await session.withTransaction(async () => {
         result = await processPendingStock({
           requestId: req.params.id,
-          branchId: req.branchId,
+          branchId: req.branchScope,
           actor: req.user,
           planHash: req.body?.planHash,
           session,
@@ -728,7 +728,7 @@ router.post(
       await session.withTransaction(async () => {
         result = await openNextRound({
           requestId: req.params.id,
-          branchId: req.branchId,
+          branchId: req.branchScope,
           actor: req.user,
           shortfallInput: answers,
           offerRemark: req.body?.offerRemark,
@@ -755,7 +755,7 @@ router.post(
 
 router.get('/:id', requirePermission('dealer.order_request.review'), async (req, res) => {
   try {
-    const request = await populateRequest(DealerOrderRequest.findOne({ _id: req.params.id, branch: req.branchId })).lean();
+    const request = await populateRequest(DealerOrderRequest.findOne({ _id: req.params.id, branch: req.branchScope })).lean();
     if (!request) throw routeError(404, 'Dealer order request not found.');
     return res.json({ success: true, data: { ...request, shortfall: shortfallDto(request) } });
   } catch (error) {

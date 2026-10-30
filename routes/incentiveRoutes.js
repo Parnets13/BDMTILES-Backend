@@ -39,7 +39,7 @@ function ruleBody(body) {
 
 router.get('/', requirePermission('incentive.rules.view'), async (req, res) => {
   try {
-    const filter = { branch: req.branchId, applicableTo: { $ne: 'dealer' } };
+    const filter = { branch: req.branchScope, applicableTo: { $ne: 'dealer' } };
     for (const field of ['applicableTo', 'incentiveType', 'status', 'triggerEvent']) {
       if (req.query[field] !== undefined) filter[field] = req.query[field];
     }
@@ -51,10 +51,10 @@ router.get('/', requirePermission('incentive.rules.view'), async (req, res) => {
 
 router.get('/stats', requirePermission('incentive.rules.view'), async (req, res) => {
   try {
-    const earningMatch = { branch: req.branchId, dealer: null };
+    const earningMatch = { branch: req.branchScope, dealer: null };
     const [total, active, totals] = await Promise.all([
-      Incentive.countDocuments({ branch: req.branchId, applicableTo: { $ne: 'dealer' } }),
-      Incentive.countDocuments({ branch: req.branchId, applicableTo: { $ne: 'dealer' }, status: 'active' }),
+      Incentive.countDocuments({ branch: req.branchScope, applicableTo: { $ne: 'dealer' } }),
+      Incentive.countDocuments({ branch: req.branchScope, applicableTo: { $ne: 'dealer' }, status: 'active' }),
       IncentiveEarning.aggregate([
         { $match: earningMatch },
         { $group: {
@@ -87,7 +87,7 @@ router.post('/', requirePermission('incentive.rules.manage'), async (req, res) =
 
 router.get('/my-earnings', requirePermission('incentive.earnings.self'), async (req, res) => {
   try {
-    const earnings = await IncentiveEarning.find({ branch: req.branchId, earnedBy: req.user._id, dealer: null })
+    const earnings = await IncentiveEarning.find({ branch: req.branchScope, earnedBy: req.user._id, dealer: null })
       .sort({ createdAt: -1 }).limit(50).populate('incentive', 'incentiveName incentiveType').lean();
     const totalEarned = earnings.reduce((sum, row) => sum + row.earnedAmount, 0);
     const totalPaid = earnings.filter(row => row.paymentStatus === 'paid').reduce((sum, row) => sum + row.earnedAmount, 0);
@@ -100,7 +100,7 @@ router.get('/earnings/list', requirePermission('incentive.earnings.view'), async
   try {
     const page = Math.max(1, Number.parseInt(req.query.page, 10) || 1);
     const limit = Math.min(100, Math.max(1, Number.parseInt(req.query.limit, 10) || 20));
-    const filter = { branch: req.branchId, dealer: null };
+    const filter = { branch: req.branchScope, dealer: null };
     for (const field of ['earnedBy', 'paymentStatus', 'triggerEvent']) if (req.query[field]) filter[field] = req.query[field];
     const [data, total] = await Promise.all([
       IncentiveEarning.find(filter).sort({ createdAt: -1 }).skip((page - 1) * limit).limit(limit)
@@ -118,7 +118,7 @@ router.post('/earnings/record', requirePermission('incentive.earnings.record'), 
 
 router.post('/earnings/calculate', requirePermission('incentive.earnings.record'), async (req, res) => {
   try {
-    const incentive = await Incentive.findOne({ _id: req.body.incentiveId, branch: req.branchId });
+    const incentive = await Incentive.findOne({ _id: req.body.incentiveId, branch: req.branchScope });
     if (!incentive) throw routeError(404, 'Incentive rule not found in the active branch.');
     assertNonDealerRule(incentive);
     const value = Number(req.body.value || 0);
@@ -136,14 +136,14 @@ router.post('/earnings/calculate', requirePermission('incentive.earnings.record'
 
 router.patch('/earnings/:id/approve', requirePermission('incentive.earnings.approve'), async (req, res) => {
   try {
-    const current = await IncentiveEarning.findOne({ _id: req.params.id, branch: req.branchId, dealer: null });
+    const current = await IncentiveEarning.findOne({ _id: req.params.id, branch: req.branchScope, dealer: null });
     if (!current) throw routeError(404, 'Earning not found in the active branch.');
     if (current.paymentStatus !== 'pending') throw routeError(409, `Only pending earnings can be approved; this record is ${current.paymentStatus}.`);
     if ([current.createdBy, current.earnedBy].filter(Boolean).some(actor => String(actor) === String(req.user._id))) {
       throw routeError(403, 'The earning creator or beneficiary cannot approve it.');
     }
     const earning = await IncentiveEarning.findOneAndUpdate(
-      { _id: current._id, branch: req.branchId, paymentStatus: 'pending' },
+      { _id: current._id, branch: req.branchScope, paymentStatus: 'pending' },
       { $set: { paymentStatus: 'approved', approvedBy: req.user._id, approvedAt: new Date() } },
       { new: true, runValidators: true }
     );
@@ -154,20 +154,20 @@ router.patch('/earnings/:id/approve', requirePermission('incentive.earnings.appr
 
 router.patch('/earnings/:id/pay', requirePermission('incentive.earnings.pay'), async (req, res) => {
   try {
-    const current = await IncentiveEarning.findOne({ _id: req.params.id, branch: req.branchId, dealer: null });
+    const current = await IncentiveEarning.findOne({ _id: req.params.id, branch: req.branchScope, dealer: null });
     if (!current) throw routeError(404, 'Earning not found in the active branch.');
     if (current.paymentStatus !== 'approved') throw routeError(409, `Only approved earnings can be paid; this record is ${current.paymentStatus}.`);
     if ([current.createdBy, current.approvedBy, current.earnedBy].filter(Boolean).some(actor => String(actor) === String(req.user._id))) {
       throw routeError(403, 'Payment requires an actor who is not the creator, approver, or beneficiary.');
     }
     const earning = await IncentiveEarning.findOneAndUpdate(
-      { _id: current._id, branch: req.branchId, paymentStatus: 'approved' },
+      { _id: current._id, branch: req.branchScope, paymentStatus: 'approved' },
       { $set: { paymentStatus: 'paid', paidAt: new Date(), paymentRef: String(req.body.paymentRef || '').trim() } },
       { new: true, runValidators: true }
     );
     if (!earning) throw routeError(409, 'Earning state changed before payment.');
     await Incentive.updateOne(
-      { _id: earning.incentive, branch: req.branchId },
+      { _id: earning.incentive, branch: req.branchScope },
       { $inc: { totalPaid: earning.earnedAmount, totalPending: -earning.earnedAmount } }
     );
     return res.json({ success: true, message: 'Earning marked paid.', data: earning });
@@ -176,7 +176,7 @@ router.patch('/earnings/:id/pay', requirePermission('incentive.earnings.pay'), a
 
 router.get('/:id', requirePermission('incentive.rules.view'), async (req, res) => {
   try {
-    const incentive = await Incentive.findOne({ _id: req.params.id, branch: req.branchId, applicableTo: { $ne: 'dealer' } }).lean();
+    const incentive = await Incentive.findOne({ _id: req.params.id, branch: req.branchScope, applicableTo: { $ne: 'dealer' } }).lean();
     if (!incentive) throw routeError(404, 'Incentive rule not found in the active branch.');
     return res.json({ success: true, data: incentive });
   } catch (error) { return sendError(res, error); }
@@ -184,7 +184,7 @@ router.get('/:id', requirePermission('incentive.rules.view'), async (req, res) =
 
 router.put('/:id', requirePermission('incentive.rules.manage'), async (req, res) => {
   try {
-    const current = await Incentive.findOne({ _id: req.params.id, branch: req.branchId });
+    const current = await Incentive.findOne({ _id: req.params.id, branch: req.branchScope });
     if (!current) throw routeError(404, 'Incentive rule not found in the active branch.');
     assertNonDealerRule(current);
     const updates = ruleBody(req.body);
@@ -199,7 +199,7 @@ router.patch('/:id/status', requirePermission('incentive.rules.manage'), async (
   try {
     if (!['active', 'paused', 'expired', 'closed'].includes(req.body.status)) throw routeError(422, 'Invalid status.');
     const incentive = await Incentive.findOneAndUpdate(
-      { _id: req.params.id, branch: req.branchId, applicableTo: { $ne: 'dealer' } },
+      { _id: req.params.id, branch: req.branchScope, applicableTo: { $ne: 'dealer' } },
       { $set: { status: req.body.status } },
       { new: true, runValidators: true }
     );
@@ -210,9 +210,9 @@ router.patch('/:id/status', requirePermission('incentive.rules.manage'), async (
 
 router.delete('/:id', requirePermission('incentive.rules.manage'), async (req, res) => {
   try {
-    const incentive = await Incentive.findOne({ _id: req.params.id, branch: req.branchId, applicableTo: { $ne: 'dealer' } });
+    const incentive = await Incentive.findOne({ _id: req.params.id, branch: req.branchScope, applicableTo: { $ne: 'dealer' } });
     if (!incentive) throw routeError(404, 'Incentive rule not found in the active branch.');
-    if (await IncentiveEarning.exists({ branch: req.branchId, incentive: incentive._id })) throw routeError(409, 'Cannot delete an incentive rule with earning history. Close it instead.');
+    if (await IncentiveEarning.exists({ branch: req.branchScope, incentive: incentive._id })) throw routeError(409, 'Cannot delete an incentive rule with earning history. Close it instead.');
     await incentive.deleteOne();
     return res.json({ success: true, message: 'Incentive deleted.' });
   } catch (error) { return sendError(res, error); }

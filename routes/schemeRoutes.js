@@ -203,7 +203,7 @@ async function supplierRule(body, session = null) {
 }
 
 function listFilter(req) {
-  const filter = { branch: req.branchId };
+  const filter = { branch: req.branchScope };
   if (req.query.status) filter.status = req.query.status;
   if (req.query.search) {
     const regex = new RegExp(escapeRegex(req.query.search), 'i');
@@ -258,10 +258,10 @@ router.get('/supplier', canView, async (req, res) => {
 router.get('/supplier/stats', canView, async (req, res) => {
   try {
     const [total, active, settlementRows] = await Promise.all([
-      SupplierScheme.countDocuments({ branch: req.branchId }),
-      SupplierScheme.countDocuments({ branch: req.branchId, status: 'active' }),
+      SupplierScheme.countDocuments({ branch: req.branchScope }),
+      SupplierScheme.countDocuments({ branch: req.branchScope, status: 'active' }),
       SchemeSettlement.aggregate([
-        { $match: { branch: req.branchId, partyType: 'supplier' } },
+        { $match: { branch: req.branchScope, partyType: 'supplier' } },
         { $group: {
           _id: '$status', count: { $sum: 1 },
           amount: { $sum: { $cond: [{ $eq: ['$adjustmentType', 'clawback'] }, { $multiply: ['$amount', -1] }, '$amount'] } },
@@ -297,7 +297,7 @@ router.post('/supplier', canManageSupplierScheme, async (req, res) => {
 
 router.get('/supplier/:id', canView, async (req, res) => {
   try {
-    const scheme = await SupplierScheme.findOne({ _id: req.params.id, branch: req.branchId })
+    const scheme = await SupplierScheme.findOne({ _id: req.params.id, branch: req.branchScope })
       .populate('supplier', 'companyName supplierCode').populate('products', 'itemName productCode').lean();
     if (!scheme) throw routeError(404, 'Scheme not found in the active branch.');
     return res.json({ success: true, data: scheme });
@@ -306,7 +306,7 @@ router.get('/supplier/:id', canView, async (req, res) => {
 
 router.get('/supplier/:id/analysis', canView, async (req, res) => {
   try {
-    const scheme = await SupplierScheme.findOne({ _id: req.params.id, branch: req.branchId }).lean();
+    const scheme = await SupplierScheme.findOne({ _id: req.params.id, branch: req.branchScope }).lean();
     const result = await calculateSupplierScheme(scheme);
     return res.json({ success: true, data: { scheme, partyName: result.partyName, ...result.calculation, calculationFingerprint: result.fingerprint } });
   } catch (error) { return sendError(res, error); }
@@ -314,7 +314,7 @@ router.get('/supplier/:id/analysis', canView, async (req, res) => {
 
 router.put('/supplier/:id', canManageSupplierScheme, async (req, res) => {
   try {
-    const current = await SupplierScheme.findOne({ _id: req.params.id, branch: req.branchId });
+    const current = await SupplierScheme.findOne({ _id: req.params.id, branch: req.branchScope });
     if (!current) throw routeError(404, 'Scheme not found in the active branch.');
     if (!['draft', 'paused'].includes(current.status)) throw routeError(409, 'Only draft or paused schemes may be edited.');
     if (Number(req.body.version) !== current.version) throw routeError(409, 'Scheme was changed by another user. Reload before editing.');
@@ -363,7 +363,7 @@ router.post('/dealer', canManageDealerScheme, async (req, res) => {
 router.get('/dealer-analysis', canView, async (req, res) => {
   try {
     if (!mongoose.isValidObjectId(req.query.dealer)) throw routeError(422, 'dealer is required.');
-    const schemes = await DealerScheme.find({ branch: req.branchId, status: { $in: ['active', 'expired', 'closed'] } }).lean();
+    const schemes = await DealerScheme.find({ branch: req.branchScope, status: { $in: ['active', 'expired', 'closed'] } }).lean();
     const results = [];
     for (const scheme of schemes) {
       try {
@@ -379,7 +379,7 @@ router.get('/dealer-analysis', canView, async (req, res) => {
 
 router.get('/dealer/:id', canView, async (req, res) => {
   try {
-    const scheme = await DealerScheme.findOne({ _id: req.params.id, branch: req.branchId })
+    const scheme = await DealerScheme.findOne({ _id: req.params.id, branch: req.branchScope })
       .populate('dealers', 'businessName dealerCode').populate('products', 'itemName productCode').lean();
     if (!scheme) throw routeError(404, 'Scheme not found in the active branch.');
     return res.json({ success: true, data: scheme });
@@ -389,7 +389,7 @@ router.get('/dealer/:id', canView, async (req, res) => {
 router.get('/dealer/:id/analysis', canView, async (req, res) => {
   try {
     if (!mongoose.isValidObjectId(req.query.dealer)) throw routeError(422, 'dealer is required.');
-    const scheme = await DealerScheme.findOne({ _id: req.params.id, branch: req.branchId }).lean();
+    const scheme = await DealerScheme.findOne({ _id: req.params.id, branch: req.branchScope }).lean();
     const result = await calculateDealerScheme(scheme, req.query.dealer);
     return res.json({ success: true, data: { scheme, partyName: result.partyName, ...result.calculation, calculationFingerprint: result.fingerprint } });
   } catch (error) { return sendError(res, error); }
@@ -397,7 +397,7 @@ router.get('/dealer/:id/analysis', canView, async (req, res) => {
 
 router.put('/dealer/:id', canManageDealerScheme, async (req, res) => {
   try {
-    const current = await DealerScheme.findOne({ _id: req.params.id, branch: req.branchId });
+    const current = await DealerScheme.findOne({ _id: req.params.id, branch: req.branchScope });
     if (!current) throw routeError(404, 'Scheme not found in the active branch.');
     if (!['draft', 'paused'].includes(current.status)) throw routeError(409, 'Only draft or paused schemes may be edited.');
     if (Number(req.body.version) !== current.version) throw routeError(409, 'Scheme was changed by another user. Reload before editing.');
@@ -409,7 +409,7 @@ router.put('/dealer/:id', canManageDealerScheme, async (req, res) => {
 
 async function changeStatus(Model, req, res) {
   try {
-    const scheme = await Model.findOne({ _id: req.params.id, branch: req.branchId });
+    const scheme = await Model.findOne({ _id: req.params.id, branch: req.branchScope });
     if (!scheme) throw routeError(404, 'Scheme not found in the active branch.');
     const next = requiredText(req.body.status, 'status');
     const transitions = {
@@ -434,7 +434,7 @@ async function submitBaseSettlement(req, res, partyType) {
     let replay = false;
     await session.withTransaction(async () => {
       const Model = partyType === 'dealer' ? DealerScheme : SupplierScheme;
-      const scheme = await Model.findOne({ _id: req.params.id, branch: req.branchId }).session(session).lean();
+      const scheme = await Model.findOne({ _id: req.params.id, branch: req.branchScope }).session(session).lean();
       const result = partyType === 'dealer'
         ? await calculateDealerScheme(scheme, req.body.dealer, session)
         : await calculateSupplierScheme(scheme, session);
@@ -444,7 +444,7 @@ async function submitBaseSettlement(req, res, partyType) {
       const partyId = partyType === 'dealer' ? req.body.dealer : scheme.supplier;
       const rootKey = `${req.branchId}:${partyType}:${scheme._id}:${partyId}:${new Date(scheme.startDate).toISOString()}:${new Date(scheme.endDate).toISOString()}`;
       const survivingAdjustment = await SchemeSettlement.exists({
-        branch: req.branchId,
+        branch: req.branchScope,
         rootKey,
         adjustmentType: { $ne: 'base' },
         status: { $in: ['submitted', 'approved'] },
@@ -454,7 +454,7 @@ async function submitBaseSettlement(req, res, partyType) {
       }
       const baseScopeKey = `${rootKey}:${result.fingerprint}:base`;
       settlement = await SchemeSettlement.findOne({
-        branch: req.branchId,
+        branch: req.branchScope,
         rootKey,
         calculationFingerprint: result.fingerprint,
         adjustmentType: 'base',
@@ -462,14 +462,14 @@ async function submitBaseSettlement(req, res, partyType) {
       }).session(session);
       if (settlement) { replay = true; return; }
       const priorAttempts = await SchemeSettlement.countDocuments({
-        branch: req.branchId,
+        branch: req.branchScope,
         rootKey,
         calculationFingerprint: result.fingerprint,
         adjustmentType: 'base',
       }).session(session);
       const scopeKey = priorAttempts ? `${baseScopeKey}:attempt:${priorAttempts + 1}` : baseScopeKey;
       await SchemeSettlement.updateMany(
-        { branch: req.branchId, rootKey, status: 'submitted', adjustmentType: 'base' },
+        { branch: req.branchScope, rootKey, status: 'submitted', adjustmentType: 'base' },
         { $set: { status: 'superseded' } },
         { session }
       );
@@ -480,7 +480,7 @@ async function submitBaseSettlement(req, res, partyType) {
         { session }
       );
       settlement = new SchemeSettlement({
-        branch: req.branchId,
+        branch: req.branchScope,
         settlementNumber,
         partyType,
         dealer: partyType === 'dealer' ? partyId : null,
@@ -521,7 +521,7 @@ router.get('/settlements', canView, async (req, res) => {
   try {
     const page = Math.max(1, Number.parseInt(req.query.page, 10) || 1);
     const limit = Math.min(100, Math.max(1, Number.parseInt(req.query.limit, 10) || 20));
-    const filter = { branch: req.branchId };
+    const filter = { branch: req.branchScope };
     if (req.query.partyType) filter.partyType = req.query.partyType;
     if (req.query.status) filter.status = req.query.status;
     if (req.query.scheme) filter.$or = [{ dealerScheme: req.query.scheme }, { supplierScheme: req.query.scheme }];
@@ -537,7 +537,7 @@ router.get('/settlements', canView, async (req, res) => {
 
 router.get('/settlements/:id', canView, async (req, res) => {
   try {
-    const settlement = await SchemeSettlement.findOne({ _id: req.params.id, branch: req.branchId })
+    const settlement = await SchemeSettlement.findOne({ _id: req.params.id, branch: req.branchScope })
       .populate('dealer', 'businessName dealerCode mobile').populate('supplier', 'companyName supplierCode mobile')
       .populate('dealerScheme supplierScheme')
       .populate('submittedBy approvedBy reversedBy supplierCreditNote.receivedBy supplierCreditNote.verifiedBy', 'name email role').lean();
@@ -604,7 +604,7 @@ router.patch('/settlements/:id/approve', canApprove, async (req, res) => {
   try {
     let settlement;
     await session.withTransaction(async () => {
-      const current = await SchemeSettlement.findOne({ _id: req.params.id, branch: req.branchId }).session(session);
+      const current = await SchemeSettlement.findOne({ _id: req.params.id, branch: req.branchScope }).session(session);
       if (!current) throw routeError(404, 'Scheme settlement not found in the active branch.');
       if (current.status !== 'submitted') throw routeError(409, `Only submitted records can be approved; this record is ${current.status}.`);
       if (String(current.submittedBy) === String(req.user._id)) throw routeError(403, 'The submitter cannot approve the same incentive.');
@@ -623,7 +623,7 @@ router.patch('/settlements/:id/approve', canApprove, async (req, res) => {
       const postingKey = `scheme-settlement:${current._id}:approved`;
       await postSubledgerEntry({
         session,
-        branch: req.branchId,
+        branch: req.branchScope,
         partyType: current.partyType,
         partyId: current.partyType === 'dealer' ? current.dealer : current.supplier,
         amount: current.amount,
@@ -638,7 +638,7 @@ router.patch('/settlements/:id/approve', canApprove, async (req, res) => {
         createdBy: req.user._id,
       });
       settlement = await SchemeSettlement.findOneAndUpdate(
-        { _id: current._id, branch: req.branchId, status: 'submitted' },
+        { _id: current._id, branch: req.branchScope, status: 'submitted' },
         { $set: {
           status: 'approved', approvedBy: req.user._id, approvedAt: noteDate,
           accountingNoteNumber: noteNumber, accountingNoteDate: noteDate, postingKey,
@@ -664,11 +664,11 @@ router.post('/settlements/:id/adjustment', canSubmit, async (req, res) => {
     let adjustment;
     let replay = false;
     await session.withTransaction(async () => {
-      const parent = await SchemeSettlement.findOne({ _id: req.params.id, branch: req.branchId }).session(session);
+      const parent = await SchemeSettlement.findOne({ _id: req.params.id, branch: req.branchScope }).session(session);
       if (!parent) throw routeError(404, 'Scheme settlement not found in the active branch.');
       if (parent.status !== 'approved') throw routeError(409, 'Adjustments can only be generated from active approved accounting.');
       const { result } = await recalculateSettlement(parent, session);
-      const approved = await SchemeSettlement.find({ branch: req.branchId, rootKey: parent.rootKey, status: 'approved' })
+      const approved = await SchemeSettlement.find({ branch: req.branchScope, rootKey: parent.rootKey, status: 'approved' })
         .select('amount adjustmentType').session(session).lean();
       const accounted = approved.reduce((sum, row) => sum + signedAmount(row), 0);
       const difference = Math.round((result.calculation.earnedAmount - accounted + Number.EPSILON) * 100) / 100;
@@ -677,7 +677,7 @@ router.post('/settlements/:id/adjustment', canSubmit, async (req, res) => {
       const absoluteDifference = Math.abs(difference);
       const baseScopeKey = `${parent.rootKey}:${result.fingerprint}:${adjustmentType}:${absoluteDifference.toFixed(2)}`;
       adjustment = await SchemeSettlement.findOne({
-        branch: req.branchId,
+        branch: req.branchScope,
         rootKey: parent.rootKey,
         calculationFingerprint: result.fingerprint,
         adjustmentType,
@@ -686,7 +686,7 @@ router.post('/settlements/:id/adjustment', canSubmit, async (req, res) => {
       }).session(session);
       if (adjustment) { replay = true; return; }
       const priorAttempts = await SchemeSettlement.countDocuments({
-        branch: req.branchId,
+        branch: req.branchScope,
         rootKey: parent.rootKey,
         calculationFingerprint: result.fingerprint,
         adjustmentType,
@@ -694,13 +694,13 @@ router.post('/settlements/:id/adjustment', canSubmit, async (req, res) => {
       }).session(session);
       const scopeKey = priorAttempts ? `${baseScopeKey}:attempt:${priorAttempts + 1}` : baseScopeKey;
       await SchemeSettlement.updateMany(
-        { branch: req.branchId, rootKey: parent.rootKey, status: 'submitted', adjustmentType: { $ne: 'base' } },
+        { branch: req.branchScope, rootKey: parent.rootKey, status: 'submitted', adjustmentType: { $ne: 'base' } },
         { $set: { status: 'superseded' } },
         { session }
       );
       const settlementNumber = await generateBranchNumber(req.branchId, `${parent.partyType}_scheme_adjustment`, new Date(), { session });
       adjustment = new SchemeSettlement({
-        branch: req.branchId,
+        branch: req.branchScope,
         settlementNumber,
         partyType: parent.partyType,
         dealer: parent.dealer,
@@ -741,7 +741,7 @@ router.patch('/settlements/:id/reverse', canApprove, async (req, res) => {
     let settlement;
     const reason = requiredText(req.body.reason, 'reason');
     await session.withTransaction(async () => {
-      const current = await SchemeSettlement.findOne({ _id: req.params.id, branch: req.branchId }).session(session);
+      const current = await SchemeSettlement.findOne({ _id: req.params.id, branch: req.branchScope }).session(session);
       if (!current) throw routeError(404, 'Scheme settlement not found in the active branch.');
       if (current.status !== 'approved') throw routeError(409, `Only approved records can be reversed; this record is ${current.status}.`);
       if ([current.submittedBy, current.approvedBy].some(actor => String(actor) === String(req.user._id))) {
@@ -749,7 +749,7 @@ router.patch('/settlements/:id/reverse', canApprove, async (req, res) => {
       }
       if (current.adjustmentType === 'base') {
         const activeDependent = await SchemeSettlement.exists({
-          branch: req.branchId,
+          branch: req.branchScope,
           rootKey: current.rootKey,
           adjustmentType: { $ne: 'base' },
           status: { $in: ['submitted', 'approved'] },
@@ -762,7 +762,7 @@ router.patch('/settlements/:id/reverse', canApprove, async (req, res) => {
       const reversalPostingKey = `scheme-settlement:${current._id}:reversed`;
       await postSubledgerEntry({
         session,
-        branch: req.branchId,
+        branch: req.branchScope,
         partyType: current.partyType,
         partyId: current.partyType === 'dealer' ? current.dealer : current.supplier,
         postingKey: reversalPostingKey,
@@ -788,7 +788,7 @@ router.patch('/settlements/:id/reverse', canApprove, async (req, res) => {
         ].filter(Boolean).join(' | ');
       }
       settlement = await SchemeSettlement.findOneAndUpdate(
-        { _id: current._id, branch: req.branchId, status: 'approved' },
+        { _id: current._id, branch: req.branchScope, status: 'approved' },
         { $set: reversalState },
         { new: true, runValidators: true, session }
       );
@@ -801,7 +801,7 @@ router.patch('/settlements/:id/reverse', canApprove, async (req, res) => {
 
 router.get('/settlements/:id/supplier-credit-note/document', canView, async (req, res) => {
   try {
-    const settlement = await SchemeSettlement.findOne({ _id: req.params.id, branch: req.branchId })
+    const settlement = await SchemeSettlement.findOne({ _id: req.params.id, branch: req.branchScope })
       .select('partyType supplierCreditNote')
       .lean();
     if (!settlement) throw routeError(404, 'Scheme settlement not found in the active branch.');
@@ -836,7 +836,7 @@ router.post('/settlements/:id/supplier-credit-note', canSubmit, uploadSupplierCr
   try {
     if (!req.file) throw routeError(422, 'Supplier credit-note document is required.');
     const amount = nonnegative(req.body.amount, 'amount');
-    const current = await SchemeSettlement.findOne({ _id: req.params.id, branch: req.branchId });
+    const current = await SchemeSettlement.findOne({ _id: req.params.id, branch: req.branchScope });
     if (!current) throw routeError(404, 'Scheme settlement not found in the active branch.');
     if (current.partyType !== 'supplier' || current.status !== 'approved' || current.adjustmentType === 'clawback') {
       throw routeError(409, 'Supplier credit-note evidence applies only to approved supplier claims or supplemental claims.');
@@ -882,7 +882,7 @@ router.post('/settlements/:id/supplier-credit-note', canSubmit, uploadSupplierCr
 
 router.patch('/settlements/:id/supplier-credit-note/verify', canApprove, async (req, res) => {
   try {
-    const current = await SchemeSettlement.findOne({ _id: req.params.id, branch: req.branchId });
+    const current = await SchemeSettlement.findOne({ _id: req.params.id, branch: req.branchScope });
     if (!current) throw routeError(404, 'Scheme settlement not found in the active branch.');
     if (current.partyType !== 'supplier' || current.status !== 'approved') throw routeError(409, 'Only active approved supplier claims can verify credit-note evidence.');
     if (current.supplierCreditNote?.status !== 'pending_verification') throw routeError(409, 'No supplier credit note is awaiting verification.');

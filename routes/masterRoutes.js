@@ -83,7 +83,7 @@ const simpleCrud = (Model, permission, dependencyCheck) => {
         if (depError) return res.status(400).json({ success: false, message: depError });
       }
       const { safeDelete } = await import('../middleware/safeDelete.js');
-      const result = await safeDelete(Model, req.params.id, { user: req.user, req, branch: req.branchId, module: Model.modelName?.toLowerCase() || 'master', titleField: 'name', skipDependencyCheck: true });
+      const result = await safeDelete(Model, req.params.id, { user: req.user, req, branch: req.branchScope, module: Model.modelName?.toLowerCase() || 'master', titleField: 'name', skipDependencyCheck: true });
       res.status(result.status || 200).json(result);
     } catch (e) { res.status(500).json({ success: false, message: e.message }); }
   });
@@ -136,7 +136,7 @@ warehouseRouter.get('/', async (req, res) => {
     const { page = 1, limit = 50, search, status, region } = req.query;
     const p = Math.max(1, parseInt(page));
     const l = Math.min(200, parseInt(limit) || 50);
-    let filter = { branch: req.branchId };
+    let filter = { branch: req.branchScope };
     if (search) {
       const rx = new RegExp(search, 'i');
       filter.$or = [{ name: rx }, { city: rx }, { managerName: rx }, { warehouseCode: rx }];
@@ -155,9 +155,9 @@ warehouseRouter.get('/', async (req, res) => {
 warehouseRouter.post('/', async (req, res) => {
   try {
     const { branch, ...input } = req.body;
-    const data = { ...input, branch: req.branchId, createdBy: req.user._id };
+    const data = { ...input, branch: req.branchScope, createdBy: req.user._id };
     if (!data.warehouseCode) {
-      const count = await Warehouse.countDocuments({ branch: req.branchId });
+      const count = await Warehouse.countDocuments({ branch: req.branchScope });
       data.warehouseCode = `WH${String(count + 1).padStart(4, '0')}`;
     }
     const wh = await Warehouse.create(data);
@@ -172,7 +172,7 @@ warehouseRouter.put('/:id', async (req, res) => {
   try {
     const { branch, createdBy, ...updates } = req.body;
     const wh = await Warehouse.findOneAndUpdate(
-      { _id: req.params.id, branch: req.branchId },
+      { _id: req.params.id, branch: req.branchScope },
       updates,
       { new: true, runValidators: true }
     )
@@ -188,14 +188,14 @@ warehouseRouter.put('/:id', async (req, res) => {
 
 warehouseRouter.delete('/:id', async (req, res) => {
   try {
-    const warehouse = await Warehouse.findOne({ _id: req.params.id, branch: req.branchId }).lean();
+    const warehouse = await Warehouse.findOne({ _id: req.params.id, branch: req.branchScope }).lean();
     if (!warehouse) return res.status(404).json({ success: false, message: 'Warehouse not found.' });
     const { safeDelete } = await import('../middleware/safeDelete.js');
     const result = await safeDelete(Warehouse, req.params.id, {
       user: req.user,
       module: 'warehouse',
       titleField: 'name',
-      scope: { branch: req.branchId },
+      scope: { branch: req.branchScope },
     });
     res.status(result.status || 200).json(result);
   } catch (e) { res.status(500).json({ success: false, message: e.message }); }
@@ -255,7 +255,7 @@ routeRouter.put('/:id', async (req, res) => {
 routeRouter.delete('/:id', async (req, res) => {
   try {
     const { safeDelete } = await import('../middleware/safeDelete.js');
-    const result = await safeDelete(Route, req.params.id, { user: req.user, req, branch: req.branchId, module: 'route', titleField: 'name' });
+    const result = await safeDelete(Route, req.params.id, { user: req.user, req, branch: req.branchScope, module: 'route', titleField: 'name' });
     res.status(result.status || 200).json(result);
   } catch (e) { res.status(500).json({ success: false, message: e.message }); }
 });
@@ -366,6 +366,18 @@ dealerRouter.get('/', async (req, res) => {
     if (routeId) filter.assignedRoute = routeId;
     if (assignedSalesExecutive === 'unassigned') filter.assignedSalesExecutive = null;
     else if (assignedSalesExecutive) filter.assignedSalesExecutive = assignedSalesExecutive;
+
+    // Dealers carry no branch column — their branch is the branch of the sales
+    // executive who owns them. Restrict the list when one branch is active and
+    // leave it whole under All Branches. A dealer with no executive belongs to
+    // no branch, so it only appears under All Branches; assignment-health exists
+    // to find exactly those.
+    if (!req.allBranches && req.branchId && !assignedSalesExecutive) {
+      const executives = await User.find({ role: 'sales_executive', assignedBranches: req.branchId })
+        .select('_id')
+        .lean();
+      filter.assignedSalesExecutive = { $in: executives.map((user) => user._id) };
+    }
 
     // `?assignment=broken` — the dealers whose catalogue cannot work. Both causes
     // from assignmentHealth: nobody assigned, or assigned to somebody who is no
@@ -663,7 +675,7 @@ dealerRouter.delete('/:id', async (req, res) => {
     const result = await safeDelete(Dealer, req.params.id, {
       user: req.user,
       req,
-      branch: req.branchId,
+      branch: req.branchScope,
       module: 'dealer',
       titleField: 'businessName',
       codeField: 'dealerCode',
@@ -733,7 +745,7 @@ supplierRouter.put('/:id', async (req, res) => {
 supplierRouter.delete('/:id', async (req, res) => {
   try {
     const { safeDelete } = await import('../middleware/safeDelete.js');
-    const result = await safeDelete(Supplier, req.params.id, { user: req.user, req, branch: req.branchId, module: 'supplier', titleField: 'companyName', codeField: 'supplierCode' });
+    const result = await safeDelete(Supplier, req.params.id, { user: req.user, req, branch: req.branchScope, module: 'supplier', titleField: 'companyName', codeField: 'supplierCode' });
     res.status(result.status || 200).json(result);
   } catch (e) { res.status(500).json({ success: false, message: e.message }); }
 });
@@ -847,7 +859,7 @@ vehicleRouter.put('/:id', async (req, res) => {
 vehicleRouter.delete('/:id', async (req, res) => {
   try {
     const { safeDelete } = await import('../middleware/safeDelete.js');
-    const result = await safeDelete(Vehicle, req.params.id, { user: req.user, req, branch: req.branchId, module: 'vehicle', titleField: 'vehicleNumber' });
+    const result = await safeDelete(Vehicle, req.params.id, { user: req.user, req, branch: req.branchScope, module: 'vehicle', titleField: 'vehicleNumber' });
     res.status(result.status || 200).json(result);
   } catch (e) { res.status(500).json({ success: false, message: e.message }); }
 });

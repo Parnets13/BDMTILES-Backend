@@ -136,7 +136,15 @@ async function authoritativeOrderData(data, dealer, branchOutstanding, branchId,
 
 async function authorizedOrderBranches(req) {
   const requested = req.query.branch || req.query.branchId;
-  if (!requested) return [req.branchId];
+  if (!requested) {
+    // "All Branches" has no single req.branchId — returning [null] made the list
+    // filter on `{ branch: null }` and render zero orders. Widen to every branch
+    // the request may read instead.
+    if (req.allBranches && req.branchIds?.length) {
+      return req.branchIds.map((id) => new mongoose.Types.ObjectId(String(id)));
+    }
+    return [req.branchId];
+  }
   const assigned = getAssignedBranchIds(req.user);
   const globalAccess = hasGlobalBranchAccess(req.user);
   const canCrossBranch = globalAccess || (req.user.permissions || []).includes('*');
@@ -436,7 +444,7 @@ router.get('/search-products', requireAnyPermission('sales.order.create', 'quota
       .populate('brand', 'name').populate('category', 'name').populate('subcategory', 'name').lean();
     const productIds = products.map((product) => product._id);
     const stockData = await Stock.aggregate([
-      { $match: { branch: req.branchId, product: { $in: productIds } } },
+      { $match: { branch: req.branchScope, product: { $in: productIds } } },
       { $group: { _id: '$product', availableQty: { $sum: '$availableQty' } } },
     ]);
     const stockMap = new Map(stockData.map((row) => [String(row._id), row.availableQty]));
@@ -446,7 +454,7 @@ router.get('/search-products', requireAnyPermission('sales.order.create', 'quota
     const inferredScope = scope || (dealerId ? 'dealer' : dealerTypeId ? 'dealer_type' : 'walk_in');
     const data = await Promise.all(products.map(async (product) => {
       const pricing = await resolvePricing({
-        branchId: req.branchId, dealerId, dealerTypeId, scope: inferredScope, product,
+        branchId: req.branchScope, dealerId, dealerTypeId, scope: inferredScope, product,
         quantity, pricingDate: req.query.date || new Date(), orderAmount: req.query.orderAmount,
         orderType: legacyOrderType || (inferredScope === 'walk_in' ? 'retail' : 'dealer'),
       });
@@ -538,7 +546,7 @@ router.put('/:id', requirePermission('sales.order.create'), async (req, res) => 
   try {
     let order;
     await session.withTransaction(async () => {
-      order = await SalesOrder.findOne({ _id: req.params.id, branch: req.branchId, ...salesOrderActorScope(req) }).session(session);
+      order = await SalesOrder.findOne({ _id: req.params.id, branch: req.branchScope, ...salesOrderActorScope(req) }).session(session);
       if (!order) throw Object.assign(new Error('Order not found.'), { status: 404 });
       if (order.sourceQuotation) {
         const rejectedFields = Object.keys(req.body || {}).filter((key) => !CONVERTED_ORDER_OPERATIONAL_FIELDS.has(key));
@@ -595,7 +603,7 @@ router.put('/:id', requirePermission('sales.order.create'), async (req, res) => 
       if (order.tallySyncStatus === 'synced') order.tallySyncStatus = 'pending';
       await order.save({ session });
       await syncAutomaticApprovalRequest({
-        branchId: req.branchId,
+        branchId: req.branchScope,
         type: 'sales_order',
         referenceModel: 'SalesOrder',
         referenceId: order._id,
@@ -628,7 +636,7 @@ router.post('/:id/request-cancellation', requirePermission('sales.order.create')
     let approval;
     let order;
     await session.withTransaction(async () => {
-      order = await SalesOrder.findOne({ _id: req.params.id, branch: req.branchId, ...salesOrderActorScope(req) }).session(session);
+      order = await SalesOrder.findOne({ _id: req.params.id, branch: req.branchScope, ...salesOrderActorScope(req) }).session(session);
       if (!order) throw Object.assign(new Error('Order not found.'), { status: 404 });
       if (order.status === 'draft') throw Object.assign(new Error('Draft orders can be cancelled directly through the status endpoint.'), { status: 409 });
       if (order.status === 'partial_dispatch' || Number(order.items.reduce((sum, item) => sum + Number(item.dispatchedQuantity || 0), 0)) > 0) {
@@ -638,13 +646,13 @@ router.post('/:id/request-cancellation', requirePermission('sales.order.create')
         throw Object.assign(new Error(`Cancellation cannot be requested for a Sales Order in "${order.status}" status.`), { status: 409 });
       }
       if (order.cancellationRequestStatus === 'pending' && order.cancellationApprovalRequest) {
-        approval = await ApprovalRequest.findOne({ _id: order.cancellationApprovalRequest, branch: req.branchId }).session(session);
+        approval = await ApprovalRequest.findOne({ _id: order.cancellationApprovalRequest, branch: req.branchScope }).session(session);
         if (approval?.status === 'pending') return;
       }
       const requestNumber = await generateBranchNumber(req.branchId, 'approval', new Date());
       [approval] = await ApprovalRequest.create([{
         requestNumber,
-        branch: req.branchId,
+        branch: req.branchScope,
         type: 'sales_order_cancellation',
         title: `Cancel Sales Order ${order.orderNumber}`,
         description: reason,
@@ -678,7 +686,7 @@ router.patch('/:id/reservation/extend', requirePermission('sales.order.approve')
     return res.status(422).json({ success: false, message: 'reason, a future extendedTo, and expectedUpdatedAt are required.' });
   }
   try {
-    const order = await SalesOrder.findOne({ _id: req.params.id, branch: req.branchId, approvalStatus: 'pending', updatedAt: expectedUpdatedAt });
+    const order = await SalesOrder.findOne({ _id: req.params.id, branch: req.branchScope, approvalStatus: 'pending', updatedAt: expectedUpdatedAt });
     if (!order) return res.status(409).json({ success: false, message: 'Pending Sales Order changed; refresh before extending its reservation.' });
     if (!['reserved', 'partial'].includes(order.reservationStatus)) return res.status(409).json({ success: false, message: 'Only an active pending-approval reservation can be extended.' });
     const version = Number(order.reservationExpiryVersion || 0) + 1;
@@ -699,7 +707,7 @@ router.post('/:id/remaining-cancellation/request', requirePermission('sales.orde
   try {
     let order; let approval;
     await session.withTransaction(async () => {
-      order = await SalesOrder.findOne({ _id: req.params.id, branch: req.branchId, ...salesOrderActorScope(req) }).session(session);
+      order = await SalesOrder.findOne({ _id: req.params.id, branch: req.branchScope, ...salesOrderActorScope(req) }).session(session);
       if (!order) throw Object.assign(new Error('Sales Order not found.'), { status: 404 });
       if (!['partial_dispatch'].includes(order.status) || !order.items.some(line => Number(line.dispatchedQuantity || 0) > QUANTITY_TOLERANCE)) {
         throw Object.assign(new Error('Cancel Remaining is available only after a partial dispatch.'), { status: 409 });
@@ -713,7 +721,7 @@ router.post('/:id/remaining-cancellation/request', requirePermission('sales.orde
       }
       const requestNumber = await generateBranchNumber(req.branchId, 'approval', new Date());
       [approval] = await ApprovalRequest.create([{
-        requestNumber, branch: req.branchId, type: 'sales_order_remaining_cancellation', title: `Cancel remaining Sales Order ${order.orderNumber}`,
+        requestNumber, branch: req.branchScope, type: 'sales_order_remaining_cancellation', title: `Cancel remaining Sales Order ${order.orderNumber}`,
         description: reason, referenceModel: 'SalesOrder', referenceId: order._id, referenceNumber: order.orderNumber,
         reason, requestedBy: req.user._id, requestedByName: req.user.name || '', status: 'pending', priority: 'urgent',
       }], { session });
@@ -737,10 +745,10 @@ router.patch('/:id/remaining-cancellation/:action', requirePermission('sales.ord
   try {
     let result;
     await session.withTransaction(async () => {
-      const order = await SalesOrder.findOne({ _id: req.params.id, branch: req.branchId }).session(session).select('remainingCancellationApprovalRequest');
+      const order = await SalesOrder.findOne({ _id: req.params.id, branch: req.branchScope }).session(session).select('remainingCancellationApprovalRequest');
       if (!order) throw Object.assign(new Error('Sales Order not found.'), { status: 404 });
       result = await actionSalesOrderRemainingCancellation({
-        branchId: req.branchId,
+        branchId: req.branchScope,
         orderId: order._id,
         approvalRequestId: order.remainingCancellationApprovalRequest,
         actorId: req.user._id,
@@ -762,7 +770,7 @@ router.patch('/:id/status', requireSalesOrderStatusPermission, async (req, res) 
     let order;
     let alreadyUpdated = false;
     await session.withTransaction(async () => {
-      const current = await SalesOrder.findOne({ _id: req.params.id, branch: req.branchId, ...salesOrderActorScope(req) }).session(session);
+      const current = await SalesOrder.findOne({ _id: req.params.id, branch: req.branchScope, ...salesOrderActorScope(req) }).session(session);
       if (!current) throw Object.assign(new Error('Order not found.'), { status: 404 });
       if (current.status === status) { order = current; alreadyUpdated = true; return; }
       if (!USER_STATUS_TRANSITIONS[current.status]?.has(status)) {
@@ -782,14 +790,14 @@ router.patch('/:id/status', requireSalesOrderStatusPermission, async (req, res) 
       if (status === 'cancelled') setFields.cancellationReason = cancellationReason || '';
       if (current.tallySyncStatus === 'synced') setFields.tallySyncStatus = 'pending';
       order = await SalesOrder.findOneAndUpdate(
-        { _id: current._id, branch: req.branchId, status: oldStatus, ...salesOrderActorScope(req) },
+        { _id: current._id, branch: req.branchScope, status: oldStatus, ...salesOrderActorScope(req) },
         { $set: setFields, $push: { modificationLogs: { field: 'status', oldValue: oldStatus, newValue: status, changedBy: req.user._id, changedAt: new Date(), reason: status === 'cancelled' ? cancellationReason : undefined } } },
         { new: true, runValidators: true, session }
       );
       if (!order) throw Object.assign(new Error('Sales Order status changed before the update could be applied.'), { status: 409 });
       if (status === 'cancelled') {
         await syncAutomaticApprovalRequest({
-          branchId: req.branchId,
+          branchId: req.branchScope,
           type: 'sales_order',
           referenceModel: 'SalesOrder',
           referenceId: order._id,
@@ -799,7 +807,7 @@ router.patch('/:id/status', requireSalesOrderStatusPermission, async (req, res) 
       }
       if (status === 'confirmed' && order.dealer && order.grandTotal > 0) {
         await postSubledgerEntry({
-          session, branch: req.branchId, partyType: 'dealer', partyId: order.dealer,
+          session, branch: req.branchScope, partyType: 'dealer', partyId: order.dealer,
           amount: order.grandTotal, side: 'debit', postingKey: `sales-order:${order._id}:confirmed`,
           entryType: 'invoice', entryDate: order.orderDate,
           description: `Receivable for Sales Order ${order.orderNumber}`,
@@ -814,7 +822,7 @@ router.patch('/:id/status', requireSalesOrderStatusPermission, async (req, res) 
 
 router.delete('/:id', requirePermission('sales.order.create'), async (req, res) => {
   try {
-    const existing = await SalesOrder.findOne({ _id: req.params.id, branch: req.branchId, ...salesOrderActorScope(req) }).lean();
+    const existing = await SalesOrder.findOne({ _id: req.params.id, branch: req.branchScope, ...salesOrderActorScope(req) }).lean();
     if (!existing) return res.status(404).json({ success: false, message: 'Order not found.' });
     if (existing.status !== 'draft') return res.status(409).json({ success: false, message: 'Only draft Sales Orders can be deleted.' });
     if (existing.reservationStatus === 'reserved' || (existing.items || []).some(item => Number(item.reservedQuantity || 0) > 0.0001)) {
@@ -822,7 +830,7 @@ router.delete('/:id', requirePermission('sales.order.create'), async (req, res) 
     }
     const { safeDelete } = await import('../middleware/safeDelete.js');
     const result = await safeDelete(SalesOrder, req.params.id, {
-      user: req.user, module: 'sales_order', titleField: 'dealerName', codeField: 'orderNumber', scope: { branch: req.branchId, ...salesOrderActorScope(req) },
+      user: req.user, module: 'sales_order', titleField: 'dealerName', codeField: 'orderNumber', scope: { branch: req.branchScope, ...salesOrderActorScope(req) },
     });
     return res.status(result.status || 200).json(result);
   } catch (error) { return res.status(500).json({ success: false, message: error.message }); }
@@ -843,7 +851,7 @@ router.patch('/:id/assign-branch', requirePermission('sales.order.create'), asyn
     }
 
     const order = await SalesOrder.findOneAndUpdate(
-      { _id: req.params.id, branch: req.branchId },
+      { _id: req.params.id, branch: req.branchScope },
       { 
         $set: { assignedBranch: branchId },
         $push: {
@@ -888,7 +896,7 @@ router.patch('/:id/assign-transport', requirePermission('sales.order.create'), a
     }
 
     const order = await SalesOrder.findOneAndUpdate(
-      { _id: req.params.id, branch: req.branchId },
+      { _id: req.params.id, branch: req.branchScope },
       { 
         $set: { assignedVehicle: vehicleId },
         $push: {

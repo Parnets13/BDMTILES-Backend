@@ -131,7 +131,7 @@ router.get('/', requireAnyPermission('po.management', 'po.approve'), async (req,
   try {
     const page = Math.max(1, Number.parseInt(req.query.page, 10) || 1);
     const limit = Math.min(100, Math.max(1, Number.parseInt(req.query.limit, 10) || 20));
-    const filter = { branch: req.branchId };
+    const filter = { branch: req.branchScope };
     if (req.query.status) filter.status = req.query.status;
     if (req.query.purchaseRequisition) filter.purchaseRequisition = req.query.purchaseRequisition;
     const [data, total] = await Promise.all([
@@ -145,7 +145,7 @@ router.get('/', requireAnyPermission('po.management', 'po.approve'), async (req,
 
 router.get('/:id', requireAnyPermission('po.management', 'po.approve'), async (req, res) => {
   try {
-    const quotation = await SupplierQuotation.findOne({ _id: req.params.id, branch: req.branchId })
+    const quotation = await SupplierQuotation.findOne({ _id: req.params.id, branch: req.branchScope })
       .populate('purchaseRequisition', 'prNumber status items').populate('offers.supplier', 'companyName supplierCode performanceRating').lean();
     if (!quotation) throw purchaseError(404, 'Supplier quotation not found.');
     return res.json({ success: true, data: quotation });
@@ -154,7 +154,7 @@ router.get('/:id', requireAnyPermission('po.management', 'po.approve'), async (r
 
 router.post('/', requirePermission('po.management'), async (req, res) => {
   try {
-    const pr = await PurchaseRequisition.findOne({ _id: req.body.purchaseRequisition, branch: req.branchId, status: 'approved' });
+    const pr = await PurchaseRequisition.findOne({ _id: req.body.purchaseRequisition, branch: req.branchScope, status: 'approved' });
     if (!pr) throw purchaseError(404, 'Approved purchase requisition not found in the active branch.');
     const warehouse = req.body.warehouse || pr.warehouse;
     if (!warehouse) throw purchaseError(422, 'A receiving warehouse is required.');
@@ -162,7 +162,7 @@ router.post('/', requirePermission('po.management'), async (req, res) => {
     const offers = await normalizeOffers({ offers: req.body.offers, requisition: pr });
     const quotation = await SupplierQuotation.create({
       quotationNumber: await generateBranchNumber(req.branchId, 'supplierQuotation', new Date()),
-      branch: req.branchId,
+      branch: req.branchScope,
       purchaseRequisition: pr._id,
       prNumber: pr.prNumber,
       warehouse,
@@ -177,10 +177,10 @@ router.post('/', requirePermission('po.management'), async (req, res) => {
 
 router.put('/:id', requirePermission('po.management'), async (req, res) => {
   try {
-    const quotation = await SupplierQuotation.findOne({ _id: req.params.id, branch: req.branchId });
+    const quotation = await SupplierQuotation.findOne({ _id: req.params.id, branch: req.branchScope });
     if (!quotation) throw purchaseError(404, 'Supplier quotation not found.');
     if (quotation.status !== 'draft') throw purchaseError(409, 'Only a draft supplier quotation can be updated.');
-    const pr = await PurchaseRequisition.findOne({ _id: quotation.purchaseRequisition, branch: req.branchId, status: 'approved' });
+    const pr = await PurchaseRequisition.findOne({ _id: quotation.purchaseRequisition, branch: req.branchScope, status: 'approved' });
     if (!pr) throw purchaseError(409, 'The linked purchase requisition is no longer approved.');
     const warehouse = req.body.warehouse || quotation.warehouse;
     await assertWarehousesInBranch([warehouse], req.branchId);
@@ -194,7 +194,7 @@ router.put('/:id', requirePermission('po.management'), async (req, res) => {
 
 router.delete('/:id', requirePermission('po.management'), async (req, res) => {
   try {
-    const deleted = await SupplierQuotation.findOneAndDelete({ _id: req.params.id, branch: req.branchId, status: 'draft' });
+    const deleted = await SupplierQuotation.findOneAndDelete({ _id: req.params.id, branch: req.branchScope, status: 'draft' });
     if (!deleted) throw purchaseError(409, 'Only an existing draft supplier quotation can be deleted.');
     return res.json({ success: true, message: 'Supplier quotation deleted.' });
   } catch (error) { return sendError(res, error); }
@@ -202,13 +202,13 @@ router.delete('/:id', requirePermission('po.management'), async (req, res) => {
 
 router.patch('/:id/submit', requirePermission('po.management'), async (req, res) => {
   try {
-    const current = await SupplierQuotation.findOne({ _id: req.params.id, branch: req.branchId, status: 'draft' });
+    const current = await SupplierQuotation.findOne({ _id: req.params.id, branch: req.branchScope, status: 'draft' });
     if (!current) throw purchaseError(409, 'Only a draft supplier quotation can be submitted.');
-    const pr = await PurchaseRequisition.findOne({ _id: current.purchaseRequisition, branch: req.branchId, status: 'approved' });
+    const pr = await PurchaseRequisition.findOne({ _id: current.purchaseRequisition, branch: req.branchScope, status: 'approved' });
     if (!pr) throw purchaseError(409, 'The linked purchase requisition must remain approved before submission.');
     await normalizeOffers({ offers: current.offers.map(offer => offer.toObject()), requisition: pr });
     const quotation = await SupplierQuotation.findOneAndUpdate(
-      { _id: current._id, branch: req.branchId, status: 'draft' },
+      { _id: current._id, branch: req.branchScope, status: 'draft' },
       { $set: { status: 'submitted', submittedAt: new Date(), submittedBy: req.user._id, updatedBy: req.user._id } },
       { new: true, runValidators: true }
     );
@@ -219,9 +219,9 @@ router.patch('/:id/submit', requirePermission('po.management'), async (req, res)
 
 router.post('/:id/compare', requirePermission('po.management'), async (req, res) => {
   try {
-    const quotation = await SupplierQuotation.findOne({ _id: req.params.id, branch: req.branchId, status: { $in: ['submitted', 'compared'] } });
+    const quotation = await SupplierQuotation.findOne({ _id: req.params.id, branch: req.branchScope, status: { $in: ['submitted', 'compared'] } });
     if (!quotation) throw purchaseError(409, 'Only a submitted supplier quotation can be compared.');
-    const pr = await PurchaseRequisition.findOne({ _id: quotation.purchaseRequisition, branch: req.branchId, status: 'approved' });
+    const pr = await PurchaseRequisition.findOne({ _id: quotation.purchaseRequisition, branch: req.branchScope, status: 'approved' });
     if (!pr) throw purchaseError(409, 'The linked purchase requisition must remain approved before comparison.');
     await normalizeOffers({ offers: quotation.offers.map(offer => offer.toObject()), requisition: pr });
     const ranked = quotation.offers.map(offer => {
@@ -250,7 +250,7 @@ router.post('/:id/compare', requirePermission('po.management'), async (req, res)
 
 router.patch('/:id/select-final-supplier', requirePermission('po.approve'), async (req, res) => {
   try {
-    const quotation = await SupplierQuotation.findOne({ _id: req.params.id, branch: req.branchId, status: 'compared' });
+    const quotation = await SupplierQuotation.findOne({ _id: req.params.id, branch: req.branchScope, status: 'compared' });
     if (!quotation) throw purchaseError(409, 'Compare submitted offers before selecting a supplier.');
     const offer = quotation.offers.id(req.body.offerId);
     if (!offer) throw purchaseError(422, 'Selected offer does not belong to this comparison.');
@@ -271,10 +271,10 @@ router.post('/:id/convert-to-po', requirePermission('po.management'), async (req
   try {
     let result;
     await session.withTransaction(async () => {
-      const quotation = await SupplierQuotation.findOne({ _id: req.params.id, branch: req.branchId }).session(session);
+      const quotation = await SupplierQuotation.findOne({ _id: req.params.id, branch: req.branchScope }).session(session);
       if (!quotation) throw purchaseError(404, 'Supplier quotation not found.');
       if (quotation.linkedPO || quotation.status === 'po_created') {
-        const po = await mongoose.model('PurchaseOrder').findOne({ _id: quotation.linkedPO, branch: req.branchId }).session(session);
+        const po = await mongoose.model('PurchaseOrder').findOne({ _id: quotation.linkedPO, branch: req.branchScope }).session(session);
         if (!po) throw purchaseError(409, 'Supplier quotation is already converted.');
         result = { po, quotation, replayed: true };
         return;
@@ -297,13 +297,13 @@ router.post('/:id/convert-to-po', requirePermission('po.management'), async (req
       };
       const fingerprint = requestFingerprint(payload);
       const conversion = await convertRequisitionToPurchaseOrder({
-        branchId: req.branchId, requisitionId: quotation.purchaseRequisition, input: payload,
+        branchId: req.branchScope, requisitionId: quotation.purchaseRequisition, input: payload,
         actorId: req.user._id, sourceKey: `supplier-quotation:${quotation._id}`,
         requestFingerprint: fingerprint, sourceSupplierQuotation: quotation._id,
         sourceSupplierOffer: offer._id, session,
       });
       const updated = await SupplierQuotation.findOneAndUpdate(
-        { _id: quotation._id, branch: req.branchId, status: 'selected', linkedPO: { $exists: false } },
+        { _id: quotation._id, branch: req.branchScope, status: 'selected', linkedPO: { $exists: false } },
         { $set: { status: 'po_created', linkedPO: conversion.po._id, updatedBy: req.user._id } },
         { new: true, session }
       );

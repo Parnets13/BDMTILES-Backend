@@ -47,18 +47,18 @@ router.get('/dashboard', requirePermission('dashboard.view'), async (req, res) =
       pendingPayments, openComplaints,
       weeklySalesTrend,
     ] = await Promise.all([
-      SalesOrder.aggregate([{ $match: { branch: req.branchId, createdAt: { $gte: today }, status: { $nin: ['cancelled','draft'] } } }, { $group: { _id: null, total: { $sum: '$grandTotal' }, count: { $sum: 1 } } }]),
-      SalesOrder.aggregate([{ $match: { branch: req.branchId, createdAt: { $gte: monthStart }, status: { $nin: ['cancelled','draft'] } } }, { $group: { _id: null, total: { $sum: '$grandTotal' }, count: { $sum: 1 } } }]),
-      SalesOrder.aggregate([{ $match: { branch: req.branchId, createdAt: { $gte: prevMonthStart, $lte: prevMonthEnd }, status: { $nin: ['cancelled','draft'] } } }, { $group: { _id: null, total: { $sum: '$grandTotal' } } }]),
-      SalesOrder.countDocuments({ branch: req.branchId, status: { $in: ['confirmed','processing','approved'] } }),
-      Stock.aggregate([{ $match: { branch: req.branchId } }, { $group: { _id: null, totalQty: { $sum: '$availableQty' } } }]),
-      Stock.aggregate([{ $match: { branch: req.branchId } }, { $group: { _id: null, value: { $sum: { $multiply: ['$availableQty','$purchaseRate'] } } } }]),
-      SalesOrder.aggregate([{ $match: { branch: req.branchId, paymentStatus: { $in: ['pending','partial'] }, status: { $nin: ['cancelled','draft'] } } }, { $group: { _id: null, total: { $sum: '$balanceAmount' }, count: { $sum: 1 } } }]),
+      SalesOrder.aggregate([{ $match: { branch: req.branchScope, createdAt: { $gte: today }, status: { $nin: ['cancelled','draft'] } } }, { $group: { _id: null, total: { $sum: '$grandTotal' }, count: { $sum: 1 } } }]),
+      SalesOrder.aggregate([{ $match: { branch: req.branchScope, createdAt: { $gte: monthStart }, status: { $nin: ['cancelled','draft'] } } }, { $group: { _id: null, total: { $sum: '$grandTotal' }, count: { $sum: 1 } } }]),
+      SalesOrder.aggregate([{ $match: { branch: req.branchScope, createdAt: { $gte: prevMonthStart, $lte: prevMonthEnd }, status: { $nin: ['cancelled','draft'] } } }, { $group: { _id: null, total: { $sum: '$grandTotal' } } }]),
+      SalesOrder.countDocuments({ branch: req.branchScope, status: { $in: ['confirmed','processing','approved'] } }),
+      Stock.aggregate([{ $match: { branch: req.branchScope } }, { $group: { _id: null, totalQty: { $sum: '$availableQty' } } }]),
+      Stock.aggregate([{ $match: { branch: req.branchScope } }, { $group: { _id: null, value: { $sum: { $multiply: ['$availableQty','$purchaseRate'] } } } }]),
+      SalesOrder.aggregate([{ $match: { branch: req.branchScope, paymentStatus: { $in: ['pending','partial'] }, status: { $nin: ['cancelled','draft'] } } }, { $group: { _id: null, total: { $sum: '$balanceAmount' }, count: { $sum: 1 } } }]),
       // placeholder — complaints model optional
       Promise.resolve([{ count: 0 }]),
       // Daily sales for last 7 days
       SalesOrder.aggregate([
-        { $match: { branch: req.branchId, createdAt: { $gte: weekStart }, status: { $nin: ['cancelled','draft'] } } },
+        { $match: { branch: req.branchScope, createdAt: { $gte: weekStart }, status: { $nin: ['cancelled','draft'] } } },
         { $group: { _id: { $dateToString: { format: '%Y-%m-%d', date: '$createdAt' } }, total: { $sum: '$grandTotal' }, count: { $sum: 1 } } },
         { $sort: { _id: 1 } },
       ]),
@@ -90,7 +90,7 @@ router.get('/dashboard', requirePermission('dashboard.view'), async (req, res) =
 router.get('/sales', requirePermission('reports.sales'), async (req, res) => {
   try {
     const { dateFrom, dateTo, groupBy = 'day', dealer, category } = req.query;
-    const match = { branch: req.branchId, status: { $nin: ['cancelled','draft'] }, ...dateFilter(dateFrom, dateTo, 'orderDate') };
+    const match = { branch: req.branchScope, status: { $nin: ['cancelled','draft'] }, ...dateFilter(dateFrom, dateTo, 'orderDate') };
     if (dealer) match.dealer = dealer;
 
     const groupFormats = { day: '%Y-%m-%d', month: '%Y-%m', year: '%Y' };
@@ -121,7 +121,7 @@ router.get('/sales', requirePermission('reports.sales'), async (req, res) => {
         { $sort: { revenue: -1 } }, { $limit: 10 },
       ]),
       SalesReturn.aggregate([
-        { $match: { branch: req.branchId, status: { $nin: ['cancelled'] }, ...dateFilter(dateFrom, dateTo, 'returnDate') } },
+        { $match: { branch: req.branchScope, status: { $nin: ['cancelled'] }, ...dateFilter(dateFrom, dateTo, 'returnDate') } },
         { $group: { _id: null, total: { $sum: '$grandTotal' }, count: { $sum: 1 } } },
       ]),
     ]);
@@ -143,7 +143,7 @@ router.get('/sales', requirePermission('reports.sales'), async (req, res) => {
 router.get('/purchase', requirePermission('reports.purchase'), async (req, res) => {
   try {
     const { dateFrom, dateTo, supplier } = req.query;
-    const match = { branch: req.branchId, status: { $nin: ['cancelled'] }, ...dateFilter(dateFrom, dateTo, 'poDate') };
+    const match = { branch: req.branchScope, status: { $nin: ['cancelled'] }, ...dateFilter(dateFrom, dateTo, 'poDate') };
     if (supplier) match.supplier = supplier;
 
     const [byPeriod, bySupplier, summary] = await Promise.all([
@@ -176,7 +176,7 @@ router.get('/purchase', requirePermission('reports.purchase'), async (req, res) 
 router.get('/inventory', requirePermission('reports.inventory'), async (req, res) => {
   try {
     const { warehouse, lowStock = 10 } = req.query;
-    const match = { branch: req.branchId, ...(warehouse ? { warehouse } : {}) };
+    const match = { branch: req.branchScope, ...(warehouse ? { warehouse } : {}) };
 
     const [summary, byWarehouse, lowStockItems, stockAging] = await Promise.all([
       Stock.aggregate([
@@ -210,7 +210,7 @@ router.get('/inventory', requirePermission('reports.inventory'), async (req, res
 router.get('/gst', requirePermission('reports.sales'), async (req, res) => {
   try {
     const { dateFrom, dateTo } = req.query;
-    const match = { branch: req.branchId, status: { $nin: ['cancelled','draft'] }, ...dateFilter(dateFrom, dateTo, 'orderDate') };
+    const match = { branch: req.branchScope, status: { $nin: ['cancelled','draft'] }, ...dateFilter(dateFrom, dateTo, 'orderDate') };
 
     const [gstrData, gstByRate] = await Promise.all([
       SalesOrder.aggregate([
@@ -256,7 +256,7 @@ router.get('/gst', requirePermission('reports.sales'), async (req, res) => {
 router.get('/aging', requirePermission('reports.sales'), async (req, res) => {
   try {
     const ledgerBalances = await DealerLedger.aggregate([
-      { $match: { branch: req.branchId } },
+      { $match: { branch: req.branchScope } },
       {
         $group: {
           _id: '$dealer',
@@ -299,7 +299,7 @@ router.get('/aging', requirePermission('reports.sales'), async (req, res) => {
 router.get('/profit', requirePermission('reports.sales'), async (req, res) => {
   try {
     const { dateFrom, dateTo } = req.query;
-    const match = { branch: req.branchId, status: { $nin: ['cancelled','draft'] }, ...dateFilter(dateFrom, dateTo, 'orderDate') };
+    const match = { branch: req.branchScope, status: { $nin: ['cancelled','draft'] }, ...dateFilter(dateFrom, dateTo, 'orderDate') };
 
     // Bill-wise profit: revenue - (qty * purchase rate from stock)
     const salesData = await SalesOrder.aggregate([
@@ -377,7 +377,7 @@ router.get('/profit', requirePermission('reports.sales'), async (req, res) => {
 router.get('/deviation', requirePermission('reports.profit'), async (req, res) => {
   try {
     const { dateFrom, dateTo } = req.query;
-    const match = { branch: req.branchId, status: { $nin: ['cancelled', 'draft'] }, ...dateFilter(dateFrom, dateTo, 'orderDate') };
+    const match = { branch: req.branchScope, status: { $nin: ['cancelled', 'draft'] }, ...dateFilter(dateFrom, dateTo, 'orderDate') };
 
     // A business-wide target gross margin. Kept as a named constant so the expectation is
     // auditable rather than a number buried in a formula.
@@ -520,7 +520,7 @@ router.get('/hr', requirePermission('reports.sales'), async (req, res) => {
 router.get('/dealer-performance', requirePermission('reports.sales'), async (req, res) => {
   try {
     const { dateFrom, dateTo } = req.query;
-    const match = { branch: req.branchId, status: { $nin: ['cancelled','draft'] }, ...dateFilter(dateFrom, dateTo, 'orderDate') };
+    const match = { branch: req.branchScope, status: { $nin: ['cancelled','draft'] }, ...dateFilter(dateFrom, dateTo, 'orderDate') };
 
     const dealerData = await SalesOrder.aggregate([
       { $match: match },
@@ -565,8 +565,8 @@ router.get('/dealer-performance', requirePermission('reports.sales'), async (req
 router.get('/finance-summary', requirePermission('reports.sales'), async (req, res) => {
   try {
     const { dateFrom, dateTo } = req.query;
-    const salesMatch = { branch: req.branchId, status: { $nin: ['cancelled','draft'] }, ...dateFilter(dateFrom, dateTo, 'orderDate') };
-    const purchaseMatch = { branch: req.branchId, status: { $nin: ['cancelled'] }, ...dateFilter(dateFrom, dateTo, 'poDate') };
+    const salesMatch = { branch: req.branchScope, status: { $nin: ['cancelled','draft'] }, ...dateFilter(dateFrom, dateTo, 'orderDate') };
+    const purchaseMatch = { branch: req.branchScope, status: { $nin: ['cancelled'] }, ...dateFilter(dateFrom, dateTo, 'poDate') };
 
     // Cumulative up to the end of the requested window, or everything if no window given.
     // Local end-of-day, matching dateFilter above — mixing local and UTC bounds here would
@@ -583,17 +583,17 @@ router.get('/finance-summary', requirePermission('reports.sales'), async (req, r
     ] = await Promise.all([
       SalesOrder.aggregate([{ $match: salesMatch }, { $group: { _id: null, total: { $sum: '$grandTotal' }, tax: { $sum: '$totalTax' } } }]),
       PurchaseOrder.aggregate([{ $match: purchaseMatch }, { $group: { _id: null, total: { $sum: '$grandTotal' }, tax: { $sum: '$totalTax' } } }]),
-      Payment.aggregate([{ $match: { branch: req.branchId, paymentType: 'dealer_receipt', status: 'confirmed', ...dateFilter(dateFrom, dateTo, 'paymentDate') } }, { $group: { _id: null, total: { $sum: '$amount' } } }]),
-      Payment.aggregate([{ $match: { branch: req.branchId, paymentType: 'supplier_payment', status: 'confirmed', ...dateFilter(dateFrom, dateTo, 'paymentDate') } }, { $group: { _id: null, total: { $sum: '$amount' } } }]),
-      Stock.aggregate([{ $match: { branch: req.branchId } }, { $group: { _id: null, value: { $sum: { $multiply: ['$availableQty','$purchaseRate'] } } } }]),
+      Payment.aggregate([{ $match: { branch: req.branchScope, paymentType: 'dealer_receipt', status: 'confirmed', ...dateFilter(dateFrom, dateTo, 'paymentDate') } }, { $group: { _id: null, total: { $sum: '$amount' } } }]),
+      Payment.aggregate([{ $match: { branch: req.branchScope, paymentType: 'supplier_payment', status: 'confirmed', ...dateFilter(dateFrom, dateTo, 'paymentDate') } }, { $group: { _id: null, total: { $sum: '$amount' } } }]),
+      Stock.aggregate([{ $match: { branch: req.branchScope } }, { $group: { _id: null, value: { $sum: { $multiply: ['$availableQty','$purchaseRate'] } } } }]),
       // What dealers owe us. A dealer is debited when they buy and credited when they pay,
       // so the balance is debit − credit.
-      DealerLedger.aggregate([{ $match: { branch: req.branchId, ...ledgerAsOf } }, { $group: { _id: null, debit: { $sum: '$debit' }, credit: { $sum: '$credit' } } }]),
+      DealerLedger.aggregate([{ $match: { branch: req.branchScope, ...ledgerAsOf } }, { $group: { _id: null, debit: { $sum: '$debit' }, credit: { $sum: '$credit' } } }]),
       // What we owe suppliers — the opposite sign: credited when invoiced, debited when paid.
-      SupplierLedger.aggregate([{ $match: { branch: req.branchId, ...ledgerAsOf } }, { $group: { _id: null, debit: { $sum: '$debit' }, credit: { $sum: '$credit' } } }]),
+      SupplierLedger.aggregate([{ $match: { branch: req.branchScope, ...ledgerAsOf } }, { $group: { _id: null, debit: { $sum: '$debit' }, credit: { $sum: '$credit' } } }]),
       // Only settled claims count as cost. Pending and rejected ones are not yet a cost.
       Expense.aggregate([
-        { $match: { branch: req.branchId, status: { $in: ['approved', 'reimbursed'] }, ...dateFilter(dateFrom, dateTo, 'expenseDate') } },
+        { $match: { branch: req.branchScope, status: { $in: ['approved', 'reimbursed'] }, ...dateFilter(dateFrom, dateTo, 'expenseDate') } },
         { $group: { _id: null, total: { $sum: '$amount' } } },
       ]),
       // Trial balance, from the double-entry vouchers. Only POSTED vouchers — drafts are
@@ -682,7 +682,7 @@ router.get('/finance-summary', requirePermission('reports.sales'), async (req, r
 router.get('/profitability', requirePermission('reports.sales'), async (req, res) => {
   try {
     const { dateFrom, dateTo } = req.query;
-    const match = { branch: req.branchId, status: { $nin: ['cancelled', 'draft'] }, ...dateFilter(dateFrom, dateTo, 'orderDate') };
+    const match = { branch: req.branchScope, status: { $nin: ['cancelled', 'draft'] }, ...dateFilter(dateFrom, dateTo, 'orderDate') };
 
     const [productProfit, categoryProfit, dealerProfit, overallSummary] = await Promise.all([
       // Product-wise profit (sales amount - estimated purchase cost)
@@ -762,7 +762,7 @@ router.get('/profitability', requirePermission('reports.sales'), async (req, res
 router.get('/se-performance', requirePermission('reports.sales'), async (req, res) => {
   try {
     const { dateFrom, dateTo } = req.query;
-    const match = { branch: req.branchId, status: { $nin: ['cancelled', 'draft'] }, ...dateFilter(dateFrom, dateTo, 'orderDate') };
+    const match = { branch: req.branchScope, status: { $nin: ['cancelled', 'draft'] }, ...dateFilter(dateFrom, dateTo, 'orderDate') };
 
     const sePerformance = await SalesOrder.aggregate([
       { $match: { ...match, salesExecutive: { $exists: true, $ne: null } } },
@@ -791,7 +791,7 @@ router.get('/se-performance', requirePermission('reports.sales'), async (req, re
 router.get('/supplier-performance', requirePermission('reports.purchase'), async (req, res) => {
   try {
     const { dateFrom, dateTo } = req.query;
-    const branch = req.branchId;
+    const branch = req.branchScope;
 
     const [poRows, grnRows, ledgerRows] = await Promise.all([
       PurchaseOrder.aggregate([
@@ -930,7 +930,7 @@ router.get('/branch-performance', requirePermission('reports.sales'), async (req
 // ═══════════════════════════════════════════════════════
 router.get('/warehouse-performance', requirePermission('reports.inventory'), async (req, res) => {
   try {
-    const branch = req.branchId;
+    const branch = req.branchScope;
     const valuationRate = { $cond: [{ $gt: ['$landingCost', 0] }, '$landingCost', '$purchaseRate'] };
 
     const [stockRows, grnRows] = await Promise.all([
@@ -987,7 +987,7 @@ router.get('/collection-report', requirePermission('reports.finance'), async (re
   try {
     const { dateFrom, dateTo } = req.query;
     const match = {
-      branch: req.branchId,
+      branch: req.branchScope,
       status: 'confirmed',
       paymentType: 'dealer_receipt',
       ...dateFilter(dateFrom, dateTo, 'paymentDate'),
@@ -1040,7 +1040,7 @@ router.get('/collection-report', requirePermission('reports.finance'), async (re
 router.get('/expense-report', requireAnyPermission('reports.finance', 'expense.management'), async (req, res) => {
   try {
     const { dateFrom, dateTo, status, category } = req.query;
-    const match = { branch: req.branchId, ...dateFilter(dateFrom, dateTo, 'expenseDate') };
+    const match = { branch: req.branchScope, ...dateFilter(dateFrom, dateTo, 'expenseDate') };
     if (status) match.status = status;
     if (category) match.category = category;
 
@@ -1104,7 +1104,7 @@ router.get('/expense-report', requireAnyPermission('reports.finance', 'expense.m
 // ═══════════════════════════════════════════════════════
 router.get('/outstanding-report', requirePermission('reports.finance'), async (req, res) => {
   try {
-    const branch = req.branchId;
+    const branch = req.branchScope;
     const today = new Date();
     today.setHours(0, 0, 0, 0);
 

@@ -693,23 +693,23 @@ const buildProfitability = async (scopeMatch, range) => {
 };
 
 export const getDashboardReport = async (req, res) => {
-  const requestedScope = req.query.scope || 'branch';
+  const requestedScope = req.query.scope || (req.allBranches ? 'all' : 'branch');
   if (!['branch', 'all'].includes(requestedScope)) {
     return res.status(400).json({ success: false, message: 'scope must be branch or all.' });
   }
-  if (requestedScope === 'all' && !req.hasGlobalBranchAccess) {
+  if (requestedScope === 'all' && !req.hasGlobalBranchAccess && !req.allBranches) {
     return res.status(403).json({ success: false, message: 'All-branch dashboard access is limited to owners and super administrators.' });
   }
 
   const branchIds = requestedScope === 'all'
     ? (req.user.assignedBranches || []).map((branch) => branch?._id || branch).filter(Boolean)
-    : [req.branchId];
+    : [req.branchId || req.branchScope];
   if (!branchIds.length) {
     return res.status(428).json({ success: false, code: 'BRANCH_REQUIRED', message: 'No active branches are available for this dashboard scope.' });
   }
 
-  const scopeMatch = requestedScope === 'all' ? { branch: { $in: branchIds } } : { branch: req.branchId };
-  const employeeScopeMatch = requestedScope === 'all' ? { branchId: { $in: branchIds } } : { branchId: req.branchId };
+  const scopeMatch = requestedScope === 'all' ? { branch: { $in: branchIds } } : { branch: req.branchScope };
+  const employeeScopeMatch = requestedScope === 'all' ? { branchId: { $in: branchIds } } : { branchId: req.branchScope };
   const periods = getPeriods();
 
   let profitRange;

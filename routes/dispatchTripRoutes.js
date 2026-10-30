@@ -44,7 +44,7 @@ router.get('/', async (req, res) => {
     const { page = 1, limit = 20, search, status } = req.query;
     const p = Math.max(1, parseInt(page));
     const l = Math.min(100, parseInt(limit) || 20);
-    const filter = { branch: req.branchId };
+    const filter = { branch: req.branchScope };
     if (search) {
       const regex = new RegExp(search, 'i');
       filter.$or = [{ tripNumber: regex }, { vehicleNumber: regex }, { driverName: regex }, { routeName: regex }];
@@ -68,7 +68,7 @@ router.get('/', async (req, res) => {
 
 router.get('/stats', async (req, res) => {
   try {
-    const scope = { branch: req.branchId };
+    const scope = { branch: req.branchScope };
     const [total, planning, loading, loaded, dispatched, inTransit, completed, cancelled] = await Promise.all([
       DispatchTrip.countDocuments(scope),
       DispatchTrip.countDocuments({ ...scope, status: 'planning' }),
@@ -88,7 +88,7 @@ router.get('/ready-orders', async (req, res) => {
     const page = Math.max(1, parseInt(req.query.page) || 1);
     const limit = Math.min(50, Math.max(1, parseInt(req.query.limit) || 20));
     const filter = {
-      branch: req.branchId,
+      branch: req.branchScope,
       status: 'ready_for_dispatch',
       stockConsumedAt: null,
       dispatchTrip: null,
@@ -132,7 +132,7 @@ router.post('/', async (req, res) => {
       ? { _id: { $in: requestedPickListIds } }
       : { pickListNumber: { $in: requestedPickListNumbers } };
     const expectedPickListCount = requestedPickListIds.length || requestedPickListNumbers.length;
-    const pickLists = await PickList.find({ branch: req.branchId, ...pickListSelector, status: 'ready_for_dispatch', stockConsumedAt: null, dispatchTrip: null, cancellationProcessing: { $ne: true } })
+    const pickLists = await PickList.find({ branch: req.branchScope, ...pickListSelector, status: 'ready_for_dispatch', stockConsumedAt: null, dispatchTrip: null, cancellationProcessing: { $ne: true } })
       .populate('salesOrder', 'orderNumber dealer dealerName dealerCode customerName customerPhone deliveryAddress status')
       .lean();
     if (pickLists.length !== expectedPickListCount || pickLists.some(item => !item.salesOrder)) {
@@ -190,14 +190,14 @@ router.post('/', async (req, res) => {
       vehicleNumber: req.body.vehicleNumber,
       totalBoxes: tripBoxes,
       totalWeight: tripWeight,
-      branchId: req.branchId,
+      branchId: req.branchScope,
     });
 
     tripId = new mongoose.Types.ObjectId();
     const tripNumber = await generateBranchNumber(req.branchId, 'dispatchTrip', new Date());
     for (const pickList of pickLists) {
       const claim = await PickList.updateOne(
-        { _id: pickList._id, branch: req.branchId, status: 'ready_for_dispatch', stockConsumedAt: null, dispatchTrip: null, cancellationProcessing: { $ne: true } },
+        { _id: pickList._id, branch: req.branchScope, status: 'ready_for_dispatch', stockConsumedAt: null, dispatchTrip: null, cancellationProcessing: { $ne: true } },
         { $set: { dispatchTrip: tripId, dispatchTripNumber: tripNumber, tripClaimedAt: new Date() } }
       );
       if (claim.modifiedCount !== 1) {
@@ -211,7 +211,7 @@ router.post('/', async (req, res) => {
     const trip = await DispatchTrip.create({
       _id: tripId,
       tripNumber,
-      branch: req.branchId,
+      branch: req.branchScope,
       // Vehicle fields come from the master record, not the request body, so the
       // trip can never disagree with Vehicle Master.
       ...vehicleSnapshot(assignedVehicle),
@@ -240,7 +240,7 @@ router.post('/', async (req, res) => {
   } catch (e) {
     if (tripId && claimedPickListIds.length) {
       await PickList.updateMany(
-        { _id: { $in: claimedPickListIds }, branch: req.branchId, dispatchTrip: tripId, stockConsumedAt: null },
+        { _id: { $in: claimedPickListIds }, branch: req.branchScope, dispatchTrip: tripId, stockConsumedAt: null },
         { $unset: { dispatchTrip: 1, tripClaimedAt: 1 }, $set: { dispatchTripNumber: '' } }
       );
     }
@@ -251,7 +251,7 @@ router.post('/', async (req, res) => {
 
 router.get('/:id', async (req, res) => {
   try {
-    const trip = await DispatchTrip.findOne({ _id: req.params.id, branch: req.branchId })
+    const trip = await DispatchTrip.findOne({ _id: req.params.id, branch: req.branchScope })
       .populate('vehicle', 'vehicleNumber vehicleType capacity')
       .populate('deliveryExecutive', 'name phone')
       .populate('loadingSupervisor', 'name phone')
@@ -292,13 +292,13 @@ router.get('/:id', async (req, res) => {
 
 router.patch('/:id/start-loading', async (req, res) => {
   try {
-    const current = await DispatchTrip.findOne({ _id: req.params.id, branch: req.branchId });
+    const current = await DispatchTrip.findOne({ _id: req.params.id, branch: req.branchScope });
     if (!current) return res.status(404).json({ success: false, message: 'Trip not found.' });
     if (current.status === 'loading') return res.json({ success: true, message: 'Loading already started.', data: current });
     if (current.status !== 'planning') return stateConflict(res, current, 'planning', 'start loading');
 
     const trip = await DispatchTrip.findOneAndUpdate(
-      { _id: current._id, branch: req.branchId, status: 'planning' },
+      { _id: current._id, branch: req.branchScope, status: 'planning' },
       { $set: { status: 'loading', loadingStartTime: new Date() } },
       { new: true, runValidators: true }
     );
@@ -309,7 +309,7 @@ router.patch('/:id/start-loading', async (req, res) => {
 
 router.patch('/:id/verify-loading', async (req, res) => {
   try {
-    const trip = await DispatchTrip.findOne({ _id: req.params.id, branch: req.branchId });
+    const trip = await DispatchTrip.findOne({ _id: req.params.id, branch: req.branchScope });
     if (!trip) return res.status(404).json({ success: false, message: 'Trip not found.' });
     if (trip.status === 'loaded') return res.json({ success: true, message: 'Loading already verified.', data: trip });
     if (trip.status !== 'loading') return stateConflict(res, trip, 'loading', 'verify loading');
@@ -346,7 +346,7 @@ router.patch('/:id/verify-loading', async (req, res) => {
 
 router.patch('/:id/verify-dispatch', requirePermission('dispatch.verify'), async (req, res) => {
   try {
-    const current = await DispatchTrip.findOne({ _id: req.params.id, branch: req.branchId });
+    const current = await DispatchTrip.findOne({ _id: req.params.id, branch: req.branchScope });
     if (!current) return res.status(404).json({ success: false, message: 'Trip not found.' });
     if (current.finalDispatchVerification?.completed) {
       return res.json({ success: true, message: 'Final dispatch verification already completed.', data: current });
@@ -379,7 +379,7 @@ router.patch('/:id/verify-dispatch', requirePermission('dispatch.verify'), async
       completed: true,
     };
     const trip = await DispatchTrip.findOneAndUpdate(
-      { _id: current._id, branch: req.branchId, status: 'loaded', loadingVerified: true, 'finalDispatchVerification.completed': { $ne: true }, stockDeductedAt: null },
+      { _id: current._id, branch: req.branchScope, status: 'loaded', loadingVerified: true, 'finalDispatchVerification.completed': { $ne: true }, stockDeductedAt: null },
       { $set: { finalDispatchVerification: verification } },
       { new: true, runValidators: true }
     );
@@ -394,7 +394,7 @@ router.patch('/:id/dispatch', async (req, res) => {
   try {
     await session.withTransaction(async () => {
       response = null;
-      const current = await DispatchTrip.findOne({ _id: req.params.id, branch: req.branchId }).session(session);
+      const current = await DispatchTrip.findOne({ _id: req.params.id, branch: req.branchScope }).session(session);
       if (!current) {
         response = { status: 404, body: { success: false, message: 'Trip not found.' } };
         return;
@@ -420,12 +420,12 @@ router.patch('/:id/dispatch', async (req, res) => {
       const { vehicle: dispatchVehicle } = await resolveVehicleForAssignment({
         vehicleId: current.vehicle,
         excludeTripId: current._id,
-        branchId: req.branchId,
+        branchId: req.branchScope,
         session,
       });
 
       const lockedTrip = await DispatchTrip.findOneAndUpdate(
-        { _id: current._id, branch: req.branchId, status: 'loaded', loadingVerified: true, 'finalDispatchVerification.completed': true, dispatchProcessing: { $ne: true }, stockDeductedAt: null },
+        { _id: current._id, branch: req.branchScope, status: 'loaded', loadingVerified: true, 'finalDispatchVerification.completed': true, dispatchProcessing: { $ne: true }, stockDeductedAt: null },
         { $set: { dispatchProcessing: true } },
         { new: true, session }
       );
@@ -444,7 +444,7 @@ router.patch('/:id/dispatch', async (req, res) => {
         const pickListIds = lockedTrip.orders.map(o => o.pickList).filter(Boolean);
         const plWithDE = await PickList.findOne({
           _id: { $in: pickListIds },
-          branch: req.branchId,
+          branch: req.branchScope,
           deliveryExecutive: { $exists: true, $ne: null },
         })
           .select('deliveryExecutive')
@@ -462,7 +462,7 @@ router.patch('/:id/dispatch', async (req, res) => {
       for (const order of lockedTrip.orders) {
         if (order.pickList) continue;
         const legacyPickList = await PickList.findOne({
-          branch: req.branchId,
+          branch: req.branchScope,
           status: 'ready_for_dispatch',
           stockConsumedAt: null,
           $and: [
@@ -475,7 +475,7 @@ router.patch('/:id/dispatch', async (req, res) => {
       }
 
       const pickListIds = lockedTrip.orders.map(order => order.pickList).filter(Boolean);
-      const pickLists = await PickList.find({ _id: { $in: pickListIds }, branch: req.branchId })
+      const pickLists = await PickList.find({ _id: { $in: pickListIds }, branch: req.branchScope })
         .session(session)
         .populate('salesOrder', 'orderNumber dealer dealerName dealerCode customerName customerPhone deliveryAddress status')
         .lean();
@@ -487,7 +487,7 @@ router.patch('/:id/dispatch', async (req, res) => {
         const claim = await PickList.updateOne(
           {
             _id: pickList._id,
-            branch: req.branchId,
+            branch: req.branchScope,
             status: 'ready_for_dispatch',
             stockConsumedAt: null,
             stockConsumptionProcessing: { $ne: true },
@@ -526,7 +526,7 @@ router.patch('/:id/dispatch', async (req, res) => {
           const existing = requirements.get(key);
           if (existing) existing.quantity += quantity;
           else requirements.set(key, {
-            branch: req.branchId,
+            branch: req.branchScope,
             product: item.product,
             warehouse: item.warehouse,
             shade: item.shade || '',
@@ -549,7 +549,7 @@ router.patch('/:id/dispatch', async (req, res) => {
             operationKey: stockOperationKey('dispatch-trip', lockedTrip._id, pickList._id, item._id, 'consume'),
             correlationKey: stockOperationKey('dispatch-trip', lockedTrip._id),
             movementType: 'sales_dispatch', phase: 'dispatched',
-            branch: req.branchId, product: item.product, warehouse: item.warehouse, shade: item.shade || '', batch: item.batch || '',
+            branch: req.branchScope, product: item.product, warehouse: item.warehouse, shade: item.shade || '', batch: item.batch || '',
             deltas: { reservedQty: -baseQuantity, totalQty: -baseQuantity },
             stockSet: { lastSaleDate: stockConsumedAt },
             enteredQuantity: quantity, ...snapshot, baseQuantity,
@@ -565,7 +565,7 @@ router.patch('/:id/dispatch', async (req, res) => {
       const dispatchedAt = stockConsumedAt;
       for (const order of lockedTrip.orders) {
         const pickList = pickListById.get(String(order.pickList));
-        const salesOrder = await SalesOrder.findOne({ _id: pickList.salesOrder._id, branch: req.branchId }).session(session);
+        const salesOrder = await SalesOrder.findOne({ _id: pickList.salesOrder._id, branch: req.branchScope }).session(session);
         if (!salesOrder) throw new Error(`Sales Order ${order.orderNumber} is unavailable.`);
         const lifecycleManaged = salesOrder.reservationStatus !== 'none'
           || salesOrder.items.some(item => Number(item.reservedQuantity || 0) > QUANTITY_TOLERANCE);
@@ -604,18 +604,18 @@ router.patch('/:id/dispatch', async (req, res) => {
 
         const unfulfilledQty = pickList.items.reduce((sum, item) => sum + Number(item.shortQty || 0) + Number(item.damagedQty || 0), 0);
         const consumed = await PickList.updateOne(
-          { _id: pickList._id, branch: req.branchId, dispatchTrip: lockedTrip._id, stockConsumedAt: null, stockConsumptionProcessing: true },
+          { _id: pickList._id, branch: req.branchScope, dispatchTrip: lockedTrip._id, stockConsumedAt: null, stockConsumptionProcessing: true },
           { $set: { items: pickList.items, stockConsumedAt: dispatchedAt, stockReserved: false, stockConsumptionProcessing: false, reservationState: 'consumed' } },
           { session }
         );
         if (consumed.modifiedCount !== 1) throw new Error(`${pickList.pickListNumber} stock-consumption claim was lost.`);
 
-        let delivery = await Delivery.findOne({ branch: req.branchId, dispatchTrip: lockedTrip._id, salesOrder: salesOrder._id }).session(session);
+        let delivery = await Delivery.findOne({ branch: req.branchScope, dispatchTrip: lockedTrip._id, salesOrder: salesOrder._id }).session(session);
         if (!delivery) {
           const deliveryNumber = await generateBranchNumber(req.branchId, 'delivery', new Date());
           [delivery] = await Delivery.create([{
             deliveryNumber,
-            branch: req.branchId,
+            branch: req.branchScope,
             salesOrder: salesOrder._id,
             orderNumber: order.orderNumber,
             dispatchTrip: lockedTrip._id,
@@ -670,7 +670,7 @@ router.patch('/:id/dispatch', async (req, res) => {
 
 router.patch('/:id/complete', async (req, res) => {
   try {
-    const trip = await DispatchTrip.findOne({ _id: req.params.id, branch: req.branchId });
+    const trip = await DispatchTrip.findOne({ _id: req.params.id, branch: req.branchScope });
     if (!trip) return res.status(404).json({ success: false, message: 'Trip not found.' });
     if (trip.status === 'completed') return res.json({ success: true, message: 'Trip already completed.', data: trip });
     if (!['dispatched', 'in_transit'].includes(trip.status)) return stateConflict(res, trip, 'dispatched/in_transit', 'complete trip');
@@ -686,13 +686,13 @@ router.patch('/:id/complete', async (req, res) => {
 
 router.patch('/:id/cancel', async (req, res) => {
   try {
-    const trip = await DispatchTrip.findOne({ _id: req.params.id, branch: req.branchId });
+    const trip = await DispatchTrip.findOne({ _id: req.params.id, branch: req.branchScope });
     if (!trip) return res.status(404).json({ success: false, message: 'Trip not found.' });
     const releaseTripClaims = async () => {
       const pickListIds = trip.orders.map(order => order.pickList).filter(Boolean);
       if (pickListIds.length) {
         await PickList.updateMany(
-          { _id: { $in: pickListIds }, branch: req.branchId, dispatchTrip: trip._id, stockConsumedAt: null },
+          { _id: { $in: pickListIds }, branch: req.branchScope, dispatchTrip: trip._id, stockConsumedAt: null },
           { $unset: { dispatchTrip: 1, tripClaimedAt: 1 }, $set: { dispatchTripNumber: '', stockConsumptionProcessing: false } }
         );
       }

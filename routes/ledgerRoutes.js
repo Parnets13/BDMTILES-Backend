@@ -22,7 +22,7 @@ router.get('/dealer/:dealerId', requirePermission('dealer.ledger'), async (req, 
     const { dateFrom, dateTo, page = 1, limit = 50 } = req.query;
     const p = Math.max(1, parseInt(page));
     const l = Math.min(200, parseInt(limit) || 50);
-    let filter = { branch: req.branchId, dealer: req.params.dealerId };
+    let filter = { branch: req.branchScope, dealer: req.params.dealerId };
     if (dateFrom || dateTo) {
       filter.entryDate = {};
       if (dateFrom) filter.entryDate.$gte = new Date(dateFrom);
@@ -36,7 +36,7 @@ router.get('/dealer/:dealerId', requirePermission('dealer.ledger'), async (req, 
 
     // Outstanding summary
     const summary = await DealerLedger.aggregate([
-      { $match: { branch: req.branchId, dealer: dealer?._id } },
+      { $match: { branch: req.branchScope, dealer: dealer?._id } },
       { $group: { _id: null, totalDebit: { $sum: '$debit' }, totalCredit: { $sum: '$credit' } } },
     ]);
     const outstanding = (summary[0]?.totalDebit || 0) - (summary[0]?.totalCredit || 0);
@@ -66,7 +66,7 @@ router.get('/dealers', requirePermission('dealer.ledger'), async (req, res) => {
     const dealerIds = dealers.map((dealer) => dealer._id);
     const branchBalances = dealerIds.length
       ? await DealerLedger.aggregate([
-        { $match: { branch: req.branchId, dealer: { $in: dealerIds } } },
+        { $match: { branch: req.branchScope, dealer: { $in: dealerIds } } },
         { $group: { _id: '$dealer', debit: { $sum: '$debit' }, credit: { $sum: '$credit' } } },
       ])
       : [];
@@ -101,7 +101,7 @@ router.get('/supplier/:supplierId', requirePermission('supplier.ledger'), async 
     const { dateFrom, dateTo, page = 1, limit = 50 } = req.query;
     const p = Math.max(1, parseInt(page));
     const l = Math.min(200, parseInt(limit) || 50);
-    let filter = { branch: req.branchId, supplier: req.params.supplierId };
+    let filter = { branch: req.branchScope, supplier: req.params.supplierId };
     if (dateFrom || dateTo) {
       filter.entryDate = {};
       if (dateFrom) filter.entryDate.$gte = new Date(dateFrom);
@@ -113,7 +113,7 @@ router.get('/supplier/:supplierId', requirePermission('supplier.ledger'), async 
       Supplier.findById(req.params.supplierId).select('companyName supplierCode mobile city currentOutstanding').lean(),
     ]);
     const summary = await SupplierLedger.aggregate([
-      { $match: { branch: req.branchId, supplier: supplier?._id } },
+      { $match: { branch: req.branchScope, supplier: supplier?._id } },
       { $group: { _id: null, totalDebit: { $sum: '$debit' }, totalCredit: { $sum: '$credit' } } },
     ]);
     const outstanding = (summary[0]?.totalCredit || 0) - (summary[0]?.totalDebit || 0);
@@ -142,7 +142,7 @@ router.get('/suppliers', requirePermission('supplier.ledger'), async (req, res) 
     const supplierIds = suppliers.map((supplier) => supplier._id);
     const branchBalances = supplierIds.length
       ? await SupplierLedger.aggregate([
-        { $match: { branch: req.branchId, supplier: { $in: supplierIds } } },
+        { $match: { branch: req.branchScope, supplier: { $in: supplierIds } } },
         { $group: { _id: '$supplier', debit: { $sum: '$debit' }, credit: { $sum: '$credit' } } },
       ])
       : [];

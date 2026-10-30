@@ -142,7 +142,12 @@ const compareRows = (sortBy, direction) => {
 
 export const getCanonicalStockAlerts = async (branchId, query = {}, options = {}) => {
   const filters = normalizeQuery(query, options.internalAll);
-  const branchObjectId = new mongoose.Types.ObjectId(String(branchId));
+  // Accepts a single branch id or the All Branches { $in: [...] } scope.
+  const branchObjectId = (() => {
+    const raw = Array.isArray(branchId?.$in) ? branchId.$in : [branchId];
+    const ids = raw.filter(Boolean).map((id) => new mongoose.Types.ObjectId(String(id?._id || id)));
+    return ids.length === 1 ? ids[0] : { $in: ids };
+  })();
   let warehouseRecord = null;
   if (filters.warehouse) {
     warehouseRecord = await Warehouse.findOne({ _id: filters.warehouse, branch: branchObjectId, status: 'active' })
@@ -305,7 +310,7 @@ export const getCanonicalStockAlerts = async (branchId, query = {}, options = {}
     pagination: { currentPage: filters.page, totalPages: options.internalAll ? 1 : Math.ceil(totalItems / filters.limit), totalItems, itemsPerPage: options.internalAll ? totalItems : filters.limit },
     summary,
     scope: {
-      branch: branchObjectId, warehouse: warehouseRecord, stockScope: warehouseRecord ? 'warehouse' : 'branch', snapshotAt,
+      branch: Array.isArray(branchObjectId?.$in) ? null : branchObjectId, warehouse: warehouseRecord, stockScope: warehouseRecord ? 'warehouse' : 'branch', snapshotAt,
       fallbackReorderLevel: Math.max(1, number(inventory.reorderFallbackLevel) || DEFAULT_REORDER_FALLBACK),
       fallbackMinStockLevel: inventory.minStockFallbackLevel === undefined || inventory.minStockFallbackLevel === null
         ? DEFAULT_MINIMUM_FALLBACK

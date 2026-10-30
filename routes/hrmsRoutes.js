@@ -105,7 +105,7 @@ router.get('/employees', ...employeeAccess, async (req, res) => {
     const { page = 1, limit = 20, search, status, department } = req.query;
     const p = Math.max(1, Number.parseInt(page, 10) || 1);
     const l = Math.min(100, Math.max(1, Number.parseInt(limit, 10) || 20));
-    const clauses = [{ branchId: req.branchId }];
+    const clauses = [{ branchId: req.branchScope }];
     if (search) {
       const regex = new RegExp(escapeRegex(String(search)), 'i');
       clauses.push({ $or: [{ name: regex }, { empId: regex }, { mobile: regex }, { department: regex }] });
@@ -127,7 +127,7 @@ router.get('/employees', ...employeeAccess, async (req, res) => {
 
 router.get('/employees/stats', ...employeeAccess, async (req, res) => {
   try {
-    const branchFilter = { branchId: req.branchId };
+    const branchFilter = { branchId: req.branchScope };
     const [total, active, inactive, onNotice, terminated] = await Promise.all([
       Employee.countDocuments(branchFilter),
       Employee.countDocuments({ ...branchFilter, status: 'Active' }),
@@ -227,7 +227,7 @@ router.delete('/employees/:id', ...employeeAccess, async (req, res) => {
 router.get('/employees/:id/documents/:fileName', ...employeeAccess, async (req, res) => {
   try {
     if (!validEmployeeId(req, res)) return;
-    const employee = await Employee.findOne({ _id: req.params.id, branchId: req.branchId }).select('documents').lean();
+    const employee = await Employee.findOne({ _id: req.params.id, branchId: req.branchScope }).select('documents').lean();
     if (!employee) return res.status(404).json({ success: false, message: 'Employee not found in the selected branch.' });
     const storedName = path.basename(req.params.fileName);
     if (storedName !== req.params.fileName) return res.status(400).json({ success: false, message: 'Invalid file reference.' });
@@ -261,7 +261,7 @@ router.get('/attendance', requirePermission('attendance.master'), async (req, re
     const { date, dateFrom, dateTo, employee, status, search, page = 1, limit = 50 } = req.query;
     const p = Math.max(1, parseInt(page));
     const l = Math.min(5000, Math.max(1, parseInt(limit) || 50));
-    const filter = { branch: req.branchId };
+    const filter = { branch: req.branchScope };
 
     if (date) {
       const start = parseDay(date);
@@ -301,9 +301,9 @@ router.post('/attendance/punch-in', requirePermission('attendance.master'), asyn
       return res.status(404).json({ success: false, message: 'Employee not found.' });
     }
     const today = new Date(); today.setHours(0, 0, 0, 0);
-    let record = await Attendance.findOne({ branch: req.branchId, employee, date: today });
+    let record = await Attendance.findOne({ branch: req.branchScope, employee, date: today });
     if (record && record.punchIn) return res.status(400).json({ success: false, message: 'Already punched in today.' });
-    if (!record) record = new Attendance({ branch: req.branchId, employee, date: today });
+    if (!record) record = new Attendance({ branch: req.branchScope, employee, date: today });
     record.punchIn = new Date();
     record.punchInLocation = location;
     record.punchInSelfie = selfie;
@@ -321,7 +321,7 @@ router.post('/attendance/punch-out', requirePermission('attendance.master'), asy
       return res.status(404).json({ success: false, message: 'Employee not found.' });
     }
     const today = new Date(); today.setHours(0, 0, 0, 0);
-    const record = await Attendance.findOne({ branch: req.branchId, employee, date: today });
+    const record = await Attendance.findOne({ branch: req.branchScope, employee, date: today });
     if (!record || !record.punchIn) return res.status(400).json({ success: false, message: 'No punch-in found for today.' });
     if (record.punchOut) return res.status(400).json({ success: false, message: 'Already punched out.' });
     record.punchOut = new Date();
@@ -354,8 +354,8 @@ router.post('/attendance/mark', requirePermission('attendance.master'), async (r
       return res.status(400).json({ success: false, message: 'Punch-out cannot be before punch-in.' });
     }
 
-    let record = await Attendance.findOne({ branch: req.branchId, employee, date: attendanceDate });
-    if (!record) record = new Attendance({ branch: req.branchId, employee, date: attendanceDate });
+    let record = await Attendance.findOne({ branch: req.branchScope, employee, date: attendanceDate });
+    if (!record) record = new Attendance({ branch: req.branchScope, employee, date: attendanceDate });
     record.status = status;
     record.remarks = remarks || '';
     if (parsedPunchIn) record.punchIn = parsedPunchIn;
@@ -382,7 +382,7 @@ router.get('/leaves', requirePermission('attendance.master'), async (req, res) =
   try {
     const { employee, status, page = 1, limit = 20 } = req.query;
     const p = Math.max(1, parseInt(page)); const l = parseInt(limit) || 20;
-    const filter = { branch: req.branchId };
+    const filter = { branch: req.branchScope };
     if (employee) filter.employee = employee;
     if (status) filter.status = status;
     const [leaves, total] = await Promise.all([
@@ -398,7 +398,7 @@ router.post('/leaves', requirePermission('attendance.master'), async (req, res) 
     if (!await employeeBelongsToBranch(req.body.employee, req.branchId)) {
       return res.status(404).json({ success: false, message: 'Employee not found.' });
     }
-    const leave = await Leave.create({ ...req.body, branch: req.branchId, appliedBy: req.user._id });
+    const leave = await Leave.create({ ...req.body, branch: req.branchScope, appliedBy: req.user._id });
     res.status(201).json({ success: true, message: 'Leave applied.', data: leave });
   } catch (e) { res.status(500).json({ success: false, message: e.message }); }
 });
@@ -406,12 +406,12 @@ router.post('/leaves', requirePermission('attendance.master'), async (req, res) 
 router.patch('/leaves/:id/approve', requirePermission('attendance.master'), async (req, res) => {
   try {
     const leave = await Leave.findOneAndUpdate(
-      { _id: req.params.id, branch: req.branchId, status: 'Pending' },
+      { _id: req.params.id, branch: req.branchScope, status: 'Pending' },
       { status: 'Approved', approvedBy: req.user._id, approvalDate: new Date() },
       { new: true, runValidators: true },
     );
     if (!leave) {
-      const existing = await Leave.findOne({ _id: req.params.id, branch: req.branchId }).select('status').lean();
+      const existing = await Leave.findOne({ _id: req.params.id, branch: req.branchScope }).select('status').lean();
       if (!existing) return res.status(404).json({ success: false, message: 'Leave not found.' });
       return res.status(409).json({ success: false, message: `Only Pending leave can be approved. Current status: ${existing.status}.` });
     }
@@ -420,7 +420,7 @@ router.patch('/leaves/:id/approve', requirePermission('attendance.master'), asyn
     if (balanceKey) {
       const balancePath = `leaveBalance.${balanceKey}`;
       await Employee.updateOne(
-        { _id: leave.employee, branchId: req.branchId },
+        { _id: leave.employee, branchId: req.branchScope },
         [{ $set: { [balancePath]: { $max: [0, { $subtract: [{ $ifNull: [`$${balancePath}`, 0] }, leave.days] }] } } }],
       );
     }
@@ -431,12 +431,12 @@ router.patch('/leaves/:id/approve', requirePermission('attendance.master'), asyn
 router.patch('/leaves/:id/reject', requirePermission('attendance.master'), async (req, res) => {
   try {
     const leave = await Leave.findOneAndUpdate(
-      { _id: req.params.id, branch: req.branchId, status: 'Pending' },
+      { _id: req.params.id, branch: req.branchScope, status: 'Pending' },
       { status: 'Rejected', rejectionReason: req.body.reason, approvedBy: req.user._id, approvalDate: new Date() },
       { new: true, runValidators: true },
     );
     if (!leave) {
-      const existing = await Leave.findOne({ _id: req.params.id, branch: req.branchId }).select('status').lean();
+      const existing = await Leave.findOne({ _id: req.params.id, branch: req.branchScope }).select('status').lean();
       if (!existing) return res.status(404).json({ success: false, message: 'Leave not found.' });
       return res.status(409).json({ success: false, message: `Only Pending leave can be rejected. Current status: ${existing.status}.` });
     }
@@ -452,7 +452,7 @@ router.get('/salary-slips', requirePermission('salary.management'), async (req, 
     const { month, year, status, search, page = 1, limit = 20 } = req.query;
     const p = Math.max(1, parseInt(page));
     const l = Math.min(100, Math.max(1, parseInt(limit) || 20));
-    const filter = { branch: req.branchId };
+    const filter = { branch: req.branchScope };
     if (month) filter.month = parseInt(month);
     if (year) filter.year = parseInt(year);
     if (status) filter.status = status;
@@ -470,14 +470,14 @@ router.post('/salary-slips/generate-bulk', requirePermission('salary.management'
     const period = parseSalaryPeriod(req.body.month, req.body.year);
     if (period.error) return res.status(400).json({ success: false, message: period.error });
 
-    const employees = await Employee.find({ branchId: req.branchId, status: 'Active' }).lean();
+    const employees = await Employee.find({ branchId: req.branchScope, status: 'Active' }).lean();
     if (!employees.length) {
       return res.json({ success: true, message: 'No active employees found.', data: { createdCount: 0, skippedCount: 0 } });
     }
 
     const operations = employees.map(employee => ({
       updateOne: {
-        filter: { branch: req.branchId, employee: employee._id, month: period.month, year: period.year },
+        filter: { branch: req.branchScope, employee: employee._id, month: period.month, year: period.year },
         update: { $setOnInsert: buildSalarySnapshot(employee, period.month, period.year, req.user._id, req.branchId) },
         upsert: true,
       },
@@ -503,9 +503,9 @@ router.post('/salary-slips/generate', requirePermission('salary.management'), as
       return res.status(400).json({ success: false, message: 'employeeId must be a valid identifier.' });
     }
 
-    const employee = await Employee.findOne({ _id: employeeId, branchId: req.branchId }).lean();
+    const employee = await Employee.findOne({ _id: employeeId, branchId: req.branchScope }).lean();
     if (!employee) return res.status(404).json({ success: false, message: 'Employee not found.' });
-    const existing = await SalarySlip.findOne({ branch: req.branchId, employee: employeeId, month: period.month, year: period.year });
+    const existing = await SalarySlip.findOne({ branch: req.branchScope, employee: employeeId, month: period.month, year: period.year });
     if (existing) return res.status(409).json({ success: false, message: 'Salary slip already exists for this month.' });
 
     const slip = await SalarySlip.create(buildSalarySnapshot(employee, period.month, period.year, req.user._id, req.branchId));
@@ -522,7 +522,7 @@ router.post('/salary-slips/generate', requirePermission('salary.management'), as
 router.get('/loans', requirePermission('attendance.master'), async (req, res) => {
   try {
     const { employee, status, type, search, page = 1, limit = 20 } = req.query;
-    const filter = { branch: req.branchId };
+    const filter = { branch: req.branchScope };
     if (employee) filter.employee = employee;
     if (status) filter.status = status;
     if (type) filter.type = type;
@@ -561,7 +561,7 @@ router.post('/loans', requirePermission('attendance.master'), async (req, res) =
     const emiAmount = Math.round((providedEmi ?? (amount / totalInstallments)) * 100) / 100;
     const data = {
       ...req.body,
-      branch: req.branchId,
+      branch: req.branchScope,
       amount,
       totalInstallments,
       emiAmount,
@@ -591,8 +591,8 @@ const configurableSettingFields = [
 router.get('/settings', requirePermission('attendance.master'), async (req, res) => {
   try {
     const settings = await HrmsSettings.findOneAndUpdate(
-      { branch: req.branchId },
-      { $setOnInsert: { branch: req.branchId } },
+      { branch: req.branchScope },
+      { $setOnInsert: { branch: req.branchScope } },
       { upsert: true, new: true, setDefaultsOnInsert: true, runValidators: true }
     );
     res.json({ success: true, data: settings });
@@ -610,8 +610,8 @@ router.put('/settings', requirePermission('attendance.master'), async (req, res)
       .filter(key => Object.prototype.hasOwnProperty.call(req.body, key))
       .map(key => [key, req.body[key]]));
     const settings = await HrmsSettings.findOneAndUpdate(
-      { branch: req.branchId },
-      { $set: updates, $setOnInsert: { branch: req.branchId } },
+      { branch: req.branchScope },
+      { $set: updates, $setOnInsert: { branch: req.branchScope } },
       { upsert: true, new: true, setDefaultsOnInsert: true, runValidators: true }
     );
     res.json({ success: true, message: 'Settings updated.', data: settings });
@@ -640,7 +640,7 @@ const loadExitCase = async (id, branchId) => EmployeeExit.findOne({ _id: id, bra
 
 router.get('/exits/stats', ...exitAccess, async (req, res) => {
   try {
-    const base = { branch: req.branchId };
+    const base = { branch: req.branchScope };
     const [pendingApproval, inClearance, settled, completed, rows] = await Promise.all([
       EmployeeExit.countDocuments({ ...base, status: 'pending_approval' }),
       EmployeeExit.countDocuments({ ...base, status: { $in: ['approved', 'in_clearance'] } }),
@@ -670,7 +670,7 @@ router.get('/exits', ...exitAccess, async (req, res) => {
     const { page = 1, limit = 20, status, exitType, search } = req.query;
     const p = Math.max(1, Number.parseInt(page, 10) || 1);
     const l = Math.min(100, Math.max(1, Number.parseInt(limit, 10) || 20));
-    const clauses = [{ branch: req.branchId }];
+    const clauses = [{ branch: req.branchScope }];
     if (status === 'open') clauses.push({ status: { $in: OPEN_EXIT_STATUSES } });
     else if (status) clauses.push({ status });
     if (exitType) clauses.push({ exitType });
@@ -719,14 +719,14 @@ router.post('/exits', ...exitAccess, async (req, res) => {
       return res.status(400).json({ success: false, message: 'Last working day cannot fall before the resignation date.' });
     }
 
-    const employee = await Employee.findOne({ _id: employeeId, branchId: req.branchId });
+    const employee = await Employee.findOne({ _id: employeeId, branchId: req.branchScope });
     if (!employee) return res.status(404).json({ success: false, message: 'Employee not found in the selected branch.' });
     if (employee.status === 'Terminated') {
       return res.status(409).json({ success: false, message: 'This employee has already exited.' });
     }
 
     const existing = await EmployeeExit.findOne({
-      branch: req.branchId, employee: employeeId, status: { $in: OPEN_EXIT_STATUSES },
+      branch: req.branchScope, employee: employeeId, status: { $in: OPEN_EXIT_STATUSES },
     }).select('_id status').lean();
     if (existing) {
       return res.status(409).json({
@@ -738,7 +738,7 @@ router.post('/exits', ...exitAccess, async (req, res) => {
 
     const notice = Number.isFinite(Number(noticePeriodDays)) ? Math.max(0, Number(noticePeriodDays)) : 30;
     const exitCase = await EmployeeExit.create({
-      branch: req.branchId,
+      branch: req.branchScope,
       employee: employee._id,
       employeeName: employee.name,
       empId: employee.empId || '',
@@ -779,7 +779,7 @@ router.get('/exits/:id', ...exitAccess, async (req, res) => {
 
     const employee = await Employee.findById(exitCase.employee).lean();
     const facts = employee
-      ? await buildClearanceFacts({ employee, branchId: req.branchId })
+      ? await buildClearanceFacts({ employee, branchId: req.branchScope })
       : null;
 
     res.json({
@@ -826,7 +826,7 @@ router.patch('/exits/:id/decision', ...exitAccess, async (req, res) => {
       exitCase.status = 'rejected';
       // Rejecting the resignation puts the employee back to work.
       await Employee.updateOne(
-        { _id: exitCase.employee, branchId: req.branchId, status: 'On Notice' },
+        { _id: exitCase.employee, branchId: req.branchScope, status: 'On Notice' },
         { $set: { status: 'Active' } }
       );
       await exitCase.save();
@@ -866,7 +866,7 @@ router.patch('/exits/:id/withdraw', ...exitAccess, async (req, res) => {
     exitCase.approval.remarks = String(req.body.remarks || exitCase.approval.remarks || '').trim();
     await exitCase.save();
     await Employee.updateOne(
-      { _id: exitCase.employee, branchId: req.branchId, status: 'On Notice' },
+      { _id: exitCase.employee, branchId: req.branchScope, status: 'On Notice' },
       { $set: { status: 'Active' } }
     );
     res.json({ success: true, message: 'Exit withdrawn. Employee restored to Active.', data: exitCase });
@@ -924,7 +924,7 @@ router.get('/exits/:id/settlement-draft', ...exitAccess, async (req, res) => {
 
     const result = await computeSettlementDraft({
       employee,
-      branchId: req.branchId,
+      branchId: req.branchScope,
       lastWorkingDay,
       noticeShortfallDays: exitCase.noticeShortfallDays,
     });
@@ -1077,7 +1077,7 @@ router.post('/exits/:id/complete', ...exitAccess, async (req, res) => {
 
     const employee = await Employee.findById(exitCase.employee).lean();
     if (!employee) return res.status(404).json({ success: false, message: 'Linked employee record is missing.' });
-    const facts = await buildClearanceFacts({ employee, branchId: req.branchId });
+    const facts = await buildClearanceFacts({ employee, branchId: req.branchScope });
     if (facts.assets.count > 0) {
       blockers.push(`${facts.assets.count} company asset(s) are still assigned to this employee.`);
     }
@@ -1106,7 +1106,7 @@ router.post('/exits/:id/complete', ...exitAccess, async (req, res) => {
     });
 
     const closedLoans = await closeRecoveredLoans({
-      branchId: req.branchId,
+      branchId: req.branchScope,
       employeeId: exitCase.employee,
       actorId: req.user._id,
     });
@@ -1152,7 +1152,7 @@ router.get('/performance/components', ...performanceAccess, (req, res) => {
 
 router.get('/performance/stats', ...performanceAccess, async (req, res) => {
   try {
-    const base = { branch: req.branchId };
+    const base = { branch: req.branchScope };
     const [total, drafts, submitted, acknowledged, pipOpen, promotions, avg] = await Promise.all([
       PerformanceReview.countDocuments(base),
       PerformanceReview.countDocuments({ ...base, status: 'draft' }),
@@ -1183,7 +1183,7 @@ router.get('/performance', ...performanceAccess, async (req, res) => {
     const { page = 1, limit = 20, status, employee, grade, search } = req.query;
     const p = Math.max(1, Number.parseInt(page, 10) || 1);
     const l = Math.min(100, Math.max(1, Number.parseInt(limit, 10) || 20));
-    const clauses = [{ branch: req.branchId }];
+    const clauses = [{ branch: req.branchScope }];
     if (status) clauses.push({ status });
     if (grade) clauses.push({ grade });
     if (employee && mongoose.isValidObjectId(employee)) clauses.push({ employee });
@@ -1215,12 +1215,12 @@ router.get('/performance/preview', ...performanceAccess, async (req, res) => {
     const period = parsePeriod(from, to);
     if (period.error) return res.status(400).json({ success: false, message: period.error });
 
-    const employee = await Employee.findOne({ _id: employeeId, branchId: req.branchId }).lean();
+    const employee = await Employee.findOne({ _id: employeeId, branchId: req.branchScope }).lean();
     if (!employee) return res.status(404).json({ success: false, message: 'Employee not found in the selected branch.' });
 
     const result = await computePerformance({
       employee,
-      branchId: req.branchId,
+      branchId: employee.branchId || req.branchScope,
       from: period.from,
       to: period.to,
       managerRating,
@@ -1246,7 +1246,7 @@ router.get('/performance/:id', ...performanceAccess, async (req, res) => {
     if (!mongoose.isValidObjectId(req.params.id)) {
       return res.status(400).json({ success: false, message: 'Review identifier is invalid.' });
     }
-    const review = await PerformanceReview.findOne({ _id: req.params.id, branch: req.branchId }).lean();
+    const review = await PerformanceReview.findOne({ _id: req.params.id, branch: req.branchScope }).lean();
     if (!review) return res.status(404).json({ success: false, message: 'Review not found in the selected branch.' });
     res.json({ success: true, data: review });
   } catch (e) { res.status(500).json({ success: false, message: e.message }); }
@@ -1283,11 +1283,11 @@ router.post('/performance', ...performanceAccess, async (req, res) => {
       return res.status(400).json({ success: false, message: 'Increment recommendation must be a percentage between 0 and 100.' });
     }
 
-    const employee = await Employee.findOne({ _id: employeeId, branchId: req.branchId }).lean();
+    const employee = await Employee.findOne({ _id: employeeId, branchId: req.branchScope }).lean();
     if (!employee) return res.status(404).json({ success: false, message: 'Employee not found in the selected branch.' });
 
     const duplicate = await PerformanceReview.findOne({
-      branch: req.branchId, employee: employeeId,
+      branch: req.branchScope, employee: employeeId,
       periodFrom: period.from, periodTo: period.to,
     }).select('_id status').lean();
     if (duplicate) {
@@ -1299,11 +1299,11 @@ router.post('/performance', ...performanceAccess, async (req, res) => {
     }
 
     const computed = await computePerformance({
-      employee, branchId: req.branchId, from: period.from, to: period.to, managerRating: rating,
+      employee, branchId: employee.branchId || req.branchScope, from: period.from, to: period.to, managerRating: rating,
     });
 
     const review = await PerformanceReview.create({
-      branch: req.branchId,
+      branch: req.branchScope,
       employee: employee._id,
       employeeName: employee.name,
       empId: employee.empId || '',
@@ -1358,7 +1358,7 @@ router.put('/performance/:id', ...performanceAccess, async (req, res) => {
     if (!mongoose.isValidObjectId(req.params.id)) {
       return res.status(400).json({ success: false, message: 'Review identifier is invalid.' });
     }
-    const review = await PerformanceReview.findOne({ _id: req.params.id, branch: req.branchId });
+    const review = await PerformanceReview.findOne({ _id: req.params.id, branch: req.branchScope });
     if (!review) return res.status(404).json({ success: false, message: 'Review not found in the selected branch.' });
     if (review.status === 'acknowledged') {
       return res.status(409).json({ success: false, message: 'An acknowledged review is a signed record and cannot be edited.' });
@@ -1380,11 +1380,11 @@ router.put('/performance/:id', ...performanceAccess, async (req, res) => {
       return res.status(400).json({ success: false, message: 'A manager rating is required before a review can be submitted.' });
     }
 
-    const employee = await Employee.findOne({ _id: review.employee, branchId: req.branchId }).lean();
+    const employee = await Employee.findOne({ _id: review.employee, branchId: req.branchScope }).lean();
     if (!employee) return res.status(404).json({ success: false, message: 'Linked employee record is missing.' });
 
     const computed = await computePerformance({
-      employee, branchId: req.branchId,
+      employee, branchId: employee.branchId || req.branchScope,
       from: review.periodFrom, to: review.periodTo, managerRating: rating,
     });
 
@@ -1443,7 +1443,7 @@ router.patch('/performance/:id/acknowledge', ...performanceAccess, async (req, r
     if (!mongoose.isValidObjectId(req.params.id)) {
       return res.status(400).json({ success: false, message: 'Review identifier is invalid.' });
     }
-    const review = await PerformanceReview.findOne({ _id: req.params.id, branch: req.branchId });
+    const review = await PerformanceReview.findOne({ _id: req.params.id, branch: req.branchScope });
     if (!review) return res.status(404).json({ success: false, message: 'Review not found in the selected branch.' });
     if (review.status !== 'submitted') {
       return res.status(409).json({ success: false, message: `Only a submitted review can be acknowledged (this one is ${review.status}).` });

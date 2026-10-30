@@ -35,7 +35,7 @@ router.get('/inbox', async (req, res) => {
   try {
     const page = Math.max(1, Number.parseInt(req.query.page, 10) || 1);
     const limit = Math.min(100, Math.max(1, Number.parseInt(req.query.limit, 10) || 20));
-    const filter = { branch: req.branchId, recipient: req.user._id };
+    const filter = { branch: req.branchScope, recipient: req.user._id };
     if (req.query.unread === 'true') filter.readAt = null;
     const [data, total] = await Promise.all([
       Notification.find(filter).sort({ createdAt: -1 }).skip((page - 1) * limit).limit(limit).lean(),
@@ -53,7 +53,7 @@ router.get('/inbox', async (req, res) => {
 
 router.get('/inbox/unread-count', async (req, res) => {
   try {
-    const count = await Notification.countDocuments({ branch: req.branchId, recipient: req.user._id, readAt: null });
+    const count = await Notification.countDocuments({ branch: req.branchScope, recipient: req.user._id, readAt: null });
     return res.json({ success: true, data: { count } });
   } catch (error) {
     return res.status(500).json({ success: false, message: error.message });
@@ -63,7 +63,7 @@ router.get('/inbox/unread-count', async (req, res) => {
 router.patch('/inbox/read-all', async (req, res) => {
   try {
     const result = await Notification.updateMany(
-      { branch: req.branchId, recipient: req.user._id, readAt: null },
+      { branch: req.branchScope, recipient: req.user._id, readAt: null },
       { $set: { readAt: new Date() } }
     );
     return res.json({ success: true, message: 'All notifications marked as read.', data: { modified: result.modifiedCount } });
@@ -75,7 +75,7 @@ router.patch('/inbox/read-all', async (req, res) => {
 router.patch('/inbox/:id/read', async (req, res) => {
   try {
     const notification = await Notification.findOneAndUpdate(
-      { _id: req.params.id, branch: req.branchId, recipient: req.user._id },
+      { _id: req.params.id, branch: req.branchScope, recipient: req.user._id },
       { $set: { readAt: new Date() } },
       { new: true }
     );
@@ -102,7 +102,7 @@ router.get('/delivery-audit', requirePermission('notification.audit'), async (re
   try {
     const page = Math.max(1, Number.parseInt(req.query.page, 10) || 1);
     const limit = Math.min(100, Math.max(1, Number.parseInt(req.query.limit, 10) || 25));
-    const filter = { branch: req.branchId };
+    const filter = { branch: req.branchScope };
     if (req.query.deliveryState) filter.deliveryState = req.query.deliveryState;
     if (req.query.module) filter.module = req.query.module;
     const [data, total] = await Promise.all([
@@ -119,7 +119,7 @@ router.get('/delivery-audit', requirePermission('notification.audit'), async (re
 router.get('/templates', async (req, res) => {
   try {
     const { channel, event, search } = req.query;
-    const filter = { branch: req.branchId };
+    const filter = { branch: req.branchScope };
     if (channel) filter.channel = channel;
     if (event) filter.event = event;
     if (search) filter.templateName = new RegExp(escapeRegex(search), 'i');
@@ -134,7 +134,7 @@ router.post('/templates', async (req, res) => {
   try {
     const template = await NotificationTemplate.create({
       ...pick(req.body, TEMPLATE_WRITE_FIELDS),
-      branch: req.branchId,
+      branch: req.branchScope,
       createdBy: req.user._id,
     });
     return res.status(201).json({ success: true, message: 'Template created.', data: template });
@@ -146,7 +146,7 @@ router.post('/templates', async (req, res) => {
 router.put('/templates/:id', async (req, res) => {
   try {
     const template = await NotificationTemplate.findOneAndUpdate(
-      { _id: req.params.id, branch: req.branchId },
+      { _id: req.params.id, branch: req.branchScope },
       { $set: pick(req.body, TEMPLATE_WRITE_FIELDS) },
       { new: true, runValidators: true }
     );
@@ -159,7 +159,7 @@ router.put('/templates/:id', async (req, res) => {
 
 router.delete('/templates/:id', async (req, res) => {
   try {
-    const template = await NotificationTemplate.findOneAndDelete({ _id: req.params.id, branch: req.branchId });
+    const template = await NotificationTemplate.findOneAndDelete({ _id: req.params.id, branch: req.branchScope });
     if (!template) return res.status(404).json({ success: false, message: 'Template not found in the selected branch.' });
     return res.json({ success: true, message: 'Deleted.', data: { _id: template._id } });
   } catch (error) {
@@ -171,7 +171,7 @@ router.delete('/templates/:id', async (req, res) => {
 router.post('/send', async (req, res) => {
   try {
     const { templateCode, variables, recipients, recipientUserIds, recipientRoles, eventKey, module, event, deepLink, data } = req.body;
-    const template = await NotificationTemplate.findOne({ branch: req.branchId, templateCode, isActive: true }).lean();
+    const template = await NotificationTemplate.findOne({ branch: req.branchScope, templateCode, isActive: true }).lean();
     if (!template) return res.status(404).json({ success: false, message: 'Template not found or inactive.' });
 
     let messageBody = template.body;
@@ -182,7 +182,7 @@ router.post('/send', async (req, res) => {
     }
 
     const result = await createNotificationEvent({
-      branch: req.branchId,
+      branch: req.branchScope,
       module: module || 'custom',
       event: event || template.event,
       eventKey: eventKey || `test:${template._id}:${crypto.randomUUID()}`,
@@ -204,7 +204,7 @@ router.post('/send', async (req, res) => {
 
 router.get('/settings', async (req, res) => {
   try {
-    const settings = await NotificationSettings.find({ branch: req.branchId }).sort({ module: 1 }).lean();
+    const settings = await NotificationSettings.find({ branch: req.branchScope }).sort({ module: 1 }).lean();
     return res.json({ success: true, data: settings });
   } catch (error) {
     return res.status(500).json({ success: false, message: error.message });
@@ -213,9 +213,9 @@ router.get('/settings', async (req, res) => {
 
 router.get('/settings/:module', async (req, res) => {
   try {
-    const settings = await NotificationSettings.findOne({ branch: req.branchId, module: req.params.module }).lean();
+    const settings = await NotificationSettings.findOne({ branch: req.branchScope, module: req.params.module }).lean();
     return res.json({ success: true, data: settings || {
-      branch: req.branchId,
+      branch: req.branchScope,
       module: req.params.module,
       moduleName: req.params.module.replace(/_/g, ' '),
       isEnabled: true,
@@ -229,10 +229,10 @@ router.get('/settings/:module', async (req, res) => {
 router.put('/settings/:module', async (req, res) => {
   try {
     const settings = await NotificationSettings.findOneAndUpdate(
-      { branch: req.branchId, module: req.params.module },
+      { branch: req.branchScope, module: req.params.module },
       {
         $set: { ...pick(req.body, SETTINGS_WRITE_FIELDS), updatedBy: req.user._id },
-        $setOnInsert: { branch: req.branchId, module: req.params.module },
+        $setOnInsert: { branch: req.branchScope, module: req.params.module },
       },
       { upsert: true, new: true, setDefaultsOnInsert: true, runValidators: true }
     );
@@ -266,8 +266,8 @@ router.post('/settings/initialize', async (req, res) => {
     let created = 0;
     for (const [module, moduleName] of modules) {
       const result = await NotificationSettings.updateOne(
-        { branch: req.branchId, module },
-        { $setOnInsert: { branch: req.branchId, module, moduleName, isEnabled: true, events: defaultEvents[module] || [], updatedBy: req.user._id } },
+        { branch: req.branchScope, module },
+        { $setOnInsert: { branch: req.branchScope, module, moduleName, isEnabled: true, events: defaultEvents[module] || [], updatedBy: req.user._id } },
         { upsert: true, runValidators: true }
       );
       if (result.upsertedCount) created += 1;

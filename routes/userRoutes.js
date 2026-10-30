@@ -679,6 +679,13 @@ router.get('/', async (req, res) => {
       clauses.push({ assignedBranches: req.query.branch });
     }
 
+    // A single-branch view lists that branch's staff only; the All Branches view
+    // keeps the whole company directory. Users with no branch assignment belong
+    // to no branch, so they surface only under All Branches.
+    if (!req.query.branch && !req.allBranches && req.branchId) {
+      clauses.push({ assignedBranches: req.branchId });
+    }
+
     const filter = clauses.length ? { $and: clauses } : {};
     const usersQuery = User.find(filter).sort({ createdAt: -1 }).skip((p - 1) * l).limit(l);
     const [users, total] = await Promise.all([
@@ -825,7 +832,7 @@ router.put('/:id', async (req, res) => {
       user.lastReactivation = {
         at: new Date(),
         by: req.user._id,
-        branch: req.branchId || undefined,
+        branch: req.branchScope || undefined,
       };
       user.failedLoginAttempts = 0;
       user.loginLockedUntil = undefined;
@@ -853,7 +860,7 @@ router.put('/:id', async (req, res) => {
         recordModel: 'User',
         description: `Reactivated user ${user.name}`,
         metadata: { from: 'Inactive', to: 'Active' },
-        branch: req.branchId,
+        branch: req.branchScope,
         req,
       });
     }
@@ -958,7 +965,7 @@ router.delete('/:id', async (req, res) => {
       at: new Date(),
       by: req.user._id,
       reason,
-      branch: req.branchId || undefined,
+      branch: req.branchScope || undefined,
       metadata: deactivationMetadata(req),
       dependencySnapshot: snapshot,
     };
@@ -1038,7 +1045,7 @@ router.delete('/:id', async (req, res) => {
           from: 'Active',
           to: 'Inactive',
         },
-        branch: req.branchId,
+        branch: req.branchScope,
         req,
       });
     }
@@ -1210,7 +1217,7 @@ const logPermissionChange = async ({ req, res, target, before, description }) =>
       revokedCount: revoked.length,
       effectiveCount: after.permissions.includes('*') ? 'all' : after.permissions.length,
     },
-    branch: req.branchId,
+    branch: req.branchScope,
     req,
   });
 };

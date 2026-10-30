@@ -1,7 +1,7 @@
 import { verifyToken } from '../utils/jwt.js';
 import User from '../models/User.js';
 import Branch from '../models/Branch.js';
-import { resolveBranchContext } from '../utils/branchScope.js';
+import { resolveBranchContext, blockWritesInAllBranches } from '../utils/branchScope.js';
 import { PERMISSION_ALIASES, ROLE_DEFAULT_PERMISSIONS } from '../config/permissions.js';
 
 // Single source of truth lives in config/permissions.js so the backend, the
@@ -107,7 +107,10 @@ export const protect = async (req, res, next) => {
         message: 'You must change your password before continuing.',
       });
     }
-    return resolveBranchContext(req, res, next);
+    return resolveBranchContext(req, res, (error) => {
+      if (error) return next(error);
+      return blockWritesInAllBranches(req, res, next);
+    });
   } catch (error) {
     return next(error);
   }

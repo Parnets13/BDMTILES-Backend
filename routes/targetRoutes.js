@@ -89,7 +89,7 @@ router.get('/', requirePermission('incentive.rules.view'), async (req, res) => {
     }
     if (req.query.ruleStatus) filter.status = req.query.ruleStatus;
 
-    let rows = await listTargetRows({ branchId: req.branchId, filter });
+    let rows = await listTargetRows({ branchId: req.branchScope, filter });
 
     if (req.query.salesExecutive) {
       const wanted = String(req.query.salesExecutive);
@@ -126,7 +126,7 @@ router.post('/', requirePermission('incentive.rules.manage'), async (req, res) =
     const period = payload.period || req.body.period || 'monthly';
     const rule = await Incentive.create({
       ...payload,
-      branch: req.branchId,
+      branch: req.branchScope,
       applicableTo: 'sales_executive',
       incentiveType: 'target',
       period,
@@ -137,7 +137,7 @@ router.post('/', requirePermission('incentive.rules.manage'), async (req, res) =
     });
 
     const executiveDirectory = await loadExecutiveDirectory(rule.specificUsers);
-    const [row] = await expandRule({ rule: rule.toObject(), branchId: req.branchId, executiveDirectory });
+    const [row] = await expandRule({ rule: rule.toObject(), branchId: req.branchScope, executiveDirectory });
     return res.status(201).json({ success: true, message: `Target ${rule.incentiveCode} created.`, data: row });
   } catch (error) { return sendError(res, error); }
 });
@@ -147,7 +147,7 @@ router.get('/:id', requirePermission('incentive.rules.view'), async (req, res) =
   try {
     const rule = await findRule(req.branchId, req.params.id);
     const executiveDirectory = await loadExecutiveDirectory(rule.specificUsers);
-    const rows = await expandRule({ rule: rule.toObject(), branchId: req.branchId, executiveDirectory });
+    const rows = await expandRule({ rule: rule.toObject(), branchId: req.branchScope, executiveDirectory });
     return res.json({ success: true, data: rows.length === 1 ? rows[0] : rows });
   } catch (error) { return sendError(res, error); }
 });
@@ -167,7 +167,7 @@ router.put('/:id', requirePermission('incentive.rules.manage'), async (req, res)
     await rule.save();
 
     const executiveDirectory = await loadExecutiveDirectory(rule.specificUsers);
-    const [row] = await expandRule({ rule: rule.toObject(), branchId: req.branchId, executiveDirectory });
+    const [row] = await expandRule({ rule: rule.toObject(), branchId: req.branchScope, executiveDirectory });
     return res.json({ success: true, message: 'Target updated.', data: row });
   } catch (error) { return sendError(res, error); }
 });
@@ -185,7 +185,7 @@ router.patch('/:id/status', requirePermission('incentive.rules.manage'), async (
     await rule.save();
 
     const executiveDirectory = await loadExecutiveDirectory(rule.specificUsers);
-    const [row] = await expandRule({ rule: rule.toObject(), branchId: req.branchId, executiveDirectory });
+    const [row] = await expandRule({ rule: rule.toObject(), branchId: req.branchScope, executiveDirectory });
     return res.json({ success: true, message: `Target ${req.body.status}.`, data: row });
   } catch (error) { return sendError(res, error); }
 });
@@ -195,7 +195,7 @@ router.delete('/:id', requirePermission('incentive.rules.manage'), async (req, r
   try {
     const rule = await findRule(req.branchId, req.params.id);
     assertNotShared(rule);
-    if (await IncentiveEarning.exists({ branch: req.branchId, incentive: rule._id })) {
+    if (await IncentiveEarning.exists({ branch: req.branchScope, incentive: rule._id })) {
       throw fail(409, 'This target already has incentive earning history. Close it instead of deleting.', 'TARGET_HAS_EARNINGS');
     }
     await rule.deleteOne();

@@ -101,12 +101,12 @@ router.get('/directory/executives', requirePermission('sales.executive.app'), as
     // `User.status` is capitalised ('Active'/'Inactive') — a lowercase 'active' here
     // matches nothing and would leave every filter dropdown empty.
     const filter = { role: 'sales_executive', status: 'Active' };
-    // Scope to the caller's branch unless they hold global access. The SE app is a
-    // branch tool; a branch manager should not see another branch's roster.
-    if (!req.hasGlobalBranchAccess) {
+    // Scope to the active branch; All Branches spans every branch in scope. The SE
+    // app is a branch tool, so a branch manager must not see another branch's roster.
+    if (!req.allBranches) {
       filter.$or = [
-        { defaultBranch: req.branchId },
-        { assignedBranches: req.branchId },
+        { defaultBranch: req.branchScope },
+        { assignedBranches: req.branchScope },
       ];
     }
     const rows = await User.find(filter)
@@ -141,7 +141,7 @@ router.get('/me/dealers', requirePermission('se.dealer.insights'), async (req, r
 
     const dealerIds = dealers.map((dealer) => dealer._id);
     const outstandingRows = dealerIds.length ? await DealerLedger.aggregate([
-      { $match: { branch: req.branchId, dealer: { $in: dealerIds } } },
+      { $match: { branch: req.branchScope, dealer: { $in: dealerIds } } },
       { $group: { _id: '$dealer', debit: { $sum: '$debit' }, credit: { $sum: '$credit' } } },
     ]) : [];
     const outstandingByDealer = new Map(
@@ -184,10 +184,10 @@ router.get('/me/dealers/:id/insights', requirePermission('se.dealer.insights'), 
 
     const [outstanding, exposure, pendingOrders, openQuotations, openComplaints] = await Promise.all([
       ledgerOutstanding(req.branchId, dealer._id),
-      getDealerCreditExposure({ branchId: req.branchId, dealer }),
-      SalesOrder.countDocuments({ branch: req.branchId, dealer: dealer._id, status: { $in: OPEN_ORDER_STATUSES } }),
-      Quotation.countDocuments({ branch: req.branchId, dealer: dealer._id, createdBy: req.user._id, status: { $in: OPEN_QUOTATION_STATUSES } }),
-      Complaint.countDocuments({ branch: req.branchId, dealer: dealer._id, status: { $nin: TERMINAL_COMPLAINT_STATUSES } }),
+      getDealerCreditExposure({ branchId: req.branchScope, dealer }),
+      SalesOrder.countDocuments({ branch: req.branchScope, dealer: dealer._id, status: { $in: OPEN_ORDER_STATUSES } }),
+      Quotation.countDocuments({ branch: req.branchScope, dealer: dealer._id, createdBy: req.user._id, status: { $in: OPEN_QUOTATION_STATUSES } }),
+      Complaint.countDocuments({ branch: req.branchScope, dealer: dealer._id, status: { $nin: TERMINAL_COMPLAINT_STATUSES } }),
     ]);
 
     const creditLimit = Number(dealer.creditLimit || 0);
@@ -241,12 +241,12 @@ router.get(
     const [dealerCount, outstandingRows, pendingOrders, openQuotations, openComplaints] = await Promise.all([
       Promise.resolve(dealerIds.length),
       dealerIds.length ? DealerLedger.aggregate([
-        { $match: { branch: req.branchId, dealer: { $in: dealerIds } } },
+        { $match: { branch: req.branchScope, dealer: { $in: dealerIds } } },
         { $group: { _id: null, debit: { $sum: '$debit' }, credit: { $sum: '$credit' } } },
       ]) : [],
-      SalesOrder.countDocuments({ branch: req.branchId, salesExecutive: req.user._id, status: { $in: OPEN_ORDER_STATUSES } }),
-      dealerIds.length ? Quotation.countDocuments({ branch: req.branchId, dealer: { $in: dealerIds }, createdBy: req.user._id, status: { $in: OPEN_QUOTATION_STATUSES } }) : 0,
-      dealerIds.length ? Complaint.countDocuments({ branch: req.branchId, dealer: { $in: dealerIds }, status: { $nin: TERMINAL_COMPLAINT_STATUSES } }) : 0,
+      SalesOrder.countDocuments({ branch: req.branchScope, salesExecutive: req.user._id, status: { $in: OPEN_ORDER_STATUSES } }),
+      dealerIds.length ? Quotation.countDocuments({ branch: req.branchScope, dealer: { $in: dealerIds }, createdBy: req.user._id, status: { $in: OPEN_QUOTATION_STATUSES } }) : 0,
+      dealerIds.length ? Complaint.countDocuments({ branch: req.branchScope, dealer: { $in: dealerIds }, status: { $nin: TERMINAL_COMPLAINT_STATUSES } }) : 0,
     ]);
     const totalOutstanding = round2((outstandingRows[0]?.debit || 0) - (outstandingRows[0]?.credit || 0));
 
@@ -272,7 +272,7 @@ router.get(
 router.get('/me/target-progress', requirePermission('se.targets.view'), async (req, res) => {
   try {
     const targets = await listMyTargetProgress({
-      branchId: req.branchId,
+      branchId: req.branchScope,
       executiveId: req.user._id,
     });
     return res.json({ success: true, data: { targets } });
@@ -324,7 +324,7 @@ const startOfToday = () => {
 
 // Resolve the Employee profile linked to the signed-in user, scoped to branch.
 async function resolveEmployee(req) {
-  const employee = await Employee.findOne({ userId: req.user._id, branchId: req.branchId })
+  const employee = await Employee.findOne({ userId: req.user._id, branchId: req.branchScope })
     .select('_id name empId branchId department')
     .lean();
   return employee;
@@ -394,8 +394,8 @@ router.get('/me/attendance/today', requirePermission('se.attendance.view'), asyn
   try {
     const employee = await resolveEmployee(req);
     if (!employee) return res.status(404).json({ success: false, message: 'No employee profile is linked to your account.' });
-    const settings = await HrmsSettings.findOne({ branch: req.branchId }).select('defaultShiftStart graceMinutes').lean();
-    const record = await Attendance.findOne({ branch: req.branchId, employee: employee._id, date: startOfToday() }).lean();
+    const settings = await HrmsSettings.findOne({ branch: req.branchScope }).select('defaultShiftStart graceMinutes').lean();
+    const record = await Attendance.findOne({ branch: req.branchScope, employee: employee._id, date: startOfToday() }).lean();
     return res.json({
       success: true,
       data: {
@@ -414,7 +414,7 @@ router.get('/me/attendance/history', requirePermission('se.attendance.view'), as
     const employee = await resolveEmployee(req);
     if (!employee) return res.status(404).json({ success: false, message: 'No employee profile is linked to your account.' });
     const limit = Math.min(60, Math.max(1, Number.parseInt(req.query.limit, 10) || 30));
-    const records = await Attendance.find({ branch: req.branchId, employee: employee._id })
+    const records = await Attendance.find({ branch: req.branchScope, employee: employee._id })
       .sort({ date: -1 }).limit(limit).lean();
     return res.json({ success: true, data: records.map(attendanceView) });
   } catch (error) {
@@ -433,19 +433,19 @@ router.post('/me/attendance/punch-in', requirePermission('se.attendance.view'), 
     const lateReason = String(req.body?.lateReason || '').trim();
 
     const today = startOfToday();
-    let record = await Attendance.findOne({ branch: req.branchId, employee: employee._id, date: today });
+    let record = await Attendance.findOne({ branch: req.branchScope, employee: employee._id, date: today });
     if (record && record.punchIn) {
       return res.status(409).json({ success: false, message: 'You have already punched in today.' });
     }
 
-    const settings = await HrmsSettings.findOne({ branch: req.branchId }).select('defaultShiftStart graceMinutes').lean();
+    const settings = await HrmsSettings.findOne({ branch: req.branchScope }).select('defaultShiftStart graceMinutes').lean();
     const punchInAt = new Date();
     const lateMinutes = computeLateMinutes(punchInAt, settings);
     if (lateMinutes > 0 && !lateReason) {
       return res.status(422).json({ success: false, message: 'You are past the grace period. A late-entry reason is required.', code: 'LATE_REASON_REQUIRED', lateMinutes });
     }
 
-    if (!record) record = new Attendance({ branch: req.branchId, employee: employee._id, date: today });
+    if (!record) record = new Attendance({ branch: req.branchScope, employee: employee._id, date: today });
     record.punchIn = punchInAt;
     record.punchInLocation = location;
     if (selfie) record.punchInSelfie = selfie;
@@ -470,7 +470,7 @@ router.post('/me/attendance/punch-out', requirePermission('se.attendance.view'),
     if (!location) return res.status(422).json({ success: false, message: 'A valid GPS location (lat, lng) is required to punch out.' });
     const selfie = typeof req.body?.selfie === 'string' ? req.body.selfie : '';
 
-    const record = await Attendance.findOne({ branch: req.branchId, employee: employee._id, date: startOfToday() });
+    const record = await Attendance.findOne({ branch: req.branchScope, employee: employee._id, date: startOfToday() });
     if (!record || !record.punchIn) return res.status(409).json({ success: false, message: 'You have not punched in today.' });
     if (record.punchOut) return res.status(409).json({ success: false, message: 'You have already punched out today.' });
 
@@ -528,7 +528,7 @@ router.get('/me/expenses', requirePermission('sales.executive.app'), async (req,
     }
     const p = Math.max(1, Number.parseInt(page, 10) || 1);
     const l = Math.min(50, Math.max(1, Number.parseInt(limit, 10) || 20));
-    const filter = { branch: req.branchId, employee: employee._id };
+    const filter = { branch: req.branchScope, employee: employee._id };
     if (status) filter.status = status;
     if (category) filter.category = category;
 
@@ -550,7 +550,7 @@ router.get('/me/expenses/stats', requirePermission('sales.executive.app'), async
   try {
     const employee = await resolveEmployee(req);
     if (!employee) return res.status(404).json({ success: false, message: 'No employee profile is linked to your account.' });
-    const match = { branch: req.branchId, employee: employee._id };
+    const match = { branch: req.branchScope, employee: employee._id };
     const [rows] = await Promise.all([
       Expense.aggregate([
         { $match: match },
@@ -600,7 +600,7 @@ router.post('/me/expenses', requirePermission('sales.executive.app'), async (req
     const photoUpload = Array.isArray(req.body?.photoUpload) ? req.body.photoUpload.filter((s) => typeof s === 'string') : [];
 
     const expense = await Expense.create({
-      branch: req.branchId,
+      branch: req.branchScope,
       employee: employee._id,
       employeeName: employee.name,
       department: employee.department,
@@ -667,7 +667,7 @@ router.get('/me/collections', requirePermission('se.collections.view'), async (r
     const { status, page = 1, limit = 20 } = req.query;
     const p = Math.max(1, Number.parseInt(page, 10) || 1);
     const l = Math.min(50, Math.max(1, Number.parseInt(limit, 10) || 20));
-    const filter = { branch: req.branchId, isFieldCollection: true, collectedBy: req.user._id };
+    const filter = { branch: req.branchScope, isFieldCollection: true, collectedBy: req.user._id };
     if (status && ['pending', 'confirmed', 'bounced', 'cancelled'].includes(String(status))) filter.status = status;
 
     const [rows, total] = await Promise.all([
@@ -688,7 +688,7 @@ router.get('/me/collections', requirePermission('se.collections.view'), async (r
 router.get('/me/collections/stats', requirePermission('se.collections.view'), async (req, res) => {
   try {
     const rows = await Payment.aggregate([
-      { $match: { branch: req.branchId, isFieldCollection: true, collectedBy: req.user._id } },
+      { $match: { branch: req.branchScope, isFieldCollection: true, collectedBy: req.user._id } },
       { $group: { _id: '$status', count: { $sum: 1 }, amount: { $sum: '$amount' } } },
     ]);
     const summary = { pending: 0, confirmed: 0, bounced: 0, cancelled: 0, pendingAmount: 0, confirmedAmount: 0 };
@@ -708,7 +708,7 @@ router.get('/me/dealers/:id/outstanding', requirePermission('se.collections.view
     const dealer = await assertMyDealer(req.user._id, req.params.id);
     if (!dealer) return res.status(404).json({ success: false, message: 'Dealer not found or not assigned to you.' });
     const invoices = await Invoice.find({
-      branch: req.branchId,
+      branch: req.branchScope,
       dealer: dealer._id,
       status: { $ne: 'cancelled' },
       paymentStatus: { $in: ['pending', 'partial'] },
@@ -739,7 +739,7 @@ router.post('/me/collections', requirePermission('se.collections.view'), async (
     if (!dealer) return res.status(404).json({ success: false, message: 'Dealer not found or not assigned to you.' });
 
     if (sourceKey) {
-      const existing = await Payment.findOne({ branch: req.branchId, sourceKey }).lean();
+      const existing = await Payment.findOne({ branch: req.branchScope, sourceKey }).lean();
       if (existing) return res.json({ success: true, message: 'Collection already recorded.', data: collectionView(existing) });
     }
 
@@ -767,7 +767,7 @@ router.post('/me/collections', requirePermission('se.collections.view'), async (
 
     // Always pending + unallocated + accounting-inert. No applyPaymentEffects.
     const payment = await Payment.create({
-      branch: req.branchId,
+      branch: req.branchScope,
       paymentType: 'dealer_receipt',
       paymentDate,
       dealer: dealer._id,
@@ -799,7 +799,7 @@ router.post('/me/collections', requirePermission('se.collections.view'), async (
     if (error.code === 11000) {
       // A concurrent retry with the same idempotency key: return the winner.
       if (sourceKey) {
-        const existing = await Payment.findOne({ branch: req.branchId, sourceKey }).lean();
+        const existing = await Payment.findOne({ branch: req.branchScope, sourceKey }).lean();
         if (existing) return res.json({ success: true, message: 'Collection already recorded.', data: collectionView(existing) });
       }
       return res.status(409).json({ success: false, message: 'Duplicate collection number, please retry.' });
@@ -839,7 +839,7 @@ router.get('/me/visits', requirePermission('se.route.plan'), async (req, res) =>
     const { status, page = 1, limit = 20 } = req.query;
     const p = Math.max(1, Number.parseInt(page, 10) || 1);
     const l = Math.min(50, Math.max(1, Number.parseInt(limit, 10) || 20));
-    const filter = { branch: req.branchId, salesExecutive: req.user._id };
+    const filter = { branch: req.branchScope, salesExecutive: req.user._id };
     if (status && ['checked_in', 'completed', 'cancelled'].includes(String(status))) filter.status = status;
 
     const [rows, total] = await Promise.all([
@@ -893,7 +893,7 @@ router.post('/me/dealers/:id/visits/check-in', requirePermission('se.route.plan'
 
     const now = new Date();
     const visit = await DealerVisit.create({
-      branch: req.branchId,
+      branch: req.branchScope,
       dealer: dealer._id,
       dealerName: dealer.businessName,
       salesExecutive: req.user._id,
@@ -1043,8 +1043,15 @@ function visitDateWindow({ from, to }) {
  */
 const asObjectId = (value) => new mongoose.Types.ObjectId(String(value));
 
+/** Branch clause for aggregates, widening to { $in } while "All Branches" is active. */
+const asBranchClause = (scope) => {
+  const raw = Array.isArray(scope?.$in) ? scope.$in : [scope];
+  const ids = raw.filter(Boolean).map((id) => new mongoose.Types.ObjectId(String(id?._id || id)));
+  return ids.length === 1 ? ids[0] : { $in: ids };
+};
+
 function buildVisitFilter(req) {
-  const filter = { branch: asObjectId(req.branchId) };
+  const filter = { branch: asBranchClause(req.branchScope) };
   if (mongoose.isValidObjectId(req.query.salesExecutive)) filter.salesExecutive = asObjectId(req.query.salesExecutive);
   if (mongoose.isValidObjectId(req.query.dealer)) filter.dealer = asObjectId(req.query.dealer);
   if (VISIT_STATUSES.includes(String(req.query.status))) filter.status = req.query.status;
@@ -1145,13 +1152,13 @@ const MONITOR_PERMISSION = 'se.attendance.view';
  */
 router.get('/monitoring/live', requirePermission(MONITOR_PERMISSION), async (req, res) => {
   try {
-    const branch = new mongoose.Types.ObjectId(String(req.branchId));
+    const branch = asBranchClause(req.branchScope);
     const [activeVisits, employees, punches, latestFixes] = await Promise.all([
       DealerVisit.find({ branch, status: 'checked_in' })
         .select('salesExecutive dealerName checkInAt checkInLocation purpose')
         .populate('salesExecutive', 'name phone')
         .lean(),
-      Employee.find({ branchId: req.branchId }).select('_id name empId userId').lean(),
+      Employee.find({ branchId: req.branchScope }).select('_id name empId userId').lean(),
       Attendance.find({ branch, date: { $gte: startOfToday() } })
         .select('employee punchIn punchOut punchInLocation punchOutLocation status')
         .lean(),
@@ -1246,7 +1253,7 @@ router.get('/monitoring/live', requirePermission(MONITOR_PERMISSION), async (req
 /** One executive's day in order — every visit with its times, place and duration. */
 router.get('/monitoring/route-history', requirePermission(MONITOR_PERMISSION), async (req, res) => {
   try {
-    const filter = { branch: req.branchId };
+    const filter = { branch: req.branchScope };
     if (req.query.executive) filter.salesExecutive = req.query.executive;
     const window = visitDateWindow(req.query);
     if (window) filter.checkInAt = window;
@@ -1288,7 +1295,7 @@ router.get('/monitoring/route-history', requirePermission(MONITOR_PERMISSION), a
 /** Visits that were closed as missed, with the reason the executive gave. */
 router.get('/monitoring/missed-visits', requirePermission(MONITOR_PERMISSION), async (req, res) => {
   try {
-    const filter = { branch: req.branchId, status: 'missed' };
+    const filter = { branch: req.branchScope, status: 'missed' };
     const window = visitDateWindow(req.query);
     if (window) filter.checkInAt = window;
 
@@ -1321,13 +1328,13 @@ router.get('/monitoring/missed-visits', requirePermission(MONITOR_PERMISSION), a
  */
 router.get('/monitoring/productivity', requirePermission(MONITOR_PERMISSION), async (req, res) => {
   try {
-    const filter = { branch: req.branchId };
+    const filter = { branch: req.branchScope };
     const window = visitDateWindow(req.query);
     if (window) filter.checkInAt = window;
 
     const [rows] = await Promise.all([
       DealerVisit.aggregate([
-        { $match: { ...filter, branch: new mongoose.Types.ObjectId(String(req.branchId)) } },
+        { $match: filter },
         {
           $group: {
             _id: '$salesExecutive',
@@ -1428,7 +1435,7 @@ async function trackingDecision(req) {
   const employee = await resolveEmployee(req);
   if (!employee) return { shouldTrack: false, reason: 'no_employee_profile' };
   const attendance = await Attendance.findOne({
-    branch: req.branchId,
+    branch: req.branchScope,
     employee: employee._id,
     date: startOfToday(),
   }).lean();
@@ -1500,7 +1507,7 @@ router.post('/me/tracking/ping', requirePermission('se.attendance.view'), async 
 
     const days = retentionDays();
     const ping = await TrackingPing.create({
-      branch: req.branchId,
+      branch: req.branchScope,
       executive: req.user._id,
       employee: decision.employee?._id,
       executiveName: req.user.name || '',
@@ -1552,7 +1559,7 @@ router.get('/monitoring/trail', requirePermission(MONITOR_PERMISSION), async (re
     }
     const day = String(req.query.day || businessDayKey()).slice(0, 10);
     const points = await TrackingPing.find({
-      branch: req.branchId,
+      branch: req.branchScope,
       executive,
       day,
       status: 'active',
@@ -1701,7 +1708,7 @@ router.post('/me/messages/:dealerId', requireAnyPermission(...CHAT_PERMISSIONS),
     }
 
     const message = await DealerMessage.create({
-      branch: req.branchId,
+      branch: req.branchScope,
       dealer: dealer._id,
       senderRole: 'executive',
       salesExecutive: req.user._id,
@@ -1744,7 +1751,7 @@ function populateRequest(query) {
 
 async function loadOwnRequest(req, res) {
   const request = await populateRequest(
-    DealerOrderRequest.findOne({ _id: req.params.id, branch: req.branchId, salesExecutive: req.user._id })
+    DealerOrderRequest.findOne({ _id: req.params.id, branch: req.branchScope, salesExecutive: req.user._id })
   ).lean();
   if (!request) {
   res.status(404).json({ success: false, message: 'Order request not found or not yours.' });
@@ -1770,7 +1777,7 @@ router.post('/me/order-requests/:id/stock-plan',
         if (!own) return;
         const { request, quotation, plan } = await dealerOrderStockPlan({
           requestId: req.params.id,
-          branchId: req.branchId,
+          branchId: req.branchScope,
           actor: req.user,
           session,
         });
@@ -1812,7 +1819,7 @@ router.post('/me/order-requests/:id/process',
       await session.withTransaction(async () => {
         result = await processDealerOrderRequest({
           requestId: req.params.id,
-          branchId: req.branchId,
+          branchId: req.branchScope,
           actor: req.user,
           planHash: req.body?.planHash,
           shortfallInput: answers,

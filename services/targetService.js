@@ -52,6 +52,14 @@ const objectId = (value) => (value instanceof mongoose.Types.ObjectId
   ? value
   : new mongoose.Types.ObjectId(String(value)));
 
+/** Branch filter that also accepts the All Branches { $in: [...] } scope. */
+const branchClause = (value) => {
+  if (value && typeof value === 'object' && Array.isArray(value.$in)) {
+    return { $in: value.$in.map((id) => objectId(id)) };
+  }
+  return objectId(value);
+};
+
 function fail(status, message, code) {
   const error = new Error(message);
   error.status = status;
@@ -106,7 +114,7 @@ export function unitOf(metric) {
  * rule is valid for. Sales/collections are rupee sums; orders/visits are counts.
  */
 export async function computeAchievement({ branchId, executiveId, metric, from, to }) {
-  const branch = objectId(branchId);
+  const branch = branchClause(branchId);
   const executive = objectId(executiveId);
   const window = { $gte: new Date(from), $lte: new Date(to) };
 
@@ -259,7 +267,7 @@ export async function loadExecutiveDirectory(extraIds = []) {
 
 /** Every target row in a branch, newest window first. */
 export async function listTargetRows({ branchId, filter = {}, now = new Date() }) {
-  const rules = await Incentive.find({ branch: objectId(branchId), ...TARGET_RULE_MATCH, ...filter })
+  const rules = await Incentive.find({ branch: branchClause(branchId), ...TARGET_RULE_MATCH, ...filter })
     .sort({ validTo: -1, createdAt: -1 })
     .lean();
   const referenced = rules.flatMap((rule) => (rule.specificUsers || []));
@@ -276,7 +284,7 @@ export async function listTargetRows({ branchId, filter = {}, now = new Date() }
  */
 export async function listMyTargetProgress({ branchId, executiveId, now = new Date() }) {
   const rules = await Incentive.find({
-    branch: objectId(branchId),
+    branch: branchClause(branchId),
     ...TARGET_RULE_MATCH,
     status: 'active',
     targetValue: { $gt: 0 },

@@ -223,7 +223,7 @@ router.delete('/nodes/:id', requireBranch, async (req, res) => {
 
     const { safeDelete } = await import('../middleware/safeDelete.js');
     const result = await safeDelete(Category, req.params.id, {
-      user: req.user, req, branch: req.branchId,
+      user: req.user, req, branch: req.branchScope,
       module: 'category', titleField: 'name', skipDependencyCheck: true,
     });
     res.status(result.status || 200).json(result);
@@ -347,7 +347,7 @@ router.delete('/brands/:id', requireBranch, async (req, res) => {
     const unlinked = linked.modifiedCount || 0;
     const { safeDelete } = await import('../middleware/safeDelete.js');
     const result = await safeDelete(Brand, req.params.id, {
-      user: req.user, req, branch: req.branchId,
+      user: req.user, req, branch: req.branchScope,
       module: 'brand', titleField: 'name', skipDependencyCheck: true,
     });
     if (result.success && unlinked) {
@@ -527,7 +527,7 @@ router.delete('/categories/:id', requireBranch, async (req, res) => {
 
     const { safeDelete } = await import('../middleware/safeDelete.js');
     const result = await safeDelete(Category, req.params.id, {
-      user: req.user, req, branch: req.branchId,
+      user: req.user, req, branch: req.branchScope,
       module: 'category', titleField: 'name', skipDependencyCheck: true,
     });
     res.status(result.status || 200).json(result);
@@ -564,7 +564,7 @@ router.delete('/subcategories/:id', requireBranch, async (req, res) => {
     if (productCount > 0) throw fail(400, `Cannot delete. ${productCount} product${productCount === 1 ? '' : 's'} use this subcategory.`);
     const { safeDelete } = await import('../middleware/safeDelete.js');
     const result = await safeDelete(Category, req.params.id, {
-      user: req.user, req, branch: req.branchId,
+      user: req.user, req, branch: req.branchScope,
       module: 'subcategory', titleField: 'name', skipDependencyCheck: true,
     });
     res.status(result.status || 200).json(result);

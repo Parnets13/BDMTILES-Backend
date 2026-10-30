@@ -23,7 +23,7 @@ router.get('/', requirePermission('task.management'), async (req, res) => {
   try {
     const { page = 1, limit = 20, search, status, priority, assignedTo } = req.query;
     const p = Math.max(1, parseInt(page)), l = Math.min(100, parseInt(limit) || 20);
-    const filter = { branch: req.branchId };
+    const filter = { branch: req.branchScope };
     if (search) { const r = new RegExp(search, 'i'); filter.$or = [{ title: r }, { taskNumber: r }, { description: r }]; }
     if (status) filter.status = status;
     if (priority) filter.priority = priority;
@@ -39,7 +39,7 @@ router.get('/', requirePermission('task.management'), async (req, res) => {
 
 router.get('/stats', requirePermission('task.management'), async (req, res) => {
   try {
-    const scope = { branch: req.branchId };
+    const scope = { branch: req.branchScope };
     const [total, pending, inProgress, completed, overdue] = await Promise.all([
       Task.countDocuments(scope), Task.countDocuments({ ...scope, status: 'pending' }),
       Task.countDocuments({ ...scope, status: 'in_progress' }), Task.countDocuments({ ...scope, status: 'completed' }),
@@ -51,7 +51,7 @@ router.get('/stats', requirePermission('task.management'), async (req, res) => {
 
 router.get('/my-tasks', async (req, res) => {
   try {
-    const tasks = await Task.find({ branch: req.branchId, assignedTo: req.user._id, status: { $in: ['pending','in_progress'] } })
+    const tasks = await Task.find({ branch: req.branchScope, assignedTo: req.user._id, status: { $in: ['pending','in_progress'] } })
       .sort({ priority: -1, dueDate: 1 }).populate('assignedBy','name').lean();
     res.json({ success: true, data: tasks });
   } catch (e) { res.status(500).json({ success: false, message: e.message }); }
@@ -64,7 +64,7 @@ router.post('/', requirePermission('task.management'), async (req, res) => {
     }
     const data = {
       ...req.body,
-      branch: req.branchId,
+      branch: req.branchScope,
       assignedBy: req.user._id,
       createdBy: req.user._id,
     };
@@ -78,7 +78,7 @@ router.post('/', requirePermission('task.management'), async (req, res) => {
 
 router.patch('/:id/status', async (req, res) => {
   try {
-    const existingTask = await Task.findOne({ _id: req.params.id, branch: req.branchId }).select('assignedTo').lean();
+    const existingTask = await Task.findOne({ _id: req.params.id, branch: req.branchScope }).select('assignedTo').lean();
     if (!existingTask) return res.status(404).json({ success: false, message: 'Not found.' });
     if (!userHasPermission(req.user, 'task.management') && !sameObjectId(existingTask.assignedTo, req.user._id)) {
       return res.status(403).json({ success: false, message: 'Access denied.' });
@@ -89,7 +89,7 @@ router.patch('/:id/status', async (req, res) => {
     if (status === 'in_progress') update.startedDate = new Date();
     if (status === 'completed') update.completedDate = new Date();
     const task = await Task.findOneAndUpdate(
-      { _id: req.params.id, branch: req.branchId },
+      { _id: req.params.id, branch: req.branchScope },
       update,
       { new: true, runValidators: true },
     );
@@ -99,7 +99,7 @@ router.patch('/:id/status', async (req, res) => {
 
 router.patch('/:id/comment', async (req, res) => {
   try {
-    const task = await Task.findOne({ _id: req.params.id, branch: req.branchId });
+    const task = await Task.findOne({ _id: req.params.id, branch: req.branchScope });
     if (!task) return res.status(404).json({ success: false, message: 'Not found.' });
     const canComment = userHasPermission(req.user, 'task.management')
       || sameObjectId(task.assignedTo, req.user._id)
@@ -118,7 +118,7 @@ router.delete('/:id', requirePermission('task.management'), async (req, res) => 
     const { safeDelete } = await import('../middleware/safeDelete.js');
     const result = await safeDelete(Task, req.params.id, {
       user: req.user,
-      branch: req.branchId,
+      branch: req.branchScope,
       module: 'task',
       titleField: 'title',
       codeField: 'taskNumber',

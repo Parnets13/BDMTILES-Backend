@@ -147,7 +147,7 @@ router.get('/', requirePermission('debit.note'), async (req, res) => {
     const { page = 1, limit = 20, search, status, supplier } = req.query;
     const p = Math.max(1, Number.parseInt(page, 10) || 1);
     const l = Math.min(100, Number.parseInt(limit, 10) || 20);
-    const filter = { branch: req.branchId };
+    const filter = { branch: req.branchScope };
     if (search) {
       const escaped = String(search).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
       const regex = new RegExp(escaped, 'i');
@@ -168,7 +168,7 @@ router.get('/', requirePermission('debit.note'), async (req, res) => {
 
 router.get('/stats', requirePermission('debit.note'), async (req, res) => {
   try {
-    const scope = { branch: req.branchId };
+    const scope = { branch: req.branchScope };
     const [total, draft, approved, debitIssued, cancelled, reversed, totalValue] = await Promise.all([
       PurchaseReturn.countDocuments(scope),
       PurchaseReturn.countDocuments({ ...scope, status: 'draft' }),
@@ -190,20 +190,20 @@ router.get('/stats', requirePermission('debit.note'), async (req, res) => {
 router.get('/grns-for-supplier/:supplierId', requirePermission('debit.note'), async (req, res) => {
   try {
     const invoices = await SupplierInvoice.find({
-      branch: req.branchId,
+      branch: req.branchScope,
       supplier: req.params.supplierId,
       status: { $in: ACTIVE_INVOICE_STATUSES },
     }).populate('items.product', 'productCode itemName tileSize images').sort({ invoiceDate: -1 }).limit(50).lean();
     const grnIds = [...new Set(invoices.flatMap((invoice) => (invoice.linkedGRNs || []).map(String)))];
     const grns = await GRN.find({
       _id: { $in: grnIds },
-      branch: req.branchId,
+      branch: req.branchScope,
       supplier: req.params.supplierId,
       status: 'posted',
     }).select('grnNumber grnDate poNumber items purchaseOrder').lean();
     const grnById = new Map(grns.map((grn) => [String(grn._id), grn]));
     const existing = await PurchaseReturn.find({
-      branch: req.branchId,
+      branch: req.branchScope,
       supplier: req.params.supplierId,
       status: { $nin: ['cancelled', 'reversed'] },
       supplierInvoice: { $in: invoices.map((invoice) => invoice._id) },
@@ -271,7 +271,7 @@ router.get('/grns-for-supplier/:supplierId', requirePermission('debit.note'), as
 
 router.get('/:id', requirePermission('debit.note'), async (req, res) => {
   try {
-    const purchaseReturn = await PurchaseReturn.findOne({ _id: req.params.id, branch: req.branchId })
+    const purchaseReturn = await PurchaseReturn.findOne({ _id: req.params.id, branch: req.branchScope })
       .populate('supplier', 'companyName supplierCode mobile')
       .populate('supplierInvoice', 'invoiceNumber invoiceDate status')
       .populate('purchaseOrder', 'poNumber poDate')
@@ -294,7 +294,7 @@ router.post('/', requirePermission('debit.note'), async (req, res) => {
   const sourceKey = `${String(req.branchId)}:${rawIdempotencyKey}`;
   const requestFingerprint = fingerprintRequest(req.body);
   try {
-    const existingReturn = await PurchaseReturn.findOne({ branch: req.branchId, sourceKey });
+    const existingReturn = await PurchaseReturn.findOne({ branch: req.branchScope, sourceKey });
     if (existingReturn) {
       if (existingReturn.requestFingerprint && existingReturn.requestFingerprint !== requestFingerprint) {
         throw routeError(409, 'This Idempotency-Key was already used with a different request payload.');
@@ -307,10 +307,10 @@ router.post('/', requirePermission('debit.note'), async (req, res) => {
       throw routeError(422, 'A posted GRN and verified supplier invoice are required.');
     }
     const [grn, supplierInvoice] = await Promise.all([
-      GRN.findOne({ _id: req.body.grn, branch: req.branchId, status: 'posted' }).lean(),
+      GRN.findOne({ _id: req.body.grn, branch: req.branchScope, status: 'posted' }).lean(),
       SupplierInvoice.findOne({
         _id: req.body.supplierInvoice,
-        branch: req.branchId,
+        branch: req.branchScope,
         supplier: supplier._id,
         status: { $in: ACTIVE_INVOICE_STATUSES },
       }).lean(),
@@ -324,7 +324,7 @@ router.post('/', requirePermission('debit.note'), async (req, res) => {
 
     const purchaseOrderId = req.body.purchaseOrder || grn.purchaseOrder;
     const purchaseOrder = purchaseOrderId
-      ? await PurchaseOrder.findOne({ _id: purchaseOrderId, branch: req.branchId, supplier: supplier._id }).lean()
+      ? await PurchaseOrder.findOne({ _id: purchaseOrderId, branch: req.branchScope, supplier: supplier._id }).lean()
       : null;
     if (!purchaseOrder || String(grn.purchaseOrder || '') !== String(purchaseOrder._id)) {
       throw routeError(422, 'Purchase order, GRN, and supplier lineage do not match. Exact PO lineage is required.');
@@ -332,7 +332,7 @@ router.post('/', requirePermission('debit.note'), async (req, res) => {
 
     const data = {
       ...req.body,
-      branch: req.branchId,
+      branch: req.branchScope,
       supplier: supplier._id,
       supplierName: supplier.companyName,
       supplierInvoice: supplierInvoice._id,
@@ -362,7 +362,7 @@ router.post('/', requirePermission('debit.note'), async (req, res) => {
     return res.status(201).json({ success: true, message: 'Purchase Return (Debit Note) created from the verified supplier invoice.', data: purchaseReturn });
   } catch (error) {
     if (error.code === 11000) {
-      const existingReturn = await PurchaseReturn.findOne({ branch: req.branchId, sourceKey });
+      const existingReturn = await PurchaseReturn.findOne({ branch: req.branchScope, sourceKey });
       if (existingReturn) {
         if (existingReturn.requestFingerprint && existingReturn.requestFingerprint !== requestFingerprint) {
           return res.status(409).json({ success: false, message: 'This Idempotency-Key was already used with a different request payload.' });
@@ -380,7 +380,7 @@ router.patch('/:id/approve', requirePermission('debit.note'), async (req, res) =
   try {
     let purchaseReturn;
     await session.withTransaction(async () => {
-      const current = await PurchaseReturn.findOne({ _id: req.params.id, branch: req.branchId }).session(session);
+      const current = await PurchaseReturn.findOne({ _id: req.params.id, branch: req.branchScope }).session(session);
       if (!current) throw routeError(404, 'Purchase Return not found.');
       if (current.status === 'debit_issued') {
         purchaseReturn = current;
@@ -392,14 +392,14 @@ router.patch('/:id/approve', requirePermission('debit.note'), async (req, res) =
       }
 
       const [grn, supplierInvoice, purchaseOrder] = await Promise.all([
-        GRN.findOne({ _id: current.grn, branch: req.branchId, supplier: current.supplier, status: 'posted' }).session(session).lean(),
+        GRN.findOne({ _id: current.grn, branch: req.branchScope, supplier: current.supplier, status: 'posted' }).session(session).lean(),
         SupplierInvoice.findOne({
           _id: current.supplierInvoice,
-          branch: req.branchId,
+          branch: req.branchScope,
           supplier: current.supplier,
           status: { $in: ACTIVE_INVOICE_STATUSES },
         }).session(session).lean(),
-        PurchaseOrder.findOne({ _id: current.purchaseOrder, branch: req.branchId, supplier: current.supplier }).session(session).lean(),
+        PurchaseOrder.findOne({ _id: current.purchaseOrder, branch: req.branchScope, supplier: current.supplier }).session(session).lean(),
       ]);
       if (!grn || !supplierInvoice || !purchaseOrder
         || String(grn.purchaseOrder || '') !== String(purchaseOrder._id)
@@ -429,7 +429,7 @@ router.patch('/:id/approve', requirePermission('debit.note'), async (req, res) =
       if (current.grandTotal > 0) {
         await postSubledgerEntry({
           session,
-          branch: req.branchId,
+          branch: req.branchScope,
           partyType: 'supplier',
           partyId: current.supplier,
           amount: current.grandTotal,
@@ -467,7 +467,7 @@ router.patch('/:id/reverse', requirePermission('debit.note'), async (req, res) =
   try {
     let purchaseReturn;
     await session.withTransaction(async () => {
-      const current = await PurchaseReturn.findOne({ _id: req.params.id, branch: req.branchId }).session(session);
+      const current = await PurchaseReturn.findOne({ _id: req.params.id, branch: req.branchScope }).session(session);
       if (!current) throw routeError(404, 'Purchase Return not found.');
       if (current.status === 'reversed') {
         purchaseReturn = current;
@@ -499,7 +499,7 @@ router.patch('/:id/reverse', requirePermission('debit.note'), async (req, res) =
       if (current.grandTotal > 0) {
         await postSubledgerEntry({
           session,
-          branch: req.branchId,
+          branch: req.branchScope,
           partyType: 'supplier',
           partyId: current.supplier,
           postingKey: `purchase-return:${current._id}:debit-note:reversal`,
@@ -532,12 +532,12 @@ router.patch('/:id/reverse', requirePermission('debit.note'), async (req, res) =
 router.patch('/:id/cancel', requirePermission('debit.note'), async (req, res) => {
   try {
     const purchaseReturn = await PurchaseReturn.findOneAndUpdate(
-      { _id: req.params.id, branch: req.branchId, status: 'draft' },
+      { _id: req.params.id, branch: req.branchScope, status: 'draft' },
       { $set: { status: 'cancelled' } },
       { new: true, runValidators: true }
     );
     if (purchaseReturn) return res.json({ success: true, message: 'Purchase Return cancelled.', data: purchaseReturn });
-    const current = await PurchaseReturn.findOne({ _id: req.params.id, branch: req.branchId });
+    const current = await PurchaseReturn.findOne({ _id: req.params.id, branch: req.branchScope });
     if (!current) return res.status(404).json({ success: false, message: 'Purchase Return not found.' });
     if (current.status === 'cancelled') return res.json({ success: true, message: 'Purchase Return is already cancelled.', data: current });
     return res.status(409).json({ success: false, message: `Cannot cancel a purchase return in ${current.status} status without reversal.` });

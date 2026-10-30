@@ -107,7 +107,7 @@ router.get('/', requireAnyPermission('po.management', 'po.approve'), async (req,
     const { page = 1, limit = 20, search, status, priority } = req.query;
     const p = Math.max(1, Number.parseInt(page, 10) || 1);
     const l = Math.min(100, Math.max(1, Number.parseInt(limit, 10) || 20));
-    const filter = { branch: req.branchId };
+    const filter = { branch: req.branchScope };
     if (search) {
       const escaped = String(search).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
       const regex = new RegExp(escaped, 'i');
@@ -126,7 +126,7 @@ router.get('/', requireAnyPermission('po.management', 'po.approve'), async (req,
 
 router.get('/stats', requireAnyPermission('po.management', 'po.approve'), async (req, res) => {
   try {
-    const scope = { branch: req.branchId };
+    const scope = { branch: req.branchScope };
     const [total, draft, submitted, approved, rejected, poCreated] = await Promise.all([
       PurchaseRequisition.countDocuments(scope),
       PurchaseRequisition.countDocuments({ ...scope, status: 'draft' }),
@@ -141,7 +141,7 @@ router.get('/stats', requireAnyPermission('po.management', 'po.approve'), async 
 
 router.get('/:id', requireAnyPermission('po.management', 'po.approve'), async (req, res) => {
   try {
-    const pr = await PurchaseRequisition.findOne({ _id: req.params.id, branch: req.branchId })
+    const pr = await PurchaseRequisition.findOne({ _id: req.params.id, branch: req.branchScope })
       .populate('warehouse', 'name warehouseCode').populate('linkedPO', 'poNumber status grandTotal').lean();
     if (!pr) throw purchaseError(404, 'Purchase requisition not found.');
     return res.json({ success: true, data: pr });
@@ -156,7 +156,7 @@ router.post('/', requirePermission('po.management'), async (req, res) => {
 
     let warehouseRecord = null;
     if (req.body.warehouse) [warehouseRecord] = await assertWarehousesInBranch([req.body.warehouse], req.branchId);
-    const items = await buildRequisitionItems({ branchId: req.branchId, items: req.body.items, warehouseRecord, source });
+    const items = await buildRequisitionItems({ branchId: req.branchScope, items: req.body.items, warehouseRecord, source });
     const prNumber = await generateBranchNumber(req.branchId, 'purchaseRequisition', req.body.requestDate || new Date());
     const session = await mongoose.startSession();
     let pr;
@@ -165,12 +165,12 @@ router.post('/', requirePermission('po.management'), async (req, res) => {
         if (source === 'reorder_suggestion') {
           // Serialize reorder PR creation per branch so concurrent/stale clients cannot both pass the open-PR check.
           await BranchSettings.findOneAndUpdate(
-            { branch: req.branchId },
-            { $inc: { reorderGuardVersion: 1 }, $setOnInsert: { branch: req.branchId, createdBy: req.user._id } },
+            { branch: req.branchScope },
+            { $inc: { reorderGuardVersion: 1 }, $setOnInsert: { branch: req.branchScope, createdBy: req.user._id } },
             { upsert: true, new: true, session, setDefaultsOnInsert: true }
           );
           const existing = await PurchaseRequisition.findOne({
-            branch: req.branchId,
+            branch: req.branchScope,
             warehouse: warehouseRecord._id,
             status: { $in: ['draft', 'submitted', 'approved'] },
             items: { $elemMatch: { product: { $in: productIds } } },
@@ -183,7 +183,7 @@ router.post('/', requirePermission('po.management'), async (req, res) => {
         }
         [pr] = await PurchaseRequisition.create([{
           prNumber,
-          branch: req.branchId,
+          branch: req.branchScope,
           requestDate: req.body.requestDate || new Date(),
           requiredByDate: req.body.requiredByDate || undefined,
           requestedBy: req.user._id,
@@ -214,7 +214,7 @@ router.patch('/:id', requirePermission('po.management'), async (req, res) => {
   try {
     let pr;
     await session.withTransaction(async () => {
-      const current = await PurchaseRequisition.findOne({ _id: req.params.id, branch: req.branchId }).session(session);
+      const current = await PurchaseRequisition.findOne({ _id: req.params.id, branch: req.branchScope }).session(session);
       if (!current) throw purchaseError(404, 'Purchase requisition not found.');
       if (current.status !== 'draft') throw purchaseError(409, `Only a draft purchase requisition can be edited. Current status: ${current.status}.`);
 
@@ -224,7 +224,7 @@ router.patch('/:id', requirePermission('po.management'), async (req, res) => {
       if (source === 'reorder_suggestion' && !nextWarehouse) throw purchaseError(422, 'A receiving warehouse is required for a stock-suggestion requisition.');
       if (nextWarehouse) [warehouseRecord] = await assertWarehousesInBranch([nextWarehouse], req.branchId, { session });
 
-      const items = await buildRequisitionItems({ branchId: req.branchId, items: req.body.items, warehouseRecord, source });
+      const items = await buildRequisitionItems({ branchId: req.branchScope, items: req.body.items, warehouseRecord, source });
 
       // Preserve the reorder open-PR guard: a draft cannot be edited to cover
       // products already claimed by another open requisition in the same warehouse.
@@ -232,7 +232,7 @@ router.patch('/:id', requirePermission('po.management'), async (req, res) => {
         const productIds = items.map(item => item.product);
         const existing = await PurchaseRequisition.findOne({
           _id: { $ne: current._id },
-          branch: req.branchId,
+          branch: req.branchScope,
           warehouse: warehouseRecord._id,
           status: { $in: ['draft', 'submitted', 'approved'] },
           items: { $elemMatch: { product: { $in: productIds } } },
@@ -264,7 +264,7 @@ router.patch('/:id', requirePermission('po.management'), async (req, res) => {
 // Cancel/delete a draft PR (recycle-bin soft delete). Only drafts can be removed.
 router.delete('/:id', requirePermission('po.management'), async (req, res) => {
   try {
-    const current = await PurchaseRequisition.findOne({ _id: req.params.id, branch: req.branchId }).select('status prNumber').lean();
+    const current = await PurchaseRequisition.findOne({ _id: req.params.id, branch: req.branchScope }).select('status prNumber').lean();
     if (!current) throw purchaseError(404, 'Purchase requisition not found.');
     if (current.status !== 'draft') throw purchaseError(409, `Only a draft purchase requisition can be deleted. Current status: ${current.status}.`);
     const { safeDelete } = await import('../middleware/safeDelete.js');
@@ -278,7 +278,7 @@ router.delete('/:id', requirePermission('po.management'), async (req, res) => {
 router.patch('/:id/submit', requirePermission('po.management'), async (req, res) => {
   try {
     const pr = await PurchaseRequisition.findOneAndUpdate(
-      { _id: req.params.id, branch: req.branchId, status: 'draft' },
+      { _id: req.params.id, branch: req.branchScope, status: 'draft' },
       { $set: { status: 'submitted' } },
       { new: true, runValidators: true }
     );
@@ -290,7 +290,7 @@ router.patch('/:id/submit', requirePermission('po.management'), async (req, res)
 router.patch('/:id/approve', requirePermission('po.approve'), async (req, res) => {
   try {
     const pr = await PurchaseRequisition.findOneAndUpdate(
-      { _id: req.params.id, branch: req.branchId, status: 'submitted' },
+      { _id: req.params.id, branch: req.branchScope, status: 'submitted' },
       { $set: { status: 'approved', approvedBy: req.user._id, approvalNotes: String(req.body.notes || ''), approvalDate: new Date() } },
       { new: true, runValidators: true }
     );
@@ -302,7 +302,7 @@ router.patch('/:id/approve', requirePermission('po.approve'), async (req, res) =
 router.patch('/:id/reject', requirePermission('po.approve'), async (req, res) => {
   try {
     const pr = await PurchaseRequisition.findOneAndUpdate(
-      { _id: req.params.id, branch: req.branchId, status: 'submitted' },
+      { _id: req.params.id, branch: req.branchScope, status: 'submitted' },
       { $set: { status: 'rejected', approvedBy: req.user._id, approvalNotes: String(req.body.notes || ''), approvalDate: new Date() } },
       { new: true, runValidators: true }
     );
