@@ -126,7 +126,7 @@ router.post('/', requirePermission('incentive.rules.manage'), async (req, res) =
     const period = payload.period || req.body.period || 'monthly';
     const rule = await Incentive.create({
       ...payload,
-      branch: req.branchScope,
+      branch: req.branchId,
       applicableTo: 'sales_executive',
       incentiveType: 'target',
       period,

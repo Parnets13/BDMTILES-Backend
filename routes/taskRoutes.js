@@ -64,7 +64,7 @@ router.post('/', requirePermission('task.management'), async (req, res) => {
     }
     const data = {
       ...req.body,
-      branch: req.branchScope,
+      branch: req.branchId,
       assignedBy: req.user._id,
       createdBy: req.user._id,
     };

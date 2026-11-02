@@ -184,7 +184,7 @@ router.post('/evidence', requireAnyPermission('complaint.management', 'warehouse
     if (!req.files?.length) return res.status(400).json({ success: false, message: 'At least one evidence image is required.' });
     try {
       const documents = await ComplaintEvidence.insertMany(req.files.map((file) => ({
-        branch: req.branchScope,
+        branch: req.branchId,
         uploadedBy: req.user._id,
         url: `/uploads/complaints/${file.filename}`,
         originalName: file.originalname,
@@ -252,7 +252,7 @@ router.post('/', requirePermission('complaint.management'), async (req, res) => 
       : [];
     if (rawComplaintPhotos.length > 10) throw routeError(422, 'A complaint can include at most 10 evidence images.');
     const data = {
-      branch: req.branchScope,
+      branch: req.branchId,
       dealer: req.body.dealer,
       salesOrder: req.body.salesOrder,
       invoice: req.body.invoice,

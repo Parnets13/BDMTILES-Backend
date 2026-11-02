@@ -232,7 +232,7 @@ router.put('/settings/:module', async (req, res) => {
       { branch: req.branchScope, module: req.params.module },
       {
         $set: { ...pick(req.body, SETTINGS_WRITE_FIELDS), updatedBy: req.user._id },
-        $setOnInsert: { branch: req.branchScope, module: req.params.module },
+        $setOnInsert: { branch: req.branchId, module: req.params.module },
       },
       { upsert: true, new: true, setDefaultsOnInsert: true, runValidators: true }
     );
@@ -267,7 +267,7 @@ router.post('/settings/initialize', async (req, res) => {
     for (const [module, moduleName] of modules) {
       const result = await NotificationSettings.updateOne(
         { branch: req.branchScope, module },
-        { $setOnInsert: { branch: req.branchScope, module, moduleName, isEnabled: true, events: defaultEvents[module] || [], updatedBy: req.user._id } },
+        { $setOnInsert: { branch: req.branchId, module, moduleName, isEnabled: true, events: defaultEvents[module] || [], updatedBy: req.user._id } },
         { upsert: true, runValidators: true }
       );
       if (result.upsertedCount) created += 1;

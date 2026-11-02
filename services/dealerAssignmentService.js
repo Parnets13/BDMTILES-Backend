@@ -16,10 +16,24 @@ const error = (status, message, code, extra = {}) =>
 
 const nameOf = user => user?.name || '';
 
+/**
+ * Who may hold dealers.
+ *
+ * Kept here so the picker and the write validation cannot drift apart — a UI that
+ * offers somebody the save rejects is exactly how "error while assigning" appears.
+ * Marketing/sales managers cover dealers too, not only the `sales_executive` role.
+ */
+export const ASSIGNABLE_EXECUTIVE_ROLES = ['sales_executive', 'sales_manager'];
+
+export const assignableExecutiveFilter = ({ activeOnly = false } = {}) => ({
+  role: { $in: ASSIGNABLE_EXECUTIVE_ROLES },
+  ...(activeOnly ? { status: 'Active' } : {}),
+});
+
 /** The only users a dealer may be assigned to. */
 export async function findAssignableExecutive(id, session = null) {
   if (!mongoose.isValidObjectId(id)) throw error(422, 'Select a valid Sales Executive.', 'SE_INVALID');
-  let query = User.findOne({ _id: id, role: 'sales_executive', status: 'Active' }).select('_id name');
+  let query = User.findOne({ ...assignableExecutiveFilter({ activeOnly: true }), _id: id }).select('_id name');
   if (session) query = query.session(session);
   const found = await query.lean();
   if (!found) throw error(422, 'The selected user is not an active Sales Executive.', 'SE_NOT_ASSIGNABLE');
@@ -133,7 +147,7 @@ export async function assignmentSummary() {
       { $match: { assignedSalesExecutive: { $ne: null } } },
       { $group: { _id: '$assignedSalesExecutive', count: { $sum: 1 } } },
     ]),
-    User.find({ role: 'sales_executive' }).select('_id name status').lean(),
+    User.find(assignableExecutiveFilter()).select('_id name status').lean(),
   ]);
 
   const countById = new Map(perExecutive.map(row => [String(row._id), row.count]));

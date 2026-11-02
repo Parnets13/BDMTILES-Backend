@@ -104,7 +104,7 @@ router.post('/', async (req, res) => {
     // Compatibility dispatches always begin in planning. Identity fields are
     // allow-listed here so callers cannot forge an executive or bypass status.
     const data = {
-      branch: req.branchScope,
+      branch: req.branchId,
       dispatchDate: req.body.dispatchDate,
       route: req.body.route,
       routeName: req.body.routeName,
@@ -120,7 +120,7 @@ router.post('/', async (req, res) => {
         vehicleId: req.body.vehicleRef || undefined,
         vehicleNumber: req.body.vehicleRef ? undefined : req.body.vehicle,
         allowBusy: true,
-        branchId: req.branchScope,
+        branchId: req.branchId,
       });
       data.vehicleRef = vehicle._id;
       data.vehicle = vehicle.vehicleNumber;
@@ -167,7 +167,7 @@ router.patch('/:id/status', async (req, res) => {
         vehicleNumber: req.body.vehicleRef ? undefined : req.body.vehicle,
         // A Dispatch is not a DispatchTrip, so it does not hold a trip slot.
         allowBusy: true,
-        branchId: req.branchScope,
+        branchId: req.branchId,
       });
       updates.vehicleRef = vehicle._id;
       updates.vehicle = vehicle.vehicleNumber;

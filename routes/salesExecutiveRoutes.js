@@ -445,7 +445,7 @@ router.post('/me/attendance/punch-in', requirePermission('se.attendance.view'), 
       return res.status(422).json({ success: false, message: 'You are past the grace period. A late-entry reason is required.', code: 'LATE_REASON_REQUIRED', lateMinutes });
     }
 
-    if (!record) record = new Attendance({ branch: req.branchScope, employee: employee._id, date: today });
+    if (!record) record = new Attendance({ branch: req.branchId, employee: employee._id, date: today });
     record.punchIn = punchInAt;
     record.punchInLocation = location;
     if (selfie) record.punchInSelfie = selfie;

@@ -335,7 +335,7 @@ router.post('/apply-bulk', requirePermission('dealer.discounts'), async (req, re
       const applyAt = new Date(body.applyAt);
       if (Number.isNaN(applyAt.getTime()) || applyAt <= new Date()) throw routeError(422, 'A future applyAt is required when applyImmediately is false.');
       const schedule = await DealerPricingSchedule.create({
-        branch: req.branchScope, ...targetFields(preview.target), scope: preview.target.scope,
+        branch: req.branchId, ...targetFields(preview.target), scope: preview.target.scope,
         products: preview.rows.map((row) => row.product),
         expectedRates: preview.rows.map((row) => ({ product: row.product, oldRate: row.oldRate, newRate: row.newRate })),
         filters: { search: body.search, brand: body.brand, category: body.category, subcategory: body.subcategory },
@@ -479,7 +479,7 @@ router.post('/', requirePermission('dealer.discounts'), async (req, res) => {
       const filter = targetFilter(req.branchId, target, product._id);
       pricing = await DealerPricing.findOne(filter).session(session);
       before = pricing ? snapshot(pricing) : null;
-      if (!pricing) pricing = new DealerPricing({ branch: req.branchScope, product: product._id, createdBy: req.user._id });
+      if (!pricing) pricing = new DealerPricing({ branch: req.branchId, product: product._id, createdBy: req.user._id });
       const editable = ['customRate', 'discountPercent', 'discountFlat', 'schemeDiscount', 'minQty', 'slabs', 'validFrom', 'validTo', 'isActive', 'remarks'];
       Object.assign(pricing, Object.fromEntries(editable.filter((key) => Object.hasOwn(req.body, key)).map((key) => [key, req.body[key]])));
       Object.assign(pricing, targetFields(target), {
@@ -495,7 +495,7 @@ router.post('/', requirePermission('dealer.discounts'), async (req, res) => {
       if (resolved.belowMinimum) throw routeError(422, `Effective rate ${resolved.effectiveRate} is below minimum selling rate ${resolved.minimumSellingRate}.`);
       await pricing.save({ session });
       await historyEntry({
-        branch: req.branchScope, pricing: pricing._id, action: before ? 'update' : 'create', target,
+        branch: req.branchId, pricing: pricing._id, action: before ? 'update' : 'create', target,
         product: product._id, before, after: snapshot(pricing), reason: auditReason,
         notes: req.body.notes, user: req.user._id, session,
       });
@@ -539,7 +539,7 @@ router.put('/:id', requirePermission('dealer.discounts'), async (req, res) => {
       }
       await pricing.save({ session });
       const action = Object.hasOwn(req.body, 'isActive') && Object.keys(req.body).every((key) => ['isActive', 'reason', 'notes'].includes(key)) ? 'toggle' : 'update';
-      await historyEntry({ branch: req.branchScope, pricing: pricing._id, action, target, product: product._id, before, after: snapshot(pricing), reason: auditReason, notes: req.body.notes, user: req.user._id, session });
+      await historyEntry({ branch: req.branchId, pricing: pricing._id, action, target, product: product._id, before, after: snapshot(pricing), reason: auditReason, notes: req.body.notes, user: req.user._id, session });
     });
     return res.json({ success: true, message: 'Pricing override updated.', data: pricing });
   } catch (error) { return sendError(res, error); }
@@ -557,7 +557,7 @@ router.delete('/:id', requirePermission('dealer.discounts'), async (req, res) =>
       pricing.isActive = false; pricing.updatedBy = req.user._id;
       await pricing.save({ session });
       const target = parseTarget({ scope: pricing.scope || 'dealer', dealer: pricing.dealer || pricing.customerId, dealerType: pricing.dealerType });
-      await historyEntry({ branch: req.branchScope, pricing: pricing._id, action: 'toggle', target, product: pricing.product, before, after: snapshot(pricing), reason: req.body?.reason || 'Deactivated', notes: req.body?.notes, user: req.user._id, session });
+      await historyEntry({ branch: req.branchId, pricing: pricing._id, action: 'toggle', target, product: pricing.product, before, after: snapshot(pricing), reason: req.body?.reason || 'Deactivated', notes: req.body?.notes, user: req.user._id, session });
     });
     return res.json({ success: true, message: 'Pricing override deactivated.', data: pricing });
   } catch (error) { return sendError(res, error); }

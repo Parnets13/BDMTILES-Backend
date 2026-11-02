@@ -508,7 +508,7 @@ router.post('/', requirePermission('payment'), async (req, res) => {
   try {
     let payment;
     await session.withTransaction(async () => {
-      const validated = await validatePaymentData({ ...req.body, branch: req.branchScope }, session);
+      const validated = await validatePaymentData({ ...req.body, branch: req.branchId }, session);
       const paymentNumber = await generateBranchNumber(req.branchId, 'payment', req.body.paymentDate || new Date(), { session });
       const data = {
         ...req.body,

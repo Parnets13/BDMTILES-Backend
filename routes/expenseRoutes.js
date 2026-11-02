@@ -76,7 +76,7 @@ router.get('/:id', requirePermission('expense.management'), async (req, res) => 
 // POST /api/v1/expenses
 router.post('/', requirePermission('expense.management'), async (req, res) => {
   try {
-    const data = { ...req.body, branch: req.branchScope, createdBy: req.user._id };
+    const data = { ...req.body, branch: req.branchId, createdBy: req.user._id };
     data.expenseNumber = await generateBranchNumber(req.branchId, 'expense', data.expenseDate || new Date());
     if (data.employee) {
       const emp = await Employee.findById(data.employee).lean();

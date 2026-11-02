@@ -105,7 +105,7 @@ router.post('/', async (req, res) => {
       });
       const returnNumber = await generateBranchNumber(req.branchId, 'dispatchReturn', new Date(), { session });
       [created] = await DispatchReturn.create([{
-        returnNumber, branch: req.branchScope, delivery: delivery._id, dispatchTrip: delivery.dispatchTrip,
+        returnNumber, branch: req.branchId, delivery: delivery._id, dispatchTrip: delivery.dispatchTrip,
         salesOrder: delivery.salesOrder, items, reason, requestedBy: req.user._id, requestedAt: new Date(), status: 'requested',
       }], { session });
       await refreshDeliveryRecoveryStates(delivery, session);

@@ -368,7 +368,7 @@ router.get('/:id', requirePermission('dealer.discounts'), async (req, res) => {
 // ══════════════════════════════════════════════════════
 router.post('/', requirePermission('dealer.discounts'), async (req, res) => {
   try {
-    const data = { ...req.body, branch: req.branchScope, createdBy: req.user._id };
+    const data = { ...req.body, branch: req.branchId, createdBy: req.user._id };
 
     // Auto-generate ruleCode if not provided
     if (!data.ruleCode) {

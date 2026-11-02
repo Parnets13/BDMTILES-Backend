@@ -120,6 +120,7 @@ router.get('/ready-orders', async (req, res) => {
 router.post('/', async (req, res) => {
   const claimedPickListIds = [];
   let tripId = null;
+  let tripBranchId = null;
   try {
     const requestedPickListIds = Array.isArray(req.body.pickListIds) ? [...new Set(req.body.pickListIds.map(String))] : [];
     const requestedPickListNumbers = Array.isArray(req.body.orders)
@@ -142,6 +143,15 @@ router.post('/', async (req, res) => {
     if (new Set(salesOrderIds).size !== salesOrderIds.length) {
       return res.status(422).json({ success: false, message: 'Use only one pick list per Sales Order in a dispatch trip.' });
     }
+
+    // A dispatch trip is a branch document: every pick list must belong to the same
+    // branch, and that branch becomes the trip's branch. The header filter only decides
+    // what you see, not which branch owns the new record.
+    const pickListBranchIds = [...new Set(pickLists.map(pl => String(pl.branch)))];
+    if (pickListBranchIds.length !== 1) {
+      return res.status(422).json({ success: false, message: 'All pick lists must belong to the same branch.' });
+    }
+    tripBranchId = pickListBranchIds[0];
 
     const orders = pickLists.map((pickList, index) => {
       const unresolvedSortingItem = (pickList.items || []).find(item => item.sortingVerifiedAt
@@ -190,14 +200,14 @@ router.post('/', async (req, res) => {
       vehicleNumber: req.body.vehicleNumber,
       totalBoxes: tripBoxes,
       totalWeight: tripWeight,
-      branchId: req.branchScope,
+      branchId: tripBranchId,
     });
 
     tripId = new mongoose.Types.ObjectId();
-    const tripNumber = await generateBranchNumber(req.branchId, 'dispatchTrip', new Date());
+    const tripNumber = await generateBranchNumber(tripBranchId, 'dispatchTrip', new Date());
     for (const pickList of pickLists) {
       const claim = await PickList.updateOne(
-        { _id: pickList._id, branch: req.branchScope, status: 'ready_for_dispatch', stockConsumedAt: null, dispatchTrip: null, cancellationProcessing: { $ne: true } },
+        { _id: pickList._id, branch: tripBranchId, status: 'ready_for_dispatch', stockConsumedAt: null, dispatchTrip: null, cancellationProcessing: { $ne: true } },
         { $set: { dispatchTrip: tripId, dispatchTripNumber: tripNumber, tripClaimedAt: new Date() } }
       );
       if (claim.modifiedCount !== 1) {
@@ -211,7 +221,7 @@ router.post('/', async (req, res) => {
     const trip = await DispatchTrip.create({
       _id: tripId,
       tripNumber,
-      branch: req.branchScope,
+      branch: tripBranchId,
       // Vehicle fields come from the master record, not the request body, so the
       // trip can never disagree with Vehicle Master.
       ...vehicleSnapshot(assignedVehicle),
@@ -239,10 +249,9 @@ router.post('/', async (req, res) => {
     });
   } catch (e) {
     if (tripId && claimedPickListIds.length) {
-      await PickList.updateMany(
-        { _id: { $in: claimedPickListIds }, branch: req.branchScope, dispatchTrip: tripId, stockConsumedAt: null },
-        { $unset: { dispatchTrip: 1, tripClaimedAt: 1 }, $set: { dispatchTripNumber: '' } }
-      );
+      const rollbackFilter = { _id: { $in: claimedPickListIds }, dispatchTrip: tripId, stockConsumedAt: null };
+      if (tripBranchId) rollbackFilter.branch = tripBranchId;
+      await PickList.updateMany(rollbackFilter, { $unset: { dispatchTrip: 1, tripClaimedAt: 1 }, $set: { dispatchTripNumber: '' } });
     }
     const status = e.status || (e.name === 'CastError' || e.name === 'ValidationError' ? 400 : e.code === 11000 ? 409 : 500);
     res.status(status).json({ success: false, message: e.code === 11000 ? 'Trip creation conflicted with another request. Refresh and retry.' : e.message });
@@ -420,7 +429,7 @@ router.patch('/:id/dispatch', async (req, res) => {
       const { vehicle: dispatchVehicle } = await resolveVehicleForAssignment({
         vehicleId: current.vehicle,
         excludeTripId: current._id,
-        branchId: req.branchScope,
+        branchId: current.branch,
         session,
       });
 
@@ -526,7 +535,7 @@ router.patch('/:id/dispatch', async (req, res) => {
           const existing = requirements.get(key);
           if (existing) existing.quantity += quantity;
           else requirements.set(key, {
-            branch: req.branchScope,
+            branch: lockedTrip.branch,
             product: item.product,
             warehouse: item.warehouse,
             shade: item.shade || '',
@@ -549,7 +558,7 @@ router.patch('/:id/dispatch', async (req, res) => {
             operationKey: stockOperationKey('dispatch-trip', lockedTrip._id, pickList._id, item._id, 'consume'),
             correlationKey: stockOperationKey('dispatch-trip', lockedTrip._id),
             movementType: 'sales_dispatch', phase: 'dispatched',
-            branch: req.branchScope, product: item.product, warehouse: item.warehouse, shade: item.shade || '', batch: item.batch || '',
+            branch: lockedTrip.branch, product: item.product, warehouse: item.warehouse, shade: item.shade || '', batch: item.batch || '',
             deltas: { reservedQty: -baseQuantity, totalQty: -baseQuantity },
             stockSet: { lastSaleDate: stockConsumedAt },
             enteredQuantity: quantity, ...snapshot, baseQuantity,
@@ -612,10 +621,10 @@ router.patch('/:id/dispatch', async (req, res) => {
 
         let delivery = await Delivery.findOne({ branch: req.branchScope, dispatchTrip: lockedTrip._id, salesOrder: salesOrder._id }).session(session);
         if (!delivery) {
-          const deliveryNumber = await generateBranchNumber(req.branchId, 'delivery', new Date());
+          const deliveryNumber = await generateBranchNumber(lockedTrip.branch, 'delivery', new Date());
           [delivery] = await Delivery.create([{
             deliveryNumber,
-            branch: req.branchScope,
+            branch: lockedTrip.branch,
             salesOrder: salesOrder._id,
             orderNumber: order.orderNumber,
             dispatchTrip: lockedTrip._id,
@@ -692,7 +701,7 @@ router.patch('/:id/cancel', async (req, res) => {
       const pickListIds = trip.orders.map(order => order.pickList).filter(Boolean);
       if (pickListIds.length) {
         await PickList.updateMany(
-          { _id: { $in: pickListIds }, branch: req.branchScope, dispatchTrip: trip._id, stockConsumedAt: null },
+          { _id: { $in: pickListIds }, branch: trip.branch, dispatchTrip: trip._id, stockConsumedAt: null },
           { $unset: { dispatchTrip: 1, tripClaimedAt: 1 }, $set: { dispatchTripNumber: '', stockConsumptionProcessing: false } }
         );
       }

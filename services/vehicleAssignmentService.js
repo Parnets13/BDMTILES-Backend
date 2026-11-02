@@ -1,7 +1,6 @@
 import mongoose from 'mongoose';
 import Vehicle from '../models/Vehicle.js';
 import DispatchTrip from '../models/DispatchTrip.js';
-import {userCanAccessBranch} from '../utils/branchScope.js';
 
 /**
  * Resolving a vehicle for a dispatch assignment.
@@ -27,22 +26,6 @@ const startOfToday = () => {
   return now;
 };
 
-/**
- * Whether the vehicle's linked executive may operate in this branch.
- *
- * Uses the same rule as the rest of the system — `userCanAccessBranch`, which honours
- * the global roles — and additionally accepts `defaultBranch`.
- *
- * The previous check read `assignedBranches` alone. That rejected an executive whose
- * profile carries only a default branch, even though `dealerAssignmentService` treats
- * exactly that as their branch, so the app accepted them everywhere except here.
- */
-const executiveCoversBranch = (executive, branchId) => {
-  if (!branchId) return true;
-  if (userCanAccessBranch(executive, branchId)) return true;
-  const own = String(executive.defaultBranch?._id || executive.defaultBranch || '');
-  return Boolean(own) && own === String(branchId);
-};
 
 const expiryProblems = (vehicle) => {
   const today = startOfToday();
@@ -151,13 +134,11 @@ export async function resolveVehicleForAssignment({
         'VEHICLE_EXECUTIVE_UNAVAILABLE',
       );
     }
-    if (!executiveCoversBranch(executive, branchId)) {
-      throw conflict(
-        409,
-        `${vehicle.vehicleNumber}'s linked executive${who} is not assigned to the active branch. Add this branch to their profile, or clear the executive on the vehicle.`,
-        'VEHICLE_EXECUTIVE_UNAVAILABLE',
-      );
-    }
+    // Branch coverage is intentionally NOT checked here. A vehicle is a global
+    // master record — a truck and its driver can operate from any branch. The
+    // trip's branch comes from the pick lists, not the vehicle, so requiring the
+    // driver to be "assigned" to that branch only blocks legitimate dispatches
+    // when a driver covers multiple branches or is temporarily reassigned.
   }
 
   const expired = expiryProblems(vehicle);

@@ -173,7 +173,7 @@ router.post('/', async (req, res) => {
     const deliveryNumber = await generateBranchNumber(req.branchId, 'delivery', new Date());
     const delivery = await Delivery.create({
       deliveryNumber,
-      branch: req.branchScope,
+      branch: req.branchId,
       salesOrder: salesOrder._id,
       orderNumber: tripOrder.orderNumber || salesOrder.orderNumber,
       dispatchTrip: trip._id,

@@ -5,6 +5,7 @@ import BranchSettings from '../models/BranchSettings.js';
 import BranchSequence from '../models/BranchSequence.js';
 import User from '../models/User.js';
 import Warehouse from '../models/Warehouse.js';
+import Company from '../models/Company.js';
 import { protect, requirePermission } from '../middleware/auth.js';
 import {
   branchAccessFilter,
@@ -30,6 +31,24 @@ const validBranchId = (req, res) => {
   return true;
 };
 
+/**
+ * A branch can be linked to several companies. Accepts ids only, de-duplicates
+ * them and rejects any that do not exist, so a stale selection cannot be saved.
+ * Returns `undefined` when the field was not part of the payload.
+ */
+const resolveCompanyIds = async (value) => {
+  if (value === undefined) return undefined;
+  const ids = [...new Set((Array.isArray(value) ? value : [])
+    .filter((id) => id && mongoose.isValidObjectId(id))
+    .map((id) => String(id)))];
+  if (!ids.length) return [];
+  const existing = await Company.countDocuments({ _id: { $in: ids } });
+  if (existing !== ids.length) {
+    throw Object.assign(new Error('One or more selected companies no longer exist.'), { status: 422 });
+  }
+  return ids;
+};
+
 router.use(protect);
 router.use(requirePermission('branch.master'));
 
@@ -47,10 +66,17 @@ router.get('/', async (req, res) => {
     if (!hasGlobalBranchAccess(req.user)) {
       filter._id = { $in: (req.user.assignedBranches || []).map((branch) => branch._id || branch) };
     }
+    // A company selection narrows the branch master as well, so switching company
+    // does not leave other companies' branches in the list. Already intersected
+    // with the user's assigned branches by resolveBranchContext.
+    if (req.companyBranchIds) {
+      filter._id = { $in: req.companyBranchIds };
+    }
 
     const [branches, total] = await Promise.all([
       Branch.find(filter).sort({ name: 1 }).skip((p - 1) * l).limit(l)
-        .populate('defaultWarehouse', 'warehouseCode name status').lean(),
+        .populate('defaultWarehouse', 'warehouseCode name status')
+        .populate('companies', 'legalName tradeName gstin status').lean(),
       Branch.countDocuments(filter),
     ]);
     return res.json({
@@ -80,8 +106,12 @@ router.get('/:id', async (req, res) => {
   try {
     if (!validBranchId(req, res)) return undefined;
     const branch = await Branch.findOne(branchAccessFilter(req.user, { _id: req.params.id }))
-      .populate('defaultWarehouse', 'warehouseCode name status').lean();
+      .populate('defaultWarehouse', 'warehouseCode name status')
+      .populate('companies', 'legalName tradeName gstin status').lean();
     if (!branch) return res.status(404).json({ success: false, message: 'Branch not found.' });
+    if (req.companyBranchIds && !req.companyBranchIds.includes(String(branch._id))) {
+      return res.status(404).json({ success: false, message: 'Branch not found.' });
+    }
     const settings = await BranchSettings.findOne({ branch: branch._id }).lean();
     return res.json({ success: true, data: { ...branch, settings } });
   } catch (error) {
@@ -95,11 +125,13 @@ router.post('/', requireGlobalBranchAccess, async (req, res) => {
     if (req.body.defaultWarehouse) {
       return res.status(422).json({ success: false, message: 'Create the branch before assigning its default warehouse.' });
     }
+    const companyIds = await resolveCompanyIds(req.body.companies);
     let branch;
     await session.withTransaction(async () => {
-      const { settings, defaultWarehouse, ...input } = req.body;
+      const { settings, defaultWarehouse, companies, ...input } = req.body;
       [branch] = await Branch.create([{
         ...input,
+        companies: companyIds || [],
         defaultWarehouse: undefined,
         createdBy: req.user._id,
         updatedBy: req.user._id,
@@ -155,11 +187,13 @@ router.put('/:id', requireGlobalBranchAccess, async (req, res) => {
   if (!validBranchId(req, res)) return undefined;
   const session = await mongoose.startSession();
   try {
+    const companyIds = await resolveCompanyIds(req.body.companies);
     let updatedBranch;
     await session.withTransaction(async () => {
       const current = await Branch.findById(req.params.id).session(session);
       if (!current) throw Object.assign(new Error('Branch not found.'), { status: 404 });
-      const { settings, branch, createdBy, ...updates } = req.body;
+      const { settings, branch, createdBy, companies, ...updates } = req.body;
+      if (companyIds !== undefined) updates.companies = companyIds;
       const isDeactivating = current.status === 'active' && updates.status === 'inactive';
       const isReactivating = current.status === 'inactive' && updates.status === 'active';
 

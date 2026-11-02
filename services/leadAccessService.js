@@ -16,7 +16,7 @@ export const getLeadRecordPredicate = async (req, resourceKey = '*') => {
 };
 
 export const getLeadCreateScope = (req) => ({
-  branch: req.branchScope,
+  branch: req.branchId,
   createdBy: req.user._id,
   createdByName: req.user.name,
 });

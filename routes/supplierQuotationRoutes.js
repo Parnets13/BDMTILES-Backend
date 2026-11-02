@@ -162,7 +162,7 @@ router.post('/', requirePermission('po.management'), async (req, res) => {
     const offers = await normalizeOffers({ offers: req.body.offers, requisition: pr });
     const quotation = await SupplierQuotation.create({
       quotationNumber: await generateBranchNumber(req.branchId, 'supplierQuotation', new Date()),
-      branch: req.branchScope,
+      branch: req.branchId,
       purchaseRequisition: pr._id,
       prNumber: pr.prNumber,
       warehouse,

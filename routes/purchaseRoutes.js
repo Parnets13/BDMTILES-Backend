@@ -428,7 +428,7 @@ router.post('/grn', requirePermission('grn.entry'), async (req, res) => {
 
       [result] = await GRN.create([{
         grnNumber,
-        branch: req.branchScope,
+        branch: req.branchId,
         grnDate,
         sourceKey,
         requestFingerprint,

@@ -107,7 +107,7 @@ router.patch('/settings', requirePermission('lead.assign'), asyncRoute(async (re
   }
   const settings = await LeadOperationsSetting.findOneAndUpdate(
     { branch: req.branchScope },
-    { $set: { acceptanceDeadlineMinutes, maxActiveLeads, updatedBy: req.user._id }, $setOnInsert: { branch: req.branchScope } },
+    { $set: { acceptanceDeadlineMinutes, maxActiveLeads, updatedBy: req.user._id }, $setOnInsert: { branch: req.branchId } },
     { upsert: true, new: true, runValidators: true }
   );
   res.json({ success: true, message: 'Lead operation settings saved.', data: settings });
@@ -130,7 +130,7 @@ router.patch('/availability/me', requireAnyPermission('lead.app', 'lead.respond'
   const now = new Date();
   const availability = await LeadExecutiveAvailability.findOneAndUpdate(
     { branch: req.branchScope, user: req.user._id },
-    { $set: { ...data, updatedBy: req.user._id, statusUpdatedAt: now, lastSeenAt: now }, $setOnInsert: { branch: req.branchScope, user: req.user._id } },
+    { $set: { ...data, updatedBy: req.user._id, statusUpdatedAt: now, lastSeenAt: now }, $setOnInsert: { branch: req.branchId, user: req.user._id } },
     { upsert: true, new: true, runValidators: true }
   );
   publishLeadEvent({ branchId: req.branchScope, event: 'availability.changed', data: { userId: req.user._id, status: availability.status } });
@@ -148,7 +148,7 @@ router.patch('/availability/:userId', requirePermission('lead.assign'), asyncRou
   const now = new Date();
   const availability = await LeadExecutiveAvailability.findOneAndUpdate(
     { branch: req.branchScope, user: executive._id },
-    { $set: { status: req.body.status, reason: req.body.reason.trim(), updatedBy: req.user._id, statusUpdatedAt: now, lastSeenAt: now }, $setOnInsert: { branch: req.branchScope, user: executive._id } },
+    { $set: { status: req.body.status, reason: req.body.reason.trim(), updatedBy: req.user._id, statusUpdatedAt: now, lastSeenAt: now }, $setOnInsert: { branch: req.branchId, user: executive._id } },
     { upsert: true, new: true, runValidators: true }
   );
   publishLeadEvent({ branchId: req.branchScope, userIds: [executive._id], event: 'availability.changed', data: { userId: executive._id, status: availability.status } });
@@ -312,7 +312,7 @@ router.post('/', requirePermission('lead.create'), asyncRoute(async (req, res) =
   if (assignToSelf) {
     await LeadExecutiveAvailability.findOneAndUpdate(
       { branch: req.branchScope, user: req.user._id },
-      { $set: { status: 'attending', currentLead: lead._id, updatedBy: req.user._id, statusUpdatedAt: now, lastSeenAt: now }, $setOnInsert: { branch: req.branchScope, user: req.user._id } },
+      { $set: { status: 'attending', currentLead: lead._id, updatedBy: req.user._id, statusUpdatedAt: now, lastSeenAt: now }, $setOnInsert: { branch: req.branchId, user: req.user._id } },
       { upsert: true }
     );
     publishLeadEvent({ branchId: req.branchScope, event: 'availability.changed', data: { userId: req.user._id, status: 'attending' } });
@@ -393,7 +393,7 @@ router.patch('/:id/visits/:visitId/status', requirePermission('lead.followup'), 
   if (['travelling', 'attending'].includes(next)) {
     await LeadExecutiveAvailability.findOneAndUpdate(
       { branch: req.branchScope, user: transitionedVisit.assignedTo },
-      { $set: { status: next, currentLead: lead._id, currentVisit: transitionedVisit._id, updatedBy: req.user._id, statusUpdatedAt: now, lastSeenAt: now }, $setOnInsert: { branch: req.branchScope, user: transitionedVisit.assignedTo } },
+      { $set: { status: next, currentLead: lead._id, currentVisit: transitionedVisit._id, updatedBy: req.user._id, statusUpdatedAt: now, lastSeenAt: now }, $setOnInsert: { branch: req.branchId, user: transitionedVisit.assignedTo } },
       { upsert: true, runValidators: true }
     );
   } else if (['completed', 'cancelled', 'no_show'].includes(next)) {
@@ -456,7 +456,7 @@ router.patch('/:id/accept', requirePermission('lead.respond'), asyncRoute(async 
   const now = new Date();
   await LeadExecutiveAvailability.findOneAndUpdate(
     { branch: req.branchScope, user: req.user._id },
-    { $set: { status: 'attending', currentLead: lead._id, updatedBy: req.user._id, statusUpdatedAt: now, lastSeenAt: now }, $setOnInsert: { branch: req.branchScope, user: req.user._id } },
+    { $set: { status: 'attending', currentLead: lead._id, updatedBy: req.user._id, statusUpdatedAt: now, lastSeenAt: now }, $setOnInsert: { branch: req.branchId, user: req.user._id } },
     { upsert: true }
   );
   publishLeadEvent({ branchId: req.branchScope, event: 'availability.changed', data: { userId: req.user._id, status: 'attending' } });

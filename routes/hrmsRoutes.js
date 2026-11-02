@@ -303,7 +303,7 @@ router.post('/attendance/punch-in', requirePermission('attendance.master'), asyn
     const today = new Date(); today.setHours(0, 0, 0, 0);
     let record = await Attendance.findOne({ branch: req.branchScope, employee, date: today });
     if (record && record.punchIn) return res.status(400).json({ success: false, message: 'Already punched in today.' });
-    if (!record) record = new Attendance({ branch: req.branchScope, employee, date: today });
+    if (!record) record = new Attendance({ branch: req.branchId, employee, date: today });
     record.punchIn = new Date();
     record.punchInLocation = location;
     record.punchInSelfie = selfie;
@@ -355,7 +355,7 @@ router.post('/attendance/mark', requirePermission('attendance.master'), async (r
     }
 
     let record = await Attendance.findOne({ branch: req.branchScope, employee, date: attendanceDate });
-    if (!record) record = new Attendance({ branch: req.branchScope, employee, date: attendanceDate });
+    if (!record) record = new Attendance({ branch: req.branchId, employee, date: attendanceDate });
     record.status = status;
     record.remarks = remarks || '';
     if (parsedPunchIn) record.punchIn = parsedPunchIn;
@@ -398,7 +398,7 @@ router.post('/leaves', requirePermission('attendance.master'), async (req, res) 
     if (!await employeeBelongsToBranch(req.body.employee, req.branchId)) {
       return res.status(404).json({ success: false, message: 'Employee not found.' });
     }
-    const leave = await Leave.create({ ...req.body, branch: req.branchScope, appliedBy: req.user._id });
+    const leave = await Leave.create({ ...req.body, branch: req.branchId, appliedBy: req.user._id });
     res.status(201).json({ success: true, message: 'Leave applied.', data: leave });
   } catch (e) { res.status(500).json({ success: false, message: e.message }); }
 });
@@ -592,7 +592,7 @@ router.get('/settings', requirePermission('attendance.master'), async (req, res)
   try {
     const settings = await HrmsSettings.findOneAndUpdate(
       { branch: req.branchScope },
-      { $setOnInsert: { branch: req.branchScope } },
+      { $setOnInsert: { branch: req.branchId } },
       { upsert: true, new: true, setDefaultsOnInsert: true, runValidators: true }
     );
     res.json({ success: true, data: settings });
@@ -611,7 +611,7 @@ router.put('/settings', requirePermission('attendance.master'), async (req, res)
       .map(key => [key, req.body[key]]));
     const settings = await HrmsSettings.findOneAndUpdate(
       { branch: req.branchScope },
-      { $set: updates, $setOnInsert: { branch: req.branchScope } },
+      { $set: updates, $setOnInsert: { branch: req.branchId } },
       { upsert: true, new: true, setDefaultsOnInsert: true, runValidators: true }
     );
     res.json({ success: true, message: 'Settings updated.', data: settings });

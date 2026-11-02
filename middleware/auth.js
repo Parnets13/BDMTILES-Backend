@@ -16,8 +16,8 @@ const tokenFromRequest = (req) => {
 export const buildAuthUser = async (userId) => {
   const user = await User.findById(userId)
     .select('-password')
-    .populate({ path: 'assignedBranches', select: 'branchCode name status city state', match: { status: 'active' } })
-    .populate({ path: 'defaultBranch', select: 'branchCode name status city state', match: { status: 'active' } })
+    .populate({ path: 'assignedBranches', select: 'branchCode name status city state companies', match: { status: 'active' } })
+    .populate({ path: 'defaultBranch', select: 'branchCode name status city state companies', match: { status: 'active' } })
     .populate('assignedWarehouse', 'warehouseCode name branch status')
     .populate('assignedWarehouses', 'warehouseCode name branch status')
     .lean();
@@ -28,7 +28,7 @@ export const buildAuthUser = async (userId) => {
   }
   if (['super_admin', 'owner'].includes(user.role)) {
     user.assignedBranches = await Branch.find({ status: 'active' })
-      .select('branchCode name status city state')
+      .select('branchCode name status city state companies')
       .sort({ name: 1 })
       .lean();
   } else {

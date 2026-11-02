@@ -470,7 +470,7 @@ const actionApproval = async (req, res, nextStatus) => {
             const originalPosting = await DealerLedger.findOne({ branch: req.branchScope, dealer: cancelledOrder.dealer, postingKey: originalPostingKey }).session(session).select('_id').lean();
             if (originalPosting) {
               await postSubledgerEntry({
-                session, branch: req.branchScope, partyType: 'dealer', partyId: cancelledOrder.dealer,
+                session, branch: req.branchId, partyType: 'dealer', partyId: cancelledOrder.dealer,
                 postingKey: `sales-order:${cancelledOrder._id}:cancelled`, reversalOfPostingKey: originalPostingKey,
                 entryType: 'credit_note', entryDate: actionedAt,
                 description: `Cancellation reversal for Sales Order ${cancelledOrder.orderNumber}`,
@@ -532,7 +532,7 @@ const actionApproval = async (req, res, nextStatus) => {
           await updatedOrder.save({ session });
           if (updatedOrder.dealer && updatedOrder.grandTotal > 0) {
             await postSubledgerEntry({
-              session, branch: req.branchScope, partyType: 'dealer', partyId: updatedOrder.dealer,
+              session, branch: req.branchId, partyType: 'dealer', partyId: updatedOrder.dealer,
               amount: updatedOrder.grandTotal, side: 'debit', postingKey: `sales-order:${updatedOrder._id}:confirmed`,
               entryType: 'invoice', entryDate: updatedOrder.orderDate,
               description: `Receivable for Sales Order ${updatedOrder.orderNumber}`,

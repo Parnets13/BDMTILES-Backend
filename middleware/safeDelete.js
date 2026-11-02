@@ -13,6 +13,7 @@ export const DELETE_OWNERSHIP = Object.freeze({
   Dealer: 'global',
   Supplier: 'global',
   Region: 'global',
+  Company: 'global',
   DealerType: 'global',
   DealerCategory: 'global',
   ExpenseCategory: 'global',

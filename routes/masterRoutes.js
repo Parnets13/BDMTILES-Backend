@@ -16,6 +16,7 @@ import Expense from '../models/Expense.js';
 import { protect, requirePermission, userHasPermission } from '../middleware/auth.js';
 import { requireBranch } from '../utils/branchScope.js';
 import {
+  assignableExecutiveFilter,
   assignmentHealth,
   assignmentSummary,
   buildAssignmentChange,
@@ -155,7 +156,7 @@ warehouseRouter.get('/', async (req, res) => {
 warehouseRouter.post('/', async (req, res) => {
   try {
     const { branch, ...input } = req.body;
-    const data = { ...input, branch: req.branchScope, createdBy: req.user._id };
+    const data = { ...input, branch: req.branchId, createdBy: req.user._id };
     if (!data.warehouseCode) {
       const count = await Warehouse.countDocuments({ branch: req.branchScope });
       data.warehouseCode = `WH${String(count + 1).padStart(4, '0')}`;
@@ -300,9 +301,8 @@ async function normalizeDealerAssignment(body, actor, currentAssignment = null) 
   }
 
   const salesExecutive = await User.findOne({
+    ...assignableExecutiveFilter({ activeOnly: true }),
     _id: selectedId,
-    role: 'sales_executive',
-    status: 'Active',
   }).select('_id').lean();
   if (!salesExecutive) {
     throw dealerError(422, 'The selected user is not an active Sales Executive.');
@@ -373,7 +373,7 @@ dealerRouter.get('/', async (req, res) => {
     // no branch, so it only appears under All Branches; assignment-health exists
     // to find exactly those.
     if (!req.allBranches && req.branchId && !assignedSalesExecutive) {
-      const executives = await User.find({ role: 'sales_executive', assignedBranches: req.branchId })
+      const executives = await User.find({ ...assignableExecutiveFilter(), assignedBranches: req.branchId })
         .select('_id')
         .lean();
       filter.assignedSalesExecutive = { $in: executives.map((user) => user._id) };
@@ -387,7 +387,7 @@ dealerRouter.get('/', async (req, res) => {
     // cannot express it in the dealer query — bounded to executives, not dealers,
     // and it cannot exceed the number of staff accounts.
     if (assignment === 'broken') {
-      const inactive = await User.find({ role: 'sales_executive', status: { $ne: 'Active' } })
+      const inactive = await User.find({ ...assignableExecutiveFilter(), status: { $ne: 'Active' } })
         .select('_id').lean();
       filter.$and = [{
         $or: [
@@ -450,7 +450,10 @@ dealerRouter.get('/stats', async (_req, res) => {
 
 dealerRouter.get('/sales-executives', requirePermission('dealer.assignment.manage'), async (_req, res) => {
   try {
-    const salesExecutives = await User.find({ role: 'sales_executive', status: 'Active' })
+    // Active executives only. Eligibility comes from the service so the picker and
+    // the save validation can never disagree. A dealer already assigned to somebody
+    // who has since been deactivated still shows that person, injected client-side.
+    const salesExecutives = await User.find(assignableExecutiveFilter({ activeOnly: true }))
       .select('name phone status')
       .sort({ name: 1 })
       .lean();

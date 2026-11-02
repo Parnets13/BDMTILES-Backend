@@ -256,7 +256,7 @@ router.post('/', requirePermission('dealer.order_request.create'), async (req, r
     const items = await buildTrustedRequestItems(req.body?.items);
     const request = await DealerOrderRequest.create({
       requestNumber: await generateBranchNumber(req.branchId, 'dealerOrderRequest'),
-      branch: req.branchScope,
+      branch: req.branchId,
       dealer: dealer._id,
       dealerSnapshot: {
         businessName: dealer.businessName,

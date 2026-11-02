@@ -305,7 +305,7 @@ router.post('/', requirePermission('invoice'), async (req, res) => {
         || new Date(new Date(invoiceDate).getTime() + supplierCreditDays * 24 * 60 * 60 * 1000);
       [result] = await SupplierInvoice.create([{
         invoiceRefNumber,
-        branch: req.branchScope,
+        branch: req.branchId,
         sourceKey,
         requestFingerprint,
         invoiceNumber,

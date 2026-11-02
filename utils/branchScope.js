@@ -17,6 +17,12 @@ export const hasGlobalBranchAccess = (user) => GLOBAL_BRANCH_ROLES.has(user?.rol
  */
 export const ALL_BRANCHES = 'all';
 
+/**
+ * Sentinel company id used by the web header's "All Companies" option. It means
+ * "do not narrow by company" and is never written to the database.
+ */
+export const ALL_COMPANIES = 'all';
+
 const ALL_BRANCHES_CONTEXT = Object.freeze({
   _id: null,
   branchCode: '',
@@ -51,6 +57,9 @@ export const branchAccessFilter = (user, filter = {}) => (
 export const resolveBranchContext = async (req, res, next) => {
   try {
     const headerBranchId = req.get('X-Branch-Id');
+    // One branch can serve several companies, so the scope is a comma-separated
+    // list of company ids (the single-id form from the first release still parses).
+    const headerCompanyId = String(req.get('X-Company-Id') || '').trim();
     const assignedIds = getAssignedBranchIds(req.user);
 
     req.branch = null;
@@ -59,6 +68,43 @@ export const resolveBranchContext = async (req, res, next) => {
     req.branchScope = null;
     req.allBranches = false;
     req.hasGlobalBranchAccess = hasGlobalBranchAccess(req.user);
+    req.companyId = null;
+    req.companyIds = [];
+    req.companyBranchIds = null;
+
+    // ── Company scope ───────────────────────────────────────────────────────
+    // Business records are stamped with a branch, not a company. A company owns
+    // a set of branches (Branch.companies is many-to-many), so selecting
+    // companies simply narrows the branch set — every existing branch-filtered
+    // query becomes company-aware without adding a column to 50 models.
+    let companyBranchIds = null;
+    if (headerCompanyId && headerCompanyId.toLowerCase() !== ALL_COMPANIES) {
+      const companyIds = [...new Set(headerCompanyId.split(',').map((id) => id.trim()).filter(Boolean))];
+      if (!companyIds.length || companyIds.some((id) => !mongoose.isValidObjectId(id))) {
+        return res.status(400).json({ success: false, message: 'Invalid company context.' });
+      }
+      // $in over the selected companies: a branch linked to ANY of them is in scope.
+      const linkedIds = (await Branch.find({ companies: { $in: companyIds }, status: 'active' })
+        .select('_id').lean()).map((branch) => String(branch._id));
+      companyBranchIds = req.hasGlobalBranchAccess
+        ? linkedIds
+        : linkedIds.filter((id) => assignedIds.includes(id));
+      req.companyId = companyIds.length === 1 ? companyIds[0] : null;
+      req.companyIds = companyIds;
+      req.companyBranchIds = companyBranchIds;
+      if (!companyBranchIds.length) {
+        return res.status(403).json({
+          success: false,
+          code: 'COMPANY_HAS_NO_BRANCHES',
+          message: companyIds.length === 1
+            ? 'This company has no branches available to you.'
+            : 'The selected companies have no branches available to you.',
+        });
+      }
+    }
+    const withinCompany = (ids) => (companyBranchIds
+      ? ids.filter((id) => companyBranchIds.includes(id))
+      : ids);
 
     // "All Branches" is a read-wide context: `req.branchId` stays null so a
     // create/update can never be attributed to an arbitrary branch, while every
@@ -67,17 +113,34 @@ export const resolveBranchContext = async (req, res, next) => {
       const allowedIds = req.hasGlobalBranchAccess
         ? (await Branch.find({ status: 'active' }).select('_id').lean()).map((branch) => String(branch._id))
         : assignedIds;
+      const scopedIds = withinCompany(allowedIds);
 
-      if (!allowedIds.length) {
+      if (!scopedIds.length) {
         return res.status(403).json({ success: false, message: 'No active branches are available to you.' });
       }
 
       req.allBranches = true;
       req.branch = { ...ALL_BRANCHES_CONTEXT };
-      req.branchIds = allowedIds;
+      req.branchIds = scopedIds;
       // ObjectIds, not strings: aggregation `$match` stages do not cast, so a
       // string `$in` would silently match nothing in every report pipeline.
-      req.branchScope = { $in: allowedIds.map((id) => new mongoose.Types.ObjectId(String(id))) };
+      req.branchScope = { $in: scopedIds.map((id) => new mongoose.Types.ObjectId(String(id))) };
+
+      // The header is a FILTER, not a form field: "All Branches" must still allow
+      // creating records. Reads stay wide (branchScope above), but a write needs one
+      // concrete branch, so it falls back to the user's default branch (then their
+      // first accessible one). req.writeBranch tells callers/UI which was used.
+      if (MUTATING_METHODS.has(req.method)) {
+        const defaultId = idString(req.user?.defaultBranch);
+        const fallbackId = [defaultId, ...scopedIds].find((id) => id && scopedIds.includes(String(id)));
+        if (fallbackId) {
+          const fallback = await Branch.findOne({ _id: fallbackId, status: 'active' }).lean();
+          if (fallback) {
+            req.branchId = fallback._id;
+            req.writeBranch = fallback;
+          }
+        }
+      }
       return next();
     }
 
@@ -87,6 +150,12 @@ export const resolveBranchContext = async (req, res, next) => {
       }
       if (!req.hasGlobalBranchAccess && !assignedIds.includes(String(headerBranchId))) {
         return res.status(403).json({ success: false, message: 'You are not assigned to this branch.' });
+      }
+      if (companyBranchIds && !companyBranchIds.includes(String(headerBranchId))) {
+        return res.status(403).json({
+          success: false,
+          message: 'This branch does not belong to the selected company.',
+        });
       }
 
       const selected = await Branch.findOne({ _id: headerBranchId, status: 'active' }).lean();
@@ -101,7 +170,7 @@ export const resolveBranchContext = async (req, res, next) => {
     }
 
     const defaultId = idString(req.user?.defaultBranch);
-    const candidateIds = [...new Set([defaultId, ...assignedIds].filter(Boolean))];
+    const candidateIds = withinCompany([...new Set([defaultId, ...assignedIds].filter(Boolean))]);
     if (!candidateIds.length) return next();
 
     const activeBranches = await Branch.find({ _id: { $in: candidateIds }, status: 'active' }).lean();
@@ -145,6 +214,18 @@ const ALL_BRANCH_WRITE_EXEMPT = [
   '/presence',
   '/support-chat',
   '/web-management',
+  // Company master is a global identity with no branch column, so a create/edit
+  // has nothing to mis-attribute. Deleting still needs a branch (Recycle Bin audit).
+  '/masters/companies',
+  // Branch master targets a branch id in the URL, so "which branch?" is never
+  // ambiguous — editing a branch while the header shows All Branches is exactly
+  // how you link it to a company. No handler in branchRoutes reads req.branchId.
+  '/masters/branches',
+  // Dealer master has no branch column: a dealer's branch is derived from the
+  // assigned Sales Executive. Assigning an executive while the header shows All
+  // Branches therefore has nothing to mis-attribute, and blocking it made the
+  // assignment fail with 428 for no reason.
+  '/masters/dealers',
 ];
 
 const MUTATING_METHODS = new Set(['POST', 'PUT', 'PATCH', 'DELETE']);
@@ -152,18 +233,21 @@ const MUTATING_METHODS = new Set(['POST', 'PUT', 'PATCH', 'DELETE']);
 /**
  * Guard for routes that are not behind `requireBranch` but still write.
  *
- * Creating/updating in an "All Branches" view has no correct branch to attribute
- * the record to, so it is refused with an actionable message instead of writing
- * to `branch: null`.
+ * The header is a FILTER. `resolveBranchContext` now resolves a concrete fallback
+ * branch for mutating requests (`req.branchId`), so this only fires when no branch
+ * could be resolved at all — a user with no accessible branch — instead of
+ * refusing every create while the header shows All Branches.
  */
 export const blockWritesInAllBranches = (req, res, next) => {
-  if (!req.allBranches || !MUTATING_METHODS.has(req.method)) return next();
+  if (!MUTATING_METHODS.has(req.method)) return next();
+  if (req.branchId) return next();
+  if (!req.allBranches) return next();
   const url = String(req.originalUrl || req.url || '');
   if (ALL_BRANCH_WRITE_EXEMPT.some((path) => url.includes(path))) return next();
   return res.status(428).json({
     success: false,
     code: 'BRANCH_REQUIRED',
-    message: 'You are viewing all branches. Pick a specific branch before making changes.',
+    message: 'No branch is available to record this change. Ask an admin to assign you a branch.',
   });
 };
 

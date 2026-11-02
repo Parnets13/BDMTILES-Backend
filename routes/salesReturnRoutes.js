@@ -308,7 +308,7 @@ router.post('/', requirePermission('credit.note'), async (req, res) => {
 
     const data = {
       ...req.body,
-      branch: req.branchScope,
+      branch: req.branchId,
       dealer: dealer._id,
       dealerName: dealer.businessName,
       dealerCode: dealer.dealerCode,

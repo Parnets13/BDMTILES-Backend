@@ -197,7 +197,7 @@ router.post('/', requirePermission('reconciliation'), async (req, res) => {
     }
     const entries = (input.entries || []).map((entry, index) => sanitizeEntry(entry, index, statementFrom, statementTo));
     const data = {
-      branch: req.branchScope,
+      branch: req.branchId,
       reconciliationNumber: await generateBranchNumber(req.branchId, 'bankReconciliation', reconciliationDate),
       reconciliationDate,
       bankAccount: input.bankAccount || undefined,

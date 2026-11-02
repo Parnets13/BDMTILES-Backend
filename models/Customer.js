@@ -1,4 +1,5 @@
 import mongoose from 'mongoose';
+import { isValidGstin } from '../utils/gstin.js';
 
 /**
  * Customer Master — for retail, builder, architect, contractor customers
@@ -19,7 +20,18 @@ const customerSchema = new mongoose.Schema(
     email: { type: String, trim: true, lowercase: true, default: '' },
 
     // GST (optional for retail, required for builders)
-    gstin: { type: String, trim: true, uppercase: true, default: '' },
+    gstin: {
+      type: String,
+      trim: true,
+      uppercase: true,
+      default: '',
+      // Optional, but must be a real GSTIN when present — the same rule the
+      // Company master uses, so every GST entry point agrees.
+      validate: {
+        validator: (value) => !value || isValidGstin(value),
+        message: 'Enter a valid GST number — 15 characters, e.g. 29ABCDE1234F1Z5.',
+      },
+    },
     pan: { type: String, trim: true, uppercase: true, default: '' },
 
     // Addresses

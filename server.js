@@ -70,6 +70,7 @@ import incentiveRoutes from './routes/incentiveRoutes.js';
 import targetRoutes from './routes/targetRoutes.js';
 import supportChatRoutes from './routes/supportChatRoutes.js';
 import branchRoutes from './routes/branchRoutes.js';
+import companyRoutes from './routes/companyRoutes.js';
 import salesExecutiveRoutes from './routes/salesExecutiveRoutes.js';
 import dealerOrderRequestRoutes from './routes/dealerOrderRequestRoutes.js';
 import attendanceRoutes from './routes/attendanceRoutes.js';
@@ -156,6 +157,9 @@ app.use('/api/v1/category-setup', categoryRoutes);
 app.use('/api/v1/attributes', attributeRoutes);
 app.use('/api/v1/products', productRoutes);
 app.use('/api/v1/masters/branches', branchRoutes);
+// Company master owns its own router (like branches) so it must be mounted before
+// the catch-all /masters router, otherwise /masters would swallow the path.
+app.use('/api/v1/masters/companies', companyRoutes);
 app.use('/api/v1/masters', masterRoutes);
 // Staff view of the targets dealers set for their own employees. Separate prefix
 // from /masters so the dealer-scoped sub-resource does not have to live under it.

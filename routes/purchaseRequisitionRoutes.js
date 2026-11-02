@@ -166,7 +166,7 @@ router.post('/', requirePermission('po.management'), async (req, res) => {
           // Serialize reorder PR creation per branch so concurrent/stale clients cannot both pass the open-PR check.
           await BranchSettings.findOneAndUpdate(
             { branch: req.branchScope },
-            { $inc: { reorderGuardVersion: 1 }, $setOnInsert: { branch: req.branchScope, createdBy: req.user._id } },
+            { $inc: { reorderGuardVersion: 1 }, $setOnInsert: { branch: req.branchId, createdBy: req.user._id } },
             { upsert: true, new: true, session, setDefaultsOnInsert: true }
           );
           const existing = await PurchaseRequisition.findOne({

@@ -832,7 +832,7 @@ router.put('/:id', async (req, res) => {
       user.lastReactivation = {
         at: new Date(),
         by: req.user._id,
-        branch: req.branchScope || undefined,
+        branch: req.branchId || undefined,
       };
       user.failedLoginAttempts = 0;
       user.loginLockedUntil = undefined;
@@ -965,7 +965,7 @@ router.delete('/:id', async (req, res) => {
       at: new Date(),
       by: req.user._id,
       reason,
-      branch: req.branchScope || undefined,
+      branch: req.branchId || undefined,
       metadata: deactivationMetadata(req),
       dependencySnapshot: snapshot,
     };

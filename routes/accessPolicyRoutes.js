@@ -81,7 +81,7 @@ router.put('/:module/:resourceKey', async (req, res) => {
       { branch: req.branchScope, module, resourceKey },
       {
         $set: { ...pick(req.body), module, resourceKey, updatedBy: req.user._id },
-        $setOnInsert: { branch: req.branchScope },
+        $setOnInsert: { branch: req.branchId },
       },
       { upsert: true, new: true, setDefaultsOnInsert: true, runValidators: true }
     );
