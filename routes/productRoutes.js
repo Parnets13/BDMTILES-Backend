@@ -11,7 +11,7 @@ import Category from '../models/Category.js';
 import Dealer from '../models/Dealer.js';
 import Branch from '../models/Branch.js';
 import { protect, requirePermission, requireAnyPermission } from '../middleware/auth.js';
-import { uploadProductImages } from '../middleware/upload.js';
+import { uploadProductImages, uploadBulkImport } from '../middleware/upload.js';
 import { normalizeProductUomConfig } from '../services/stockUomService.js';
 import { normalizeAndValidateAttributes } from '../services/attributeService.js';
 import { descendantIds } from '../services/categoryTreeService.js';
@@ -881,6 +881,322 @@ router.patch('/bulk-min-stock', canUpdateProduct, async (req, res) => {
   } catch (error) {
     res.status(500).json({ success: false, message: error.message });
   }
+});
+
+// POST /api/v1/products/bulk-import — import products from a CSV file + optional image files
+//
+// Multipart form fields:
+//   csv     — one .csv file with a header row matching the product template columns
+//   images  — zero or more image files; matched to rows by the Image_N_Filename column values
+//
+// The CSV must use the exact column names produced by the "Export CSV" / "Download Template"
+// feature on the Product Master page. Brand, Category, and Subcategory are matched by name
+// (case-insensitive). Rows with validation errors are skipped and reported in the response.
+//
+// Response:
+//   { success, created, skipped, errors: [{ row, reason }], data: [product] }
+router.post('/bulk-import', canCreateProduct, (req, res) => {
+  uploadBulkImport(req, res, async (multerErr) => {
+    if (multerErr) {
+      return res.status(400).json({ success: false, message: multerErr.message });
+    }
+
+    const csvFile = req.files?.csv?.[0];
+    if (!csvFile) {
+      return res.status(400).json({ success: false, message: 'No CSV file uploaded. Attach the file in a field named "csv".' });
+    }
+
+    // Build a lookup map from the original filename → stored path, so each row's
+    // Image_N_Filename value can be matched against the files that were uploaded.
+    const imageFileMap = {};
+    for (const imgFile of (req.files?.images || [])) {
+      // Key by the original filename (lowercased) the user named on disk — this is what they
+      // put into the Image_N_Filename column of the CSV.
+      imageFileMap[imgFile.originalname.toLowerCase()] = `/uploads/products/${imgFile.filename}`;
+    }
+
+    // ── Parse file (CSV or Excel) ──────────────────────────────────────────
+    // Returns allRows as string[][] — one array of strings per row.
+    let allRows = [];
+    const ext = path.extname(csvFile.originalname).toLowerCase();
+    const isExcel = ext === '.xlsx' || ext === '.xls';
+
+    if (isExcel) {
+      // Use exceljs to read the first worksheet into a 2-D array of strings.
+      try {
+        const ExcelJS = (await import('exceljs')).default;
+        const wb = new ExcelJS.Workbook();
+        await wb.xlsx.readFile(csvFile.path);
+        const ws = wb.worksheets[0];
+        if (!ws) throw new Error('Excel file has no worksheets.');
+        ws.eachRow({ includeEmpty: false }, (row) => {
+          const cells = [];
+          row.eachCell({ includeEmpty: true }, (cell) => {
+            // Rich-text cells have a { richText: [...] } value; extract plain text.
+            const v = cell.value;
+            if (v === null || v === undefined) { cells.push(''); return; }
+            if (typeof v === 'object' && v.richText) {
+              cells.push(v.richText.map(r => r.text || '').join(''));
+            } else if (typeof v === 'object' && v.result !== undefined) {
+              cells.push(String(v.result ?? ''));         // formula cell
+            } else if (v instanceof Date) {
+              cells.push(v.toISOString().slice(0, 10));
+            } else {
+              cells.push(String(v).trim());
+            }
+          });
+          allRows.push(cells);
+        });
+      } catch (e) {
+        return res.status(400).json({ success: false, message: `Could not read Excel file: ${e.message}` });
+      }
+    } else {
+      // Plain text CSV / TSV
+      let rawText;
+      try {
+        rawText = await import('fs').then(fs => fs.promises.readFile(csvFile.path, 'utf-8'));
+      } catch (e) {
+        return res.status(500).json({ success: false, message: 'Could not read the uploaded file.' });
+      }
+
+      // Strip BOM if present (Excel adds one)
+      if (rawText.charCodeAt(0) === 0xFEFF) rawText = rawText.slice(1);
+
+      /**
+       * Auto-detecting delimiter parser — handles comma, tab, and semicolon separated files.
+       * Detects by counting which delimiter appears most on the header line.
+       */
+      const parseCSV = (text) => {
+        const lines = text.replace(/\r\n/g, '\n').replace(/\r/g, '\n').split('\n').filter(l => l.trim());
+        if (!lines.length) return [];
+
+        const header = lines[0];
+        const tabCount   = (header.match(/\t/g) || []).length;
+        const commaCount = (header.match(/,/g) || []).length;
+        const semiCount  = (header.match(/;/g) || []).length;
+        const SEP = tabCount >= commaCount && tabCount >= semiCount ? '\t'
+                  : semiCount > commaCount ? ';'
+                  : ',';
+
+        const parseRow = (line) => {
+          if (SEP === '\t') return line.split('\t').map(s => s.trim());
+          const fields = [];
+          let cur = '';
+          let inQ = false;
+          for (let i = 0; i < line.length; i++) {
+            const ch = line[i];
+            if (inQ) {
+              if (ch === '"' && line[i + 1] === '"') { cur += '"'; i++; }
+              else if (ch === '"') { inQ = false; }
+              else { cur += ch; }
+            } else {
+              if (ch === '"') { inQ = true; }
+              else if (ch === SEP) { fields.push(cur.trim()); cur = ''; }
+              else { cur += ch; }
+            }
+          }
+          fields.push(cur.trim());
+          return fields;
+        };
+
+        return lines.map(parseRow);
+      };
+
+      allRows = parseCSV(rawText);
+    }
+
+    if (allRows.length < 2) {
+      return res.status(400).json({ success: false, message: 'File has no data rows. Make sure the header row is present.' });
+    }
+
+    // ── Find the header row ────────────────────────────────────────────────
+    // The header row is the first row that contains "Item_Name" or "Category".
+    // This handles Excel files where row 1 has a title/junk and the real header
+    // is on row 2 (or later).
+    const HEADER_MARKERS = ['Item_Name', 'Category', 'item_name', 'category', 'ITEM_NAME', 'CATEGORY'];
+    let headerRowIdx = allRows.findIndex(row =>
+      row.some(cell => HEADER_MARKERS.includes(String(cell || '').trim()))
+    );
+    if (headerRowIdx < 0) {
+      return res.status(400).json({ success: false, message: 'Could not find the header row. Make sure "Item_Name" or "Category" is in the header.' });
+    }
+
+    const headers = allRows[headerRowIdx].map(h => String(h || '').trim());
+    const dataRows = allRows.slice(headerRowIdx + 1);
+
+    const col = (row, name) => {
+      const idx = headers.indexOf(name);
+      return idx >= 0 ? (row[idx] || '').trim() : '';
+    };
+    const numCol = (row, name) => {
+      const v = col(row, name);
+      const n = parseFloat(v);
+      return isNaN(n) ? 0 : n;
+    };
+
+    // ── Pre-load lookup tables ─────────────────────────────────────────────
+    const [allBrands, allCategories] = await Promise.all([
+      Brand.find({}).select('name _id').lean(),
+      Category.find({}).select('name _id level').lean(),
+    ]);
+
+    const brandMap = new Map(allBrands.map(b => [b.name.toLowerCase(), b._id]));
+    // Search ALL levels — category names are unique enough and admins enter whatever
+    // name they see in the UI (which shows categories from any level).
+    const categoryMap = new Map(allCategories.map(c => [c.name.toLowerCase(), c._id]));
+    const subcategoryMap = categoryMap; // same map — subcategory is just a deeper node
+
+    // ── Process rows ───────────────────────────────────────────────────────
+    const created = [];
+    const errors = [];
+    const RecycleBin = (await import('../models/RecycleBin.js')).default;
+
+    for (let i = 0; i < dataRows.length; i++) {
+      const row = dataRows[i];
+      const rowNum = i + 2; // 1-indexed, +1 for header
+      if (row.every(c => !c)) continue; // skip blank rows
+
+      try {
+        // ── Required: Category ──────────────────────────────────────────
+        const categoryName = col(row, 'Category');
+        if (!categoryName) {
+          errors.push({ row: rowNum, reason: 'Category is required.' });
+          continue;
+        }
+        const categoryId = categoryMap.get(categoryName.toLowerCase());
+        if (!categoryId) {
+          errors.push({ row: rowNum, reason: `Category "${categoryName}" not found.` });
+          continue;
+        }
+
+        // ── Optional lookups ────────────────────────────────────────────
+        const brandName = col(row, 'Brand');
+        const brandId = brandName ? (brandMap.get(brandName.toLowerCase()) || null) : null;
+        if (brandName && !brandId) {
+          errors.push({ row: rowNum, reason: `Brand "${brandName}" not found.` });
+          continue;
+        }
+
+        const subcategoryName = col(row, 'Subcategory');
+        const subcategoryId = subcategoryName ? (subcategoryMap.get(subcategoryName.toLowerCase()) || null) : null;
+        if (subcategoryName && !subcategoryId) {
+          errors.push({ row: rowNum, reason: `Subcategory "${subcategoryName}" not found.` });
+          continue;
+        }
+
+        // ── Image resolution ────────────────────────────────────────────
+        // The "Images" column holds all filenames separated by " | "
+        // e.g. "img1.png | img2.png | img3.png"
+        const images = [];
+        const imagesRaw = col(row, 'Images');
+        if (imagesRaw) {
+          const fnames = imagesRaw.split('|').map(s => s.trim()).filter(Boolean);
+          for (const fname of fnames) {
+            const uploaded = imageFileMap[fname.toLowerCase()];
+            if (uploaded) images.push(uploaded);
+          }
+        }
+
+        // ── Build product data ──────────────────────────────────────────
+        const statusVal = col(row, 'Status') || 'active';
+        const productData = {
+          itemName: col(row, 'Item_Name'),
+          aliasName: col(row, 'Alias_Name'),
+          productCode: col(row, 'Product_Code') || undefined,
+          hsnCode: col(row, 'HSN_Code'),
+          gst: numCol(row, 'GST_%') || 18,
+          unit: col(row, 'Unit') || 'Box',
+          category: categoryId,
+          subcategory: subcategoryId || undefined,
+          brand: brandId || undefined,
+          tileSize: col(row, 'Tile_Size'),
+          finish: col(row, 'Finish'),
+          colour: col(row, 'Colour'),
+          design: col(row, 'Design'),
+          collection: col(row, 'Collection'),
+          tileType: col(row, 'Tile_Type'),
+          applicationArea: col(row, 'Application_Area'),
+          grade: col(row, 'Grade') || '',
+          surface: col(row, 'Surface'),
+          thickness: col(row, 'Thickness'),
+          antiSkidRating: col(row, 'Anti_Skid_Rating'),
+          waterAbsorption: col(row, 'Water_Absorption'),
+          breakingStrength: col(row, 'Breaking_Strength'),
+          piecesPerBox: numCol(row, 'Pieces_Per_Box'),
+          sqftPerBox: numCol(row, 'Sqft_Per_Box'),
+          weightPerBox: numCol(row, 'Weight_Per_Box'),
+          mrp: numCol(row, 'MRP'),
+          purchaseRate: numCol(row, 'Purchase_Rate'),
+          landingCost: numCol(row, 'Landing_Cost'),
+          retailRate: numCol(row, 'Retail_Rate'),
+          dealerRate: numCol(row, 'Dealer_Rate'),
+          wholesaleRate: numCol(row, 'Wholesale_Rate'),
+          distributorRate: numCol(row, 'Distributor_Rate'),
+          projectRate: numCol(row, 'Project_Rate'),
+          builderRate: numCol(row, 'Builder_Rate'),
+          minimumSellingRate: numCol(row, 'Min_Selling_Rate'),
+          minStockLevel: numCol(row, 'Min_Stock_Level'),
+          reorderLevel: numCol(row, 'Reorder_Level'),
+          countryOfOrigin: col(row, 'Country_Of_Origin') || 'India',
+          barcode: col(row, 'Barcode') || undefined,
+          description: col(row, 'Description'),
+          status: ['active', 'inactive', 'draft'].includes(statusVal) ? statusVal : 'active',
+          images,
+          createdBy: req.user._id,
+        };
+
+        if (!productData.itemName) {
+          errors.push({ row: rowNum, reason: 'Item_Name is required.' });
+          continue;
+        }
+
+        Object.assign(productData, normalizeProductUomConfig(productData, productData.unit));
+
+        // Validate and normalize flexible attributes (skip if category has none)
+        try {
+          const { attributes } = await normalizeAndValidateAttributes(productData.category, {}, { partial: true });
+          productData.attributes = attributes;
+        } catch { /* non-critical — proceed without attributes */ }
+
+        // Auto-generate product code if not provided
+        if (!productData.productCode) {
+          let codeNum = await Product.countDocuments() + 1;
+          let code = `BDM${String(codeNum).padStart(6, '0')}`;
+          while (true) {
+            const [inProd, inBin] = await Promise.all([
+              Product.findOne({ productCode: code }).lean(),
+              RecycleBin.findOne({ 'data.productCode': code, originalModel: 'Product' }).lean(),
+            ]);
+            if (!inProd && !inBin) break;
+            codeNum++;
+            code = `BDM${String(codeNum).padStart(6, '0')}`;
+          }
+          productData.productCode = code;
+        }
+
+        const product = await Product.create(productData);
+        scheduleEmbedding(String(product._id), product.images);
+        created.push(product);
+      } catch (err) {
+        const reason = err.code === 11000
+          ? `Product code "${col(row, 'Product_Code')}" already exists.`
+          : (err.message || 'Unknown error.');
+        errors.push({ row: rowNum, reason });
+      }
+    }
+
+    // Clean up the uploaded CSV file (it was only needed to parse)
+    try { await import('fs').then(fs => fs.promises.unlink(csvFile.path)); } catch { /* ignore */ }
+
+    return res.json({
+      success: true,
+      message: `Import complete. ${created.length} created, ${errors.length} skipped.`,
+      created: created.length,
+      skipped: errors.length,
+      errors,
+      data: created.map(p => ({ _id: p._id, productCode: p.productCode, itemName: p.itemName })),
+    });
+  });
 });
 
 export default router;

@@ -55,6 +55,34 @@ export const uploadProductImages = multer({
   limits: { fileSize: 5 * 1024 * 1024 }, // 5MB per file
 }).array('images', 10); // max 10 images
 
+// Bulk-import: one CSV/Excel file (field "csv") + up to 200 product images (field "images").
+// Images land in the same products directory so they are served by the existing static handler.
+const csvFilter = (_req, file, cb) => {
+  const csvTypes = [
+    'text/csv', 'application/csv',
+    'application/vnd.ms-excel',
+    'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+  ];
+  const ext = path.extname(file.originalname).toLowerCase();
+  if (csvTypes.includes(file.mimetype) || ext === '.csv' || ext === '.xlsx' || ext === '.xls') {
+    cb(null, true);
+  } else if (fileFilter) {
+    // fall through to image filter for the images field
+    const allowedExts = ['.jpg', '.jpeg', '.png', '.webp', '.gif', '.avif'];
+    cb(null, allowedExts.includes(ext));
+  } else {
+    cb(null, false);
+  }
+};
+
+export const uploadBulkImport = multer({
+  storage: storageFor(productUploadDirectory),
+  limits: { fileSize: 20 * 1024 * 1024 }, // 20MB for CSV; images up to 5MB checked below
+}).fields([
+  { name: 'csv', maxCount: 1 },
+  { name: 'images', maxCount: 200 },
+]);
+
 // Brand logos are uploaded through the category-setup permission boundary.
 export const uploadBrandImage = multer({
   storage: storageFor(brandUploadDirectory),

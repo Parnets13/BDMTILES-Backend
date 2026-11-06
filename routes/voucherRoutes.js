@@ -1,6 +1,7 @@
 import { Router } from 'express';
 import Voucher from '../models/Voucher.js';
 import BankAccount from '../models/BankAccount.js';
+import LedgerAccount from '../models/LedgerAccount.js';
 import { protect, requirePermission } from '../middleware/auth.js';
 
 const router = Router();
@@ -50,6 +51,50 @@ router.get('/stats', requirePermission('finance.management'), async (req, res) =
     res.json({ success: true, data: { total, draft, posted, todayVouchers, monthTotal: monthTotal[0]?.total || 0 } });
   } catch (e) { res.status(500).json({ success: false, message: e.message }); }
 });
+
+// ══════════════════════════════════
+// LEDGER ACCOUNTS (Chart of Accounts)
+// — Must be before /:id to avoid route shadowing
+// ══════════════════════════════════
+
+router.get('/accounts/list', requirePermission('finance.management'), async (req, res) => {
+  try {
+    const { page = 1, limit = 20, search, group } = req.query;
+    const p = Math.max(1, parseInt(page));
+    const l = Math.min(100, parseInt(limit) || 20);
+    const filter = {};
+    if (search) {
+      const r = new RegExp(search, 'i');
+      filter.$or = [{ accountName: r }, { accountCode: r }];
+    }
+    if (group) filter.accountGroup = group;
+    const [data, total] = await Promise.all([
+      LedgerAccount.find(filter).sort({ accountGroup: 1, accountName: 1 }).skip((p - 1) * l).limit(l).lean(),
+      LedgerAccount.countDocuments(filter),
+    ]);
+    res.json({ success: true, data, pagination: { currentPage: p, totalPages: Math.ceil(total / l), totalItems: total } });
+  } catch (e) { res.status(500).json({ success: false, message: e.message }); }
+});
+
+router.post('/accounts', requirePermission('finance.management'), async (req, res) => {
+  try {
+    const doc = await LedgerAccount.create({ ...req.body, createdBy: req.user._id });
+    res.status(201).json({ success: true, message: 'Account created.', data: doc });
+  } catch (e) {
+    if (e.code === 11000) return res.status(400).json({ success: false, message: 'Account name already exists.' });
+    res.status(e.name === 'ValidationError' ? 422 : 500).json({ success: false, message: e.message });
+  }
+});
+
+router.put('/accounts/:id', requirePermission('finance.management'), async (req, res) => {
+  try {
+    const doc = await LedgerAccount.findByIdAndUpdate(req.params.id, req.body, { new: true, runValidators: true });
+    if (!doc) return res.status(404).json({ success: false, message: 'Account not found.' });
+    res.json({ success: true, message: 'Account updated.', data: doc });
+  } catch (e) { res.status(500).json({ success: false, message: e.message }); }
+});
+
+// ══════════════════════════════════
 
 router.get('/:id', requirePermission('finance.management'), async (req, res) => {
   try {
@@ -149,5 +194,9 @@ router.get('/cash-bank-book/entries', requirePermission('finance.management'), a
     res.json({ success: true, data: entries, pagination: { currentPage: p, totalPages: Math.ceil(total/l), totalItems: total } });
   } catch (e) { res.status(500).json({ success: false, message: e.message }); }
 });
+
+// ══════════════════════════════════
+// LEDGER ACCOUNTS (Chart of Accounts)
+// ══════════════════════════════════
 
 export default router;
