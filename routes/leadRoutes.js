@@ -21,7 +21,7 @@ import { markLeadWon } from '../services/leadConversionService.js';
 import { createNotificationEvent } from '../services/notificationService.js';
 
 const router = Router();
-const TERMINAL_STATUSES = ['won', 'lost'];
+const TERMINAL_STATUSES = ['won', 'lost', 'draft'];
 const VISIT_TRANSITIONS = {
   scheduled: ['travelling', 'cancelled', 'no_show'],
   travelling: ['arrived', 'cancelled'],
@@ -35,7 +35,7 @@ const CREATE_FIELDS = [
   'name', 'phone', 'alternatePhone', 'email', 'businessName', 'city', 'state', 'address', 'pinCode',
   'customerType', 'leadSource', 'leadChannel', 'leadType', 'campaign', 'referredBy', 'interestedIn',
   'interestedProducts', 'estimatedArea', 'estimatedValue', 'projectType', 'priority', 'nextFollowupDate',
-  'remarks', 'tags',
+  'remarks', 'tags', 'status',
 ];
 const UPDATE_FIELDS = CREATE_FIELDS.filter((field) => !['name', 'phone'].includes(field)).concat(['name', 'phone']);
 const CHANNEL_BY_LEGACY_TYPE = {
@@ -278,8 +278,19 @@ router.get('/', requirePermission('lead.view'), asyncRoute(async (req, res) => {
 
 router.post('/', requirePermission('lead.create'), asyncRoute(async (req, res) => {
   const assignToSelf = req.body.assignToSelf === true || req.body.assignToMe === true;
-  if (!assignToSelf && (req.body.assignedTo || req.body.assignmentStatus || req.body.assignmentHistory)) {
-    return res.status(422).json({ success: false, message: 'Create-time assignment is not supported. Use assignToSelf or create the lead first.' });
+  // `draft` status: save without entering the pipeline. No assignment, no notification.
+  const isDraft = req.body.status === 'draft';
+
+  // Allow create-time assignment by managers (lead.assign holders) using assignOnCreate.
+  // This skips the atomic assignment service on purpose: the lead does not exist yet,
+  // so there is nothing to version-lock. The body must supply an SE id.
+  const assignOnCreate = !assignToSelf && !isDraft && req.body.assignOnCreate === true
+    && req.body.assignedTo
+    && userHasPermission(req.user, 'lead.assign');
+
+  if (!assignToSelf && !isDraft && !assignOnCreate
+    && (req.body.assignmentStatus || req.body.assignmentHistory)) {
+    return res.status(422).json({ success: false, message: 'Create-time assignment is not supported. Use assignToSelf, assignOnCreate, or create the lead first.' });
   }
   const data = { ...pick(req.body, CREATE_FIELDS), ...getLeadCreateScope(req) };
   data.leadChannel = data.leadChannel || CHANNEL_BY_LEGACY_TYPE[data.customerType] || 'other';
@@ -288,7 +299,10 @@ router.post('/', requirePermission('lead.create'), asyncRoute(async (req, res) =
   data.leadNumber = await generateUniqueCode(Lead, 'leadNumber', 'LD-', 5);
 
   const now = new Date();
-  if (assignToSelf) {
+
+  if (isDraft) {
+    data.status = 'draft';
+  } else if (assignToSelf) {
     data.assignedTo = req.user._id;
     data.assignedToName = req.user.name;
     data.assignmentStatus = 'accepted';
@@ -305,6 +319,27 @@ router.post('/', requirePermission('lead.create'), asyncRoute(async (req, res) =
       response: 'accepted',
       respondedAt: now,
     }];
+  } else if (assignOnCreate) {
+    // Look up the SE so we can store their name and validate they exist.
+    const se = await User.findOne({ _id: req.body.assignedTo, role: 'sales_executive', status: 'Active', assignedBranches: req.branchScope }).select('_id name');
+    if (!se) return res.status(422).json({ success: false, message: 'Selected Sales Executive not found in this branch.' });
+    data.assignedTo = se._id;
+    data.assignedToName = se.name;
+    data.assignmentStatus = 'pending';
+    data.status = 'assigned';
+    data.assignedAt = now;
+    data.assignmentVersion = 1;
+    // acceptance deadline from settings
+    const settings = await (await import('../services/leadAssignmentService.js')).getLeadOperationsSetting(req.branchScope);
+    data.acceptanceDeadlineAt = new Date(now.getTime() + settings.acceptanceDeadlineMinutes * 60000);
+    data.assignmentHistory = [{
+      assignedTo: se._id,
+      assignedToName: se.name,
+      assignedBy: req.user._id,
+      assignedByName: req.user.name,
+      assignedAt: now,
+      response: 'pending',
+    }];
   }
 
   const lead = await Lead.create(data);
@@ -318,14 +353,30 @@ router.post('/', requirePermission('lead.create'), asyncRoute(async (req, res) =
     publishLeadEvent({ branchId: req.branchScope, event: 'availability.changed', data: { userId: req.user._id, status: 'attending' } });
   }
 
-  await appendLeadActivity({ branch: req.branchScope, lead, type: 'created', summary: `Lead ${lead.leadNumber} created${assignToSelf ? ' and assigned to self' : ''}`, actor: req.user });
-  await emitNotification({
-    branch: req.branchScope, module: 'lead', event: 'lead_created', eventKey: `lead:${lead._id}:created`,
-    title: `Lead ${lead.leadNumber} created`, body: `${lead.name} was added as a new lead.`,
-    deepLink: `/crm/lead-management?lead=${lead._id}`, data: { leadId: lead._id, leadNumber: lead.leadNumber }, actor: req.user._id,
-  });
+  if (assignOnCreate) {
+    // Notify the SE immediately — same payload as the atomic assign service.
+    publishLeadEvent({ branchId: req.branchScope, userIds: [data.assignedTo], event: 'lead.assigned', data: { leadId: lead._id, assignmentVersion: lead.assignmentVersion } });
+    await emitNotification({
+      branch: req.branchScope, module: 'lead', event: 'lead_assigned', eventKey: `lead:${lead._id}:assigned:v1`,
+      title: 'New lead assigned to you', body: `${lead.name} (${lead.leadNumber}) has been assigned to you.`,
+      deepLink: `/crm/lead-management?lead=${lead._id}`, data: { leadId: lead._id, leadNumber: lead.leadNumber }, actor: req.user._id,
+      recipientUserIds: [String(data.assignedTo)],
+    });
+  }
+
+  await appendLeadActivity({ branch: req.branchScope, lead, type: 'created',
+    summary: `Lead ${lead.leadNumber} created${assignToSelf ? ' and assigned to self' : assignOnCreate ? ` and assigned to ${data.assignedToName}` : isDraft ? ' as draft' : ''}`,
+    actor: req.user });
+
+  if (!isDraft) {
+    await emitNotification({
+      branch: req.branchScope, module: 'lead', event: 'lead_created', eventKey: `lead:${lead._id}:created`,
+      title: `Lead ${lead.leadNumber} created`, body: `${lead.name} was added as a new lead.`,
+      deepLink: `/crm/lead-management?lead=${lead._id}`, data: { leadId: lead._id, leadNumber: lead.leadNumber }, actor: req.user._id,
+    });
+  }
   emitChange({ req, lead, action: 'created' });
-  res.status(201).json({ success: true, message: `Lead ${lead.leadNumber} created.`, data: lead });
+  res.status(201).json({ success: true, message: `Lead ${lead.leadNumber} ${isDraft ? 'saved as draft' : 'created'}.`, data: lead });
 }));
 
 router.get('/:id/visits', requireAnyPermission('lead.view', 'lead.app'), asyncRoute(async (req, res) => {
@@ -525,6 +576,8 @@ router.patch('/:id/status', requirePermission('lead.update'), asyncRoute(async (
   const previous = lead.status;
   lead.status = req.body.status;
   if (req.body.status === 'lost') lead.lostReason = req.body.lostReason || '';
+  // Store closing remarks for lost / on_hold / won — visible in lead history
+  if (req.body.closingRemarks) lead.closingRemarks = req.body.closingRemarks.trim();
   await lead.save();
   await appendLeadActivity({ branch: req.branchScope, lead, type: 'status_changed', summary: `Status ${previous} → ${lead.status}`, actor: req.user, fromStatus: previous, toStatus: lead.status });
   emitChange({ req, lead, action: 'status_changed', recipients: lead.assignedTo ? [lead.assignedTo] : [] });
@@ -561,6 +614,83 @@ router.delete('/:id', requirePermission('lead.delete'), asyncRoute(async (req, r
     emitChange({ req, lead, action: 'deleted', recipients: lead.assignedTo ? [lead.assignedTo] : [] });
   }
   res.status(result.status || 200).json(result);
+}));
+
+/**
+ * POST /leads/:id/create-dealer
+ *
+ * Lets a Sales Executive register the lead as a dealer directly from the app,
+ * bypassing the dealer.master permission wall. The SE already owns this lead,
+ * so allowing them to create a dealer from it is an intentional product decision.
+ *
+ * Required body fields: ownerName, mobile, businessName
+ * Optional:  dealerType (ObjectId), city, state, address, pinCode, email, gstin
+ *
+ * On success the lead's convertedToDealer field is set so the quotation action
+ * can prefill the dealer automatically on subsequent opens.
+ */
+router.post('/:id/create-dealer', requirePermission('lead.app'), asyncRoute(async (req, res) => {
+  const { lead } = await leadOr404(req, 'followup'); // 'followup' scope = assigned SE
+
+  if (lead.convertedToDealer) {
+    // Already converted — return the existing dealer so the client can proceed.
+    const { default: Dealer } = await import('../models/Dealer.js');
+    const existing = await Dealer.findById(lead.convertedToDealer)
+      .populate('dealerType', 'name pricingTier').lean();
+    if (existing) {
+      return res.json({ success: true, message: 'Dealer already created for this lead.', data: existing });
+    }
+  }
+
+  const { default: Dealer } = await import('../models/Dealer.js');
+  const { assertMobileAvailable } = await import('../services/mobileIdentityService.js');
+  const { generateUniqueCode } = await import('../utils/codeGenerator.js');
+
+  const { ownerName, mobile, businessName, dealerType, city, state, address, pinCode, email, gstin } = req.body;
+
+  if (!businessName?.trim()) return res.status(422).json({ success: false, message: 'Business name is required.' });
+  if (!ownerName?.trim())    return res.status(422).json({ success: false, message: 'Owner name is required.' });
+  if (!mobile?.trim())       return res.status(422).json({ success: false, message: 'Mobile number is required.' });
+
+  // Normalize + uniqueness check (same rule as the master endpoint).
+  const mobileNormalized = await assertMobileAvailable(mobile, { exclude: null });
+
+  const dealerCode = await generateUniqueCode(Dealer, 'dealerCode', 'DLR', 5);
+
+  const created = await Dealer.create({
+    businessName: businessName.trim(),
+    ownerName: ownerName.trim(),
+    mobile: mobile.trim(),
+    mobileNormalized,
+    dealerCode,
+    email:   email?.trim()   || '',
+    gstin:   gstin?.trim()   || '',
+    city:    city?.trim()    || '',
+    state:   state?.trim()   || '',
+    address: address?.trim() || '',
+    pinCode: pinCode?.trim() || '',
+    dealerType: dealerType || undefined,
+    // Assign to the creating SE so the dealer has an operating branch immediately.
+    assignedSalesExecutive: req.user._id,
+    createdBy: req.user._id,
+    status: 'active',
+  });
+
+  // Link back to the lead so the quotation button can prefill automatically.
+  lead.convertedToDealer = created._id;
+  await lead.save();
+
+  await appendLeadActivity({
+    branch: req.branchScope,
+    lead,
+    type: 'updated',
+    summary: `Dealer ${created.dealerCode} created from lead and linked`,
+    actor: req.user,
+  });
+  emitChange({ req, lead, action: 'updated', recipients: lead.assignedTo ? [lead.assignedTo] : [] });
+
+  const dealer = await Dealer.findById(created._id).populate('dealerType', 'name pricingTier').lean();
+  return res.status(201).json({ success: true, message: `Dealer ${dealerCode} created and linked to lead.`, data: dealer });
 }));
 
 export default router;

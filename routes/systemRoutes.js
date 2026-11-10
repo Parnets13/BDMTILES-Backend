@@ -153,7 +153,7 @@ const listFilter = (value) => {
 
 router.get('/activity-logs', LOG_VIEW_PERMISSIONS, async (req, res) => {
   try {
-    const { page = 1, limit = 30, search, action, module, user: userId, dateFrom, dateTo } = req.query;
+    const { page = 1, limit = 30, search, action, module, user: userId, dateFrom, dateTo, device } = req.query;
     const p = Math.max(1, Number.parseInt(page, 10) || 1);
     const l = Math.min(100, Math.max(1, Number.parseInt(limit, 10) || 30));
     const filter = { branch: req.branchScope };
@@ -166,6 +166,8 @@ router.get('/activity-logs', LOG_VIEW_PERMISSIONS, async (req, res) => {
     if (actionFilter) filter.action = actionFilter;
     if (moduleFilter) filter.module = moduleFilter;
     if (userId) filter.user = userId;
+    // Filter by device: 'mobile' shows only app actions, 'web' shows only browser actions.
+    if (device) filter.device = String(device);
     if (dateFrom || dateTo) {
       filter.timestamp = {};
       if (dateFrom) filter.timestamp.$gte = new Date(dateFrom);

@@ -67,10 +67,11 @@ const leadSchema = new mongoose.Schema(
     priority: { type: String, enum: ['low', 'medium', 'high', 'hot'], default: 'medium' },
     status: {
       type: String,
-      enum: ['new', 'assigned', 'accepted', 'contacted', 'qualified', 'proposal_sent', 'negotiation', 'site_visit', 'won', 'lost', 'on_hold'],
+      enum: ['draft', 'new', 'assigned', 'accepted', 'contacted', 'qualified', 'proposal_sent', 'negotiation', 'site_visit', 'won', 'lost', 'on_hold'],
       default: 'new',
     },
     lostReason: String,
+    closingRemarks: { type: String, default: '' },  // remarks captured when closing/winning/holding
 
     // SE Assignment — current
     assignedTo: { type: mongoose.Schema.Types.ObjectId, ref: 'User' },

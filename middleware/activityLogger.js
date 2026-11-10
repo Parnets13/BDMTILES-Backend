@@ -36,7 +36,10 @@ export const logActivity = async ({
       metadata: metadata || null,
       ipAddress: req?.ip || req?.connection?.remoteAddress || '',
       userAgent: req?.get?.('user-agent') || '',
-      device: req?.get?.('x-device') || 'web',
+      // Prefer the explicit X-Device header; fall back to sniffing the client
+      // identifier the app always sends so pre-header requests still resolve.
+      device: req?.get?.('x-device')
+        || (/bdmtiles-(sales|dealer|customer)-app/i.test(req?.get?.('x-bdmtiles-client') || '') ? 'mobile' : 'web'),
       timestamp: new Date(),
     });
   } catch (err) {
@@ -91,11 +94,22 @@ function getActionFromMethod(method, path) {
   if (method === 'POST') return 'create';
   if (method === 'PUT') return 'update';
   if (method === 'PATCH') {
-    if (path.includes('/approve')) return 'approve';
-    if (path.includes('/reject')) return 'reject';
-    if (path.includes('/cancel')) return 'status_change';
-    if (path.includes('/status')) return 'status_change';
-    if (path.includes('/restore')) return 'restore';
+    if (path.includes('/approve'))          return 'approve';
+    if (path.includes('/reject'))           return 'reject';
+    if (path.includes('/cancel'))           return 'status_change';
+    if (path.includes('/status'))           return 'status_change';
+    if (path.includes('/restore'))          return 'restore';
+    if (path.includes('/accept'))           return 'approve';
+    if (path.includes('/decline'))          return 'reject';
+    if (path.includes('/convert'))          return 'status_change';
+    if (path.includes('/followup'))         return 'update';
+    if (path.includes('/availability'))     return 'update';
+    if (path.includes('/punch-in'))         return 'create';
+    if (path.includes('/punch-out'))        return 'update';
+    if (path.includes('/checkout'))         return 'update';
+    if (path.includes('/mark'))             return 'create';
+    if (path.includes('/read'))             return 'update';
+    if (path.includes('/assign'))           return 'update';
     return 'update';
   }
   if (method === 'DELETE') return 'delete';
@@ -105,15 +119,57 @@ function getActionFromMethod(method, path) {
 function getModuleFromPath(url) {
   const parts = url.replace('/api/v1/', '').split('/');
   const moduleMap = {
-    'products': 'product', 'sales-orders': 'sales_order', 'purchase': 'purchase',
-    'purchase-returns': 'purchase_return', 'sales-returns': 'sales_return',
-    'payments': 'payment', 'hrms': 'hrms', 'masters': 'master',
-    'category-setup': 'category', 'users': 'user', 'auth': 'auth',
-    'dealer-pricing': 'pricing', 'quotations': 'quotation', 'dealer-order-requests': 'dealer_order_request',
-    'ledger': 'ledger', 'cheques': 'cheque', 'vouchers': 'voucher',
-    'dispatch': 'dispatch', 'leads': 'lead', 'complaints': 'complaint',
-    'approvals': 'approval', 'schemes': 'scheme', 'reports': 'report',
-    'supplier-invoices': 'supplier_invoice', 'stock': 'stock',
+    // Core
+    'products':              'product',
+    'sales-orders':          'sales_order',
+    'purchase':              'purchase',
+    'purchase-returns':      'purchase_return',
+    'sales-returns':         'sales_return',
+    'payments':              'payment',
+    'hrms':                  'hrms',
+    'masters':               'master',
+    'category-setup':        'category',
+    'users':                 'user',
+    'auth':                  'auth',
+    'dealer-pricing':        'pricing',
+    'quotations':            'quotation',
+    'dealer-order-requests': 'dealer_order_request',
+    'ledger':                'ledger',
+    'cheques':               'cheque',
+    'vouchers':              'voucher',
+    'dispatch':              'dispatch',
+    'leads':                 'lead',
+    'complaints':            'complaint',
+    'approvals':             'approval',
+    'schemes':               'scheme',
+    'reports':               'report',
+    'supplier-invoices':     'supplier_invoice',
+    'stock':                 'stock',
+    // SE app routes (mobile)
+    'sales-executive':       'sales_executive',
+    'attendance':            'attendance',
+    'expenses':              'expense',
+    'collections':           'collection',
+    'sales-returns':         'sales_return',
+    'invoices':              'invoice',
+    'tasks':                 'task',
+    'notifications':         'notification',
+    'targets':               'target',
+    'incentives':            'incentive',
+    'dealer-app':            'dealer_app',
+    'delivery':              'delivery',
+    'dispatch-trips':        'dispatch_trip',
+    'pick-lists':            'pick_list',
+    'stock-transfers':       'stock_transfer',
+    'stock-adjustments':     'stock_adjustment',
+    'customers':             'customer',
+    'wallets':               'wallet',
+    'access-policies':       'access_policy',
+    'bank-reconciliation':   'bank_reconciliation',
+    'documents':             'document',
+    'purchase-requisitions': 'purchase_requisition',
+    'supplier-quotations':   'supplier_quotation',
+    'assets':                'asset',
   };
   return moduleMap[parts[0]] || parts[0] || 'system';
 }
@@ -142,6 +198,11 @@ export const logAuthEvent = async ({ action, user, req, description, metadata })
   const branch = user.defaultBranch
     || (Array.isArray(user.assignedBranches) ? user.assignedBranches[0] : undefined);
 
+  // Detect mobile client from headers even on auth routes (no X-Device from pre-fix
+  // builds, but X-BDMTILES-Client is always present in the app).
+  const device = req?.get?.('x-device')
+    || (/bdmtiles-(sales|dealer|customer)-app/i.test(req?.get?.('x-bdmtiles-client') || '') ? 'mobile' : 'web');
+
   await logActivity({
     user,
     action,
@@ -150,8 +211,7 @@ export const logAuthEvent = async ({ action, user, req, description, metadata })
     recordTitle: user.name || user.userName || user.email || '',
     recordModel: 'User',
     description: description || `${action === 'login' ? 'Signed in' : 'Signed out'}`,
-    metadata: metadata || null,
-    // logActivity takes `branch`; passing it explicitly avoids depending on req.branchId.
+    metadata: { ...(metadata || {}), device },
     branch: branch?._id || branch || undefined,
     req,
   });

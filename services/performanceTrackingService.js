@@ -1,7 +1,7 @@
 import mongoose from 'mongoose';
 import Lead from '../models/Lead.js';
 import SalesOrder from '../models/SalesOrder.js';
-import Collection from '../models/Collection.js';
+import Payment from '../models/Payment.js';
 import User from '../models/User.js';
 import Dealer from '../models/Dealer.js';
 
@@ -69,15 +69,20 @@ export const getExecutivePerformance = async ({ branchId, executiveId, startDate
     },
   ]);
 
-  // Collection metrics
-  const collectionMatchStage = { branch: branchId, collectedBy: objectId(executiveId) };
+  // Collection metrics (using Payment model with isFieldCollection = true)
+  const collectionMatchStage = { 
+    branch: branchId, 
+    collectedBy: objectId(executiveId),
+    isFieldCollection: true,
+    paymentType: 'dealer_receipt'
+  };
   if (startDate || endDate) {
-    collectionMatchStage.collectionDate = {};
-    if (startDate) collectionMatchStage.collectionDate.$gte = new Date(startDate);
-    if (endDate) collectionMatchStage.collectionDate.$lte = new Date(endDate);
+    collectionMatchStage.paymentDate = {};
+    if (startDate) collectionMatchStage.paymentDate.$gte = new Date(startDate);
+    if (endDate) collectionMatchStage.paymentDate.$lte = new Date(endDate);
   }
 
-  const [collectionStats] = await Collection.aggregate([
+  const [collectionStats] = await Payment.aggregate([
     { $match: collectionMatchStage },
     {
       $group: {
