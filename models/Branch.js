@@ -33,6 +33,15 @@ const branchSchema = new mongoose.Schema(
     pinCode: { type: String, trim: true, default: '' },
     phone: { type: String, trim: true, default: '' },
     email: { type: String, trim: true, lowercase: true, default: '' },
+    // Google Review link for incentive tracking
+    googleReviewLink: { type: String, trim: true, default: '' },
+    // Google Review Incentive Settings
+    googleReviewIncentive: {
+      enabled: { type: Boolean, default: false },
+      amount: { type: Number, default: 0 }, // Incentive amount per review
+      currency: { type: String, default: 'INR' },
+      description: { type: String, trim: true, default: 'Incentive for collecting Google reviews' },
+    },
     // Companies (legal entities / GST registrations) that operate from this branch.
     // Many-to-many: one company can trade from several branches, and a branch can
     // be shared by more than one registered company.

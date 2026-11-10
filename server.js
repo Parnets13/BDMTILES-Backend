@@ -118,6 +118,19 @@ app.use(express.urlencoded({ extended: true }));
 app.use(cookieParser());
 app.use(helmet({ crossOriginResourcePolicy: { policy: 'cross-origin' } }));
 
+// Root route welcome message
+app.get('/', (req, res) => {
+  res.json({
+    success: true,
+    message: 'BDMTILES API Server',
+    version: '1.0.0',
+    endpoints: {
+      health: '/api/v1/health',
+      api: '/api/v1',
+    },
+  });
+});
+
 // Liveness plus database readiness. Returning 503 prevents callers from
 // treating an HTTP listener with an unavailable database as healthy.
 app.get('/api/v1/health', (req, res) => {

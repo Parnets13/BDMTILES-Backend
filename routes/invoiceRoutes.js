@@ -307,24 +307,50 @@ router.post('/generate-from-so/:soId', requirePermission('invoice'), async (req,
       }
     }
 
-    if (!so.dealer) {
-      return res.status(422).json({ success: false, message: 'A dealer with a complete tax profile is required for a tax invoice.' });
+    // Allow walk-in/retail customers without dealers for simplified invoicing
+    const isWalkInCustomer = !so.dealer && (so.orderType === 'retail' || so.customerName);
+    
+    if (!so.dealer && !isWalkInCustomer) {
+      return res.status(422).json({ success: false, message: 'A dealer or customer information is required for invoice generation.' });
     }
     const sellerGstin = String(req.branch.gstin || '').trim().toUpperCase();
     const sellerState = String(req.branch.state || '').trim();
     const sellerStateCode = String(req.branch.stateCode || '').trim();
-    const buyerGstin = String(so.dealer.gstin || '').trim().toUpperCase();
-    const buyerState = String(so.dealer.state || '').trim();
-    const buyerName = String(so.dealerName || so.dealer.businessName || so.customerName || '').trim();
+    
+    // Validate seller/branch GSTIN
     if (!sellerState || !/^\d{2}$/.test(sellerStateCode) || !isKnownGstStateCode(sellerStateCode)
       || !gstStateMatchesCode(sellerStateCode, sellerState) || !validGstin(sellerGstin)
       || sellerGstin.slice(0, 2) !== sellerStateCode) {
       return res.status(422).json({ success: false, message: 'The active branch requires a valid GSTIN, state, and matching two-digit state code.' });
     }
-    const buyerStateCode = buyerGstin.slice(0, 2);
-    if (!buyerName || !buyerState || !validGstin(buyerGstin)
-      || !isKnownGstStateCode(buyerStateCode) || !gstStateMatchesCode(buyerStateCode, buyerState)) {
-      return res.status(422).json({ success: false, message: 'The dealer requires a name, valid GSTIN, and matching canonical GST state.' });
+    
+    // For walk-in customers, allow simplified invoicing without GSTIN validation
+    let buyerGstin = '';
+    let buyerState = '';
+    let buyerStateCode = '';
+    let buyerName = '';
+    
+    if (isWalkInCustomer) {
+      // Walk-in customer: use customer name and treat as intra-state by default
+      buyerName = String(so.customerName || so.dealerName || '').trim();
+      buyerState = sellerState; // Same state as branch for simplified GST
+      buyerStateCode = sellerStateCode;
+      buyerGstin = ''; // No GSTIN for walk-in customers
+      
+      if (!buyerName) {
+        return res.status(422).json({ success: false, message: 'Customer name is required for walk-in customer invoice.' });
+      }
+    } else {
+      // Regular dealer: validate GSTIN
+      buyerGstin = String(so.dealer.gstin || '').trim().toUpperCase();
+      buyerState = String(so.dealer.state || '').trim();
+      buyerName = String(so.dealerName || so.dealer.businessName || so.customerName || '').trim();
+      buyerStateCode = buyerGstin.slice(0, 2);
+      
+      if (!buyerName || !buyerState || !validGstin(buyerGstin)
+        || !isKnownGstStateCode(buyerStateCode) || !gstStateMatchesCode(buyerStateCode, buyerState)) {
+        return res.status(422).json({ success: false, message: 'The dealer requires a name, valid GSTIN, and matching canonical GST state.' });
+      }
     }
 
     const invoiceNumber = await generateBranchNumber(req.branchId, 'invoice', new Date());
@@ -480,21 +506,21 @@ router.post('/generate-from-so/:soId', requirePermission('invoice'), async (req,
       termsAndConditions: branchSettings?.invoiceTerms || '',
 
       // Buyer
-      buyerType: so.orderType || 'dealer',
-      dealer: so.dealer?._id,
+      buyerType: so.orderType || (isWalkInCustomer ? 'retail' : 'dealer'),
+      dealer: isWalkInCustomer ? null : (so.dealer?._id || null),
       buyerName,
-      buyerCode: so.dealerCode || '',
-      buyerGstin,
-      buyerPan: so.dealer?.pan || '',
-      buyerAddress: so.dealer?.address || '',
-      buyerCity: so.dealer?.city || '',
+      buyerCode: isWalkInCustomer ? '' : (so.dealerCode || ''),
+      buyerGstin: buyerGstin || '',
+      buyerPan: isWalkInCustomer ? '' : (so.dealer?.pan || ''),
+      buyerAddress: isWalkInCustomer ? (so.deliveryAddress || '') : (so.dealer?.address || ''),
+      buyerCity: isWalkInCustomer ? '' : (so.dealer?.city || ''),
       buyerState,
       buyerStateCode,
-      buyerPhone: so.dealer?.mobile || so.customerPhone || '',
+      buyerPhone: isWalkInCustomer ? (so.customerPhone || '') : (so.dealer?.mobile || so.customerPhone || ''),
       deliveryAddress: so.deliveryAddress || '',
       internalNotes: billedFromSorting
-        ? `Raised from ${sortingPickLists.map(pickList => pickList.pickListNumber).join(', ')} before dispatch (sorted quantities).`
-        : '',
+        ? `Raised from ${sortingPickLists.map(pickList => pickList.pickListNumber).join(', ')} before dispatch (sorted quantities).${isWalkInCustomer ? ' Walk-in customer invoice.' : ''}`
+        : isWalkInCustomer ? 'Walk-in customer invoice.' : '',
 
       // Items
       items,
