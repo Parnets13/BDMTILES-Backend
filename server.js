@@ -74,6 +74,7 @@ import companyRoutes from './routes/companyRoutes.js';
 import salesExecutiveRoutes from './routes/salesExecutiveRoutes.js';
 import dealerOrderRequestRoutes from './routes/dealerOrderRequestRoutes.js';
 import attendanceRoutes from './routes/attendanceRoutes.js';
+import performanceRoutes from './routes/performanceRoutes.js';
 import { startReservationExpiryScheduler } from './services/reservationExpiryScheduler.js';
 import { startQuotationHoldExpiryScheduler } from './services/quotationHoldExpiryScheduler.js';
 import { initSocket, getSocket } from './services/socketService.js';
@@ -226,6 +227,7 @@ app.use('/api/v1/targets', targetRoutes); // SE target authoring (facade over ta
 app.use('/api/v1/support-chat', supportChatRoutes); // admin view of the dealer<->executive thread
 app.use('/api/v1/sales-executive', salesExecutiveRoutes);
 app.use('/api/v1/attendance', attendanceRoutes);
+app.use('/api/v1/performance', performanceRoutes);
 
 // Static uploads (supplier financial evidence is never public)
 app.use('/uploads/supplier-credit-notes', (_req, res) => res.status(404).json({ success: false, message: 'Not found.' }));
