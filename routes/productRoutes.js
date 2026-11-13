@@ -15,6 +15,10 @@ import { uploadProductImages, uploadBulkImport } from '../middleware/upload.js';
 import { normalizeProductUomConfig } from '../services/stockUomService.js';
 import { normalizeAndValidateAttributes } from '../services/attributeService.js';
 import { descendantIds } from '../services/categoryTreeService.js';
+import { pdfToRows } from '../services/productPdfParser.js';
+import { isBdmSheet, convertBdmRows } from '../services/productSheetConverter.js';
+import { parseImportFile, importProductRows, IMPORT_FIELDS } from '../services/productImportService.js';
+import { uploadProductImportFile } from '../middleware/upload.js';
 import { resolvePricing } from '../services/pricingResolver.js';
 import { resolveDealerBranch } from '../services/dealerAssignmentService.js';
 import {
@@ -883,6 +887,57 @@ router.patch('/bulk-min-stock', canUpdateProduct, async (req, res) => {
   }
 });
 
+// ── Two-step import (Excel / CSV / PDF) ───────────────────────────────────────
+// Step 1  POST /api/v1/products/import/parse   multipart field "file"
+//         -> { rows, matchedFields, ignoredHeaders, fields, warning }. Nothing is saved.
+// Step 2  POST /api/v1/products/import/save    JSON { rows, defaultCategory, createBrands }
+//         -> { total, imported, errors: [{ row, field, message }], importedItems }
+// HTTP 200 is returned even when every row fails; the client reads `imported` and `errors`.
+router.post('/import/parse', canCreateProduct, (req, res) => {
+  uploadProductImportFile(req, res, async (multerErr) => {
+    const file = req.file;
+    try {
+      if (multerErr) {
+        const msg = multerErr.code === 'LIMIT_FILE_SIZE' ? 'File is larger than 20 MB.' : multerErr.message;
+        return res.status(400).json({ success: false, message: msg });
+      }
+      if (!file) return res.status(400).json({ success: false, message: 'No file uploaded (field: "file").' });
+      const ext = path.extname(file.originalname).toLowerCase();
+      const parsed = await parseImportFile(file.path, ext);
+      return res.json({
+        success: true,
+        message: `${parsed.rows.length} row(s) read from ${file.originalname}.`,
+        data: { ...parsed, fields: IMPORT_FIELDS, fileName: file.originalname },
+      });
+    } catch (err) {
+      if (!err.status) console.error('Product import parse error:', err);
+      return res.status(err.status || 500).json({ success: false, message: err.message });
+    } finally {
+      // The temp file is only needed for parsing — always remove it.
+      if (file?.path) import('fs').then((fs) => fs.promises.unlink(file.path)).catch(() => {});
+    }
+  });
+});
+
+router.post('/import/save', canCreateProduct, async (req, res) => {
+  try {
+    const { rows, defaultCategory, createBrands = true } = req.body || {};
+    const result = await importProductRows(rows, {
+      userId: req.user._id,
+      defaultCategory: defaultCategory || undefined,
+      createBrands: createBrands !== false,
+    });
+    return res.json({
+      success: true,
+      message: `Import complete: ${result.imported} of ${result.total} product(s) imported.`,
+      data: result,
+    });
+  } catch (err) {
+    if (!err.status) console.error('Product import save error:', err);
+    return res.status(err.status || 500).json({ success: false, message: err.message });
+  }
+});
+
 // POST /api/v1/products/bulk-import — import products from a CSV file + optional image files
 //
 // Multipart form fields:
@@ -920,8 +975,19 @@ router.post('/bulk-import', canCreateProduct, (req, res) => {
     let allRows = [];
     const ext = path.extname(csvFile.originalname).toLowerCase();
     const isExcel = ext === '.xlsx' || ext === '.xls';
+    const isPdf = ext === '.pdf';
+    // dryRun=true parses and validates only; nothing is written. Powers the preview step.
+    const dryRun = req.query.dryRun === 'true' || req.query.dryRun === '1';
+    const removeUpload = () => import('fs').then(fs => fs.promises.unlink(csvFile.path)).catch(() => {});
 
-    if (isExcel) {
+    if (isPdf) {
+      try {
+        allRows = await pdfToRows(csvFile.path);
+      } catch (e) {
+        await removeUpload();
+        return res.status(400).json({ success: false, message: `Could not read PDF: ${e.message}` });
+      }
+    } else if (isExcel) {
       // Use exceljs to read the first worksheet into a 2-D array of strings.
       try {
         const ExcelJS = (await import('exceljs')).default;
@@ -1006,6 +1072,7 @@ router.post('/bulk-import', canCreateProduct, (req, res) => {
     }
 
     if (allRows.length < 2) {
+      await removeUpload();
       return res.status(400).json({ success: false, message: 'File has no data rows. Make sure the header row is present.' });
     }
 
@@ -1013,11 +1080,17 @@ router.post('/bulk-import', canCreateProduct, (req, res) => {
     // The header row is the first row that contains "Item_Name" or "Category".
     // This handles Excel files where row 1 has a title/junk and the real header
     // is on row 2 (or later).
+    // "BDM code" price-list sheets (PRODUCT NAME, BDMCODE, SIZE, ... MRP/BOX) are converted
+    // into the canonical columns first.
+    const bdmHeaderIdx = allRows.findIndex(r => isBdmSheet(r));
+    if (bdmHeaderIdx >= 0) allRows = convertBdmRows(allRows, bdmHeaderIdx);
+
     const HEADER_MARKERS = ['Item_Name', 'Category', 'item_name', 'category', 'ITEM_NAME', 'CATEGORY'];
     let headerRowIdx = allRows.findIndex(row =>
       row.some(cell => HEADER_MARKERS.includes(String(cell || '').trim()))
     );
     if (headerRowIdx < 0) {
+      await removeUpload();
       return res.status(400).json({ success: false, message: 'Could not find the header row. Make sure "Item_Name" or "Category" is in the header.' });
     }
 
@@ -1046,9 +1119,17 @@ router.post('/bulk-import', canCreateProduct, (req, res) => {
     const categoryMap = new Map(allCategories.map(c => [c.name.toLowerCase(), c._id]));
     const subcategoryMap = categoryMap; // same map — subcategory is just a deeper node
 
+    // Sheets without a Category column (e.g. BDM code lists) use the category picked in the UI.
+    const fallbackCategory = mongoose.isValidObjectId(req.query.defaultCategory)
+      ? allCategories.find(c => String(c._id) === String(req.query.defaultCategory))
+      : null;
+    // Unknown brands are created on real imports (never on a dry run) when requested.
+    const createBrands = req.query.createBrands === 'true' || req.query.createBrands === '1';
+
     // ── Process rows ───────────────────────────────────────────────────────
     const created = [];
     const errors = [];
+    const preview = [];
     const RecycleBin = (await import('../models/RecycleBin.js')).default;
 
     for (let i = 0; i < dataRows.length; i++) {
@@ -1058,7 +1139,7 @@ router.post('/bulk-import', canCreateProduct, (req, res) => {
 
       try {
         // ── Required: Category ──────────────────────────────────────────
-        const categoryName = col(row, 'Category');
+        const categoryName = col(row, 'Category') || fallbackCategory?.name || '';
         if (!categoryName) {
           errors.push({ row: rowNum, reason: 'Category is required.' });
           continue;
@@ -1071,7 +1152,16 @@ router.post('/bulk-import', canCreateProduct, (req, res) => {
 
         // ── Optional lookups ────────────────────────────────────────────
         const brandName = col(row, 'Brand');
-        const brandId = brandName ? (brandMap.get(brandName.toLowerCase()) || null) : null;
+        let brandId = brandName ? (brandMap.get(brandName.toLowerCase()) || null) : null;
+        if (brandName && !brandId && createBrands) {
+          if (dryRun) {
+            brandId = 'new'; // placeholder so validation proceeds; nothing is written
+          } else {
+            const newBrand = await Brand.create({ name: brandName, createdBy: req.user._id });
+            brandMap.set(brandName.toLowerCase(), newBrand._id);
+            brandId = newBrand._id;
+          }
+        }
         if (brandName && !brandId) {
           errors.push({ row: rowNum, reason: `Brand "${brandName}" not found.` });
           continue;
@@ -1152,6 +1242,31 @@ router.post('/bulk-import', canCreateProduct, (req, res) => {
 
         Object.assign(productData, normalizeProductUomConfig(productData, productData.unit));
 
+        if (dryRun) {
+          // Validate against the schema without saving or consuming a product code.
+          await new Product({ ...productData, brand: productData.brand === 'new' ? undefined : productData.brand }).validate();
+          if (productData.productCode && await Product.exists({ productCode: productData.productCode })) {
+            throw new Error(`Product code "${productData.productCode}" already exists.`);
+          }
+          preview.push({
+            row: rowNum,
+            itemName: productData.itemName,
+            productCode: productData.productCode || '',
+            category: categoryName,
+            subcategory: subcategoryName,
+            brand: brandName,
+            tileSize: productData.tileSize,
+            finish: productData.finish,
+            colour: productData.colour,
+            unit: productData.unit,
+            gst: productData.gst,
+            mrp: productData.mrp,
+            retailRate: productData.retailRate,
+            status: productData.status,
+          });
+          continue;
+        }
+
         // Validate and normalize flexible attributes (skip if category has none)
         try {
           const { attributes } = await normalizeAndValidateAttributes(productData.category, {}, { partial: true });
@@ -1186,7 +1301,19 @@ router.post('/bulk-import', canCreateProduct, (req, res) => {
     }
 
     // Clean up the uploaded CSV file (it was only needed to parse)
-    try { await import('fs').then(fs => fs.promises.unlink(csvFile.path)); } catch { /* ignore */ }
+    await removeUpload();
+
+    if (dryRun) {
+      return res.json({
+        success: true,
+        dryRun: true,
+        message: `${preview.length} valid, ${errors.length} with errors.`,
+        valid: preview.length,
+        invalid: errors.length,
+        rows: preview,
+        errors,
+      });
+    }
 
     return res.json({
       success: true,

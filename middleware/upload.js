@@ -83,6 +83,25 @@ export const uploadBulkImport = multer({
   { name: 'images', maxCount: 200 },
 ]);
 
+// Product import (parse step): one Excel/CSV/PDF, kept in a private temp folder and deleted
+// right after parsing. Never statically served.
+export const productImportDirectory = path.join(privateUploadRoot, 'product-imports');
+fs.mkdirSync(productImportDirectory, { recursive: true });
+
+const IMPORT_EXTENSIONS = new Set(['.xlsx', '.csv', '.pdf']);
+const importFileFilter = (_req, file, cb) => {
+  const ext = path.extname(file.originalname).toLowerCase();
+  if (IMPORT_EXTENSIONS.has(ext)) return cb(null, true);
+  if (ext === '.xls') return cb(new Error('Old .xls files are not supported. In Excel use File > Save As > .xlsx and upload again.'), false);
+  return cb(new Error(`Unsupported file type "${ext || 'unknown'}". Upload .xlsx, .csv or .pdf.`), false);
+};
+
+export const uploadProductImportFile = multer({
+  storage: storageFor(productImportDirectory),
+  fileFilter: importFileFilter,
+  limits: { fileSize: 20 * 1024 * 1024, files: 1 },
+}).single('file');
+
 // Brand logos are uploaded through the category-setup permission boundary.
 export const uploadBrandImage = multer({
   storage: storageFor(brandUploadDirectory),
