@@ -468,7 +468,12 @@ router.get('/:id', requireAnyPermission('lead.view', 'lead.app'), asyncRoute(asy
     { path: 'assignmentHistory.assignedTo', select: 'name' },
     { path: 'assignmentHistory.assignedBy', select: 'name' },
     { path: 'incentiveEarning' },
+    { path: 'convertedToDealer', select: 'businessName dealerCode dealerType' },
   ]);
+  // Populate dealerType on the converted dealer so the quotation screen has the pricing tier.
+  if (lead.convertedToDealer && typeof lead.convertedToDealer === 'object') {
+    await lead.populate({ path: 'convertedToDealer.dealerType', select: 'name pricingTier' });
+  }
   const [visits, activities] = await Promise.all([
     LeadVisit.find({ branch: req.branchScope, lead: lead._id }).sort({ scheduledAt: -1 }).populate('assignedTo', 'name phone').lean(),
     LeadActivity.find({ branch: req.branchScope, lead: lead._id }).sort({ createdAt: -1 }).populate('actor', 'name role').lean(),
