@@ -5,6 +5,9 @@ const warehouseSchema = new mongoose.Schema(
     warehouseCode:  { type: String, trim: true },
     name:           { type: String, required: true, trim: true },
     branch:         { type: mongoose.Schema.Types.ObjectId, ref: 'Branch', index: true },
+    // Companies whose stock/operations this warehouse serves. Many-to-many:
+    // a warehouse may be shared across companies trading from the same branch.
+    companies:      [{ type: mongoose.Schema.Types.ObjectId, ref: 'Company' }],
     type:           { type: String, enum: ['main', 'branch', 'transit', 'godown'], default: 'main' },
     address:        { type: String, trim: true, default: '' },
     city:           { type: String, trim: true, default: '' },

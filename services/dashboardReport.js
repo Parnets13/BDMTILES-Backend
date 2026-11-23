@@ -701,9 +701,20 @@ export const getDashboardReport = async (req, res) => {
     return res.status(403).json({ success: false, message: 'All-branch dashboard access is limited to owners and super administrators.' });
   }
 
-  const branchIds = requestedScope === 'all'
-    ? (req.user.assignedBranches || []).map((branch) => branch?._id || branch).filter(Boolean)
+  // When a company filter is active, req.companyBranchIds holds the intersection
+  // of the selected companies' branches and the user's assigned branches (resolved
+  // by requireBranch). Restrict the all-branches scope to that intersection so the
+  // company selector actually narrows the dashboard figures.
+  const allUserBranchIds = (req.user.assignedBranches || [])
+    .map((branch) => branch?._id || branch)
+    .filter(Boolean);
+  const effectiveBranchIds = requestedScope === 'all'
+    ? (req.companyBranchIds
+        ? allUserBranchIds.filter((id) => req.companyBranchIds.includes(String(id)))
+        : allUserBranchIds)
     : [req.branchId || req.branchScope];
+
+  const branchIds = effectiveBranchIds;
   if (!branchIds.length) {
     return res.status(428).json({ success: false, code: 'BRANCH_REQUIRED', message: 'No active branches are available for this dashboard scope.' });
   }
@@ -760,6 +771,9 @@ export const getDashboardReport = async (req, res) => {
     branch: req.branch ? { _id: req.branch._id, branchCode: req.branch.branchCode, name: req.branch.name } : null,
     scope: requestedScope,
     branchCount: branchIds.length,
+    // Echo active company ids so the frontend subtitle can name which companies
+    // are in scope without keeping its own state.
+    companyIds: req.companyIds?.length ? req.companyIds : [],
     timezone: DASHBOARD_TIMEZONE,
     generatedAt: new Date().toISOString(),
     warnings,

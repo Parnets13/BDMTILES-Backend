@@ -364,6 +364,13 @@ export const ROLE_DEFAULT_PERMISSIONS = {
     'dispatch.management', 'dispatch.verify',
     'stock.view',
   ],
+  // Store receptionist — registers walk-in enquiries, assigns SEs, manages the full lead lifecycle.
+  receptionist: [
+    'dashboard.view', 'notification.inbox',
+    'lead.view', 'lead.create', 'lead.update', 'lead.assign',
+    'lead.followup', 'lead.delete', 'followup.management',
+    'complaint.management',
+  ],
   dealer: [
     'notification.inbox', 'dealer.order.requests', 'support.chat',
   ],
@@ -387,6 +394,7 @@ export const ROLE_INFO = {
   delivery_executive: { name: 'Delivery Executive', description: 'Delivery assignments and tracking', color: '#36cfc9', rank: 30 },
   picking_staff: { name: 'Picking Staff', description: 'Warehouse picking and sorting, stock view', color: '#9254de', rank: 20 },
   sorting_staff: { name: 'Sorting / Loading Staff', description: 'Sorting, packing, and vehicle loading / dispatch verification', color: '#597ef7', rank: 20 },
+  receptionist: { name: 'Receptionist', description: 'Register walk-in leads, assign Sales Executives, manage lead lifecycle', color: '#06b6d4', rank: 25 },
   dealer: { name: 'Dealer (App)', description: 'Dealer portal — orders and support', color: '#73d13d', rank: 10 },
 };
 

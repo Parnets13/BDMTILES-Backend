@@ -112,6 +112,7 @@ router.post('/', async (req, res) => {
       // Taken as entered — the Company master does not validate GST format.
       gstin: req.body.gstin,
       pan: req.body.pan || '',
+      stateCode: req.body.stateCode || '',
       state: req.body.state || '',
       address: req.body.address || '',
       city: req.body.city || '',
@@ -144,7 +145,7 @@ router.put('/:id', async (req, res) => {
 
     if (req.body.gstin !== undefined) company.gstin = req.body.gstin;
     // Field-by-field so a partial payload never blanks an untouched value.
-    ['legalName', 'tradeName', 'pan', 'state', 'address', 'city', 'pinCode', 'phone', 'email', 'status', 'isDefault']
+    ['legalName', 'tradeName', 'pan', 'stateCode', 'state', 'address', 'city', 'pinCode', 'phone', 'email', 'status', 'isDefault']
       .forEach((field) => {
         if (req.body[field] !== undefined) company[field] = req.body[field];
       });

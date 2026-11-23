@@ -146,7 +146,9 @@ warehouseRouter.get('/', async (req, res) => {
     if (region) filter.region = region;
     const [items, total] = await Promise.all([
       Warehouse.find(filter).sort({ name: 1 }).skip((p - 1) * l).limit(l)
-        .populate('region', 'name').populate('branch', 'branchCode name').lean(),
+        .populate('region', 'name').populate('branch', 'branchCode name')
+        .populate('companies', 'legalName tradeName gstin')
+        .lean(),
       Warehouse.countDocuments(filter),
     ]);
     res.json({ success: true, data: items, pagination: { currentPage: p, totalPages: Math.ceil(total / l), totalItems: total, itemsPerPage: l } });
@@ -178,7 +180,8 @@ warehouseRouter.put('/:id', async (req, res) => {
       { new: true, runValidators: true }
     )
       .populate('region', 'name')
-      .populate('branch', 'branchCode name');
+      .populate('branch', 'branchCode name')
+      .populate('companies', 'legalName tradeName gstin');
     if (!wh) return res.status(404).json({ success: false, message: 'Warehouse not found.' });
     res.json({ success: true, message: 'Warehouse updated.', data: wh });
   } catch (e) {
