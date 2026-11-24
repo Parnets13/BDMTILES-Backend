@@ -13,6 +13,7 @@ import TileRoom from '../../models/webContent/TileRoom.js';
 import TileTypeItem from '../../models/webContent/TileTypeItem.js';
 import TileSizeItem from '../../models/webContent/TileSizeItem.js';
 import VideoTestimonial from '../../models/webContent/VideoTestimonial.js';
+import { resolveServiceability } from '../../services/deliveryServiceability.js';
 
 const router = Router();
 
@@ -47,27 +48,45 @@ router.post('/pincode-request', async (req, res) => {  try {
     res.status(500).json({ success: false, message: error.message });
   }
 });
+/**
+ * GET /api/v1/shop/content/serviceability?pincode=560001&lat=12.97&lng=77.59
+ *
+ * Public. The radius-aware replacement for `/pincode/:pincode`. Accepts either a
+ * pincode, a coordinate pair, or both, and reports which rule decided the answer
+ * so the storefront can say "6.2 km away" only when a distance was measured.
+ */
+router.get('/serviceability', async (req, res) => {
+  try {
+    const pincode = String(req.query.pincode || '').trim();
+    if (pincode && !/^\d{6}$/.test(pincode)) {
+      return res.status(422).json({ success: false, message: 'Enter a valid 6-digit pincode.' });
+    }
+    const data = await resolveServiceability({
+      pincode,
+      latitude: req.query.lat,
+      longitude: req.query.lng,
+    });
+    return res.json({ success: true, data });
+  } catch (error) {
+    return res.status(500).json({ success: false, message: error.message });
+  }
+});
+
 // Public, no auth. Used by the storefront "Deliver To" checker.
+// Kept for existing callers; it now runs the same resolver as /serviceability, so
+// a client that also passes ?lat=&lng= gets the radius answer instead of the
+// whitelist one. The response keeps every field it had, plus `method`.
 router.get('/pincode/:pincode', async (req, res) => {
   try {
     const pincode = String(req.params.pincode || '').trim();
-    const entry = await DeliveryPincode.findOne({ pincode, status: 'active' }).lean();
-    if (!entry) {
-      return res.json({ success: true, data: { serviceable: false, pincode } });
-    }
-    res.json({
-      success: true,
-      data: {
-        serviceable: true,
-        pincode: entry.pincode,
-        area: entry.area || '',
-        city: entry.city || '',
-        deliveryDays: entry.deliveryDays ?? null,
-        codAvailable: entry.codAvailable !== false,
-      },
+    const data = await resolveServiceability({
+      pincode,
+      latitude: req.query.lat,
+      longitude: req.query.lng,
     });
+    return res.json({ success: true, data });
   } catch (error) {
-    res.status(500).json({ success: false, message: error.message });
+    return res.status(500).json({ success: false, message: error.message });
   }
 });
 

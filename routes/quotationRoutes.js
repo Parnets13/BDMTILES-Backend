@@ -37,6 +37,11 @@ import {
 import { generateBranchNumber } from '../utils/branchSequence.js';
 import { effectiveValidUntil, parseValidityDate, quotationValidity, withQuotationValidity } from '../utils/quotationValidity.js';
 import { resolveStockUom } from '../services/stockUomService.js';
+import {
+  canSeeQuotationCosts,
+  hideProductCosts,
+  stripQuotationCostsDeep,
+} from '../utils/quotationVisibility.js';
 
 const router = Router();
 router.use(protect);
@@ -46,6 +51,18 @@ router.use(requireBranch);
 router.use((req, res, next) => {
   res.set('Cache-Control', 'no-store');
   next();
+});
+/**
+ * Field-level visibility: a caller without `quotation.cost.view` never receives
+ * the tier base rate, the minimum selling rate, or the below-minimum flag on a
+ * quotation. Enforced on the way out rather than in each handler, so a route
+ * added later inherits the rule instead of having to remember it.
+ */
+router.use((req, res, next) => {
+  if (canSeeQuotationCosts(req.user)) return next();
+  const sendJson = res.json.bind(res);
+  res.json = (body) => sendJson(stripQuotationCostsDeep(body));
+  return next();
 });
 router.param('id', (req, res, next, id) => {
   if (!mongoose.isValidObjectId(id)) {
@@ -539,7 +556,7 @@ router.get('/product-browser', requireAnyPermission('sales.order.create', 'quota
         blockedQty: display(baseStock.blockedQty),
         damagedQty: display(baseStock.damagedQty),
       };
-      return {
+      const row = {
         ...product,
         stockAvailable: stock.availableQty,
         stock: {
@@ -567,6 +584,9 @@ router.get('/product-browser', requireAnyPermission('sales.order.create', 'quota
           rule: pricing.rule,
         },
       };
+      // Without `quotation.cost.view` the browser still lists the product and its
+      // offered rate, but not the tier base or the floor it is measured against.
+      return canSeeQuotationCosts(req.user) ? row : hideProductCosts(row);
     });
 
     const wantsFilterOptions = p === 1 && ['true', '1'].includes(String(includeFilterOptions).toLowerCase());

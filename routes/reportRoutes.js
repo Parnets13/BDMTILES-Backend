@@ -14,6 +14,7 @@ import Employee from '../models/Employee.js';
 import Attendance from '../models/Attendance.js';
 import Leave from '../models/Leave.js';
 import Branch from '../models/Branch.js';
+import Product from '../models/Product.js';
 import { protect, requirePermission, requireAnyPermission } from '../middleware/auth.js';
 import { requireBranch } from '../utils/branchScope.js';
 import { getDashboardReport } from '../services/dashboardReport.js';
@@ -92,6 +93,19 @@ router.get('/sales', requirePermission('reports.sales'), async (req, res) => {
     const { dateFrom, dateTo, groupBy = 'day', dealer, category } = req.query;
     const match = { branch: req.branchScope, status: { $nin: ['cancelled','draft'] }, ...dateFilter(dateFrom, dateTo, 'orderDate') };
     if (dealer) match.dealer = dealer;
+    // Category is a product attribute, so the filter narrows orders to those
+    // containing at least one product in that category. Resolving the product
+    // ids first keeps the aggregation free of a per-row lookup.
+    if (category) {
+      const productIds = await Product.find({ category }).distinct('_id');
+      if (!productIds.length) {
+        return res.json({ success: true, data: {
+          summary: { totalRevenue: 0, totalOrders: 0, avgOrderValue: 0, returnsValue: 0, returnsCount: 0 },
+          byPeriod: [], byDealer: [], topProducts: [],
+        }});
+      }
+      match['items.product'] = { $in: productIds };
+    }
 
     const groupFormats = { day: '%Y-%m-%d', month: '%Y-%m', year: '%Y' };
     const fmt = groupFormats[groupBy] || '%Y-%m-%d';
@@ -299,6 +313,11 @@ router.get('/aging', requirePermission('reports.sales'), async (req, res) => {
 router.get('/profit', requirePermission('reports.sales'), async (req, res) => {
   try {
     const { dateFrom, dateTo } = req.query;
+    // The bill list used to stop at 50 with no indication, so a month with more
+    // than 50 orders silently lost the rest. Now the caller can ask for more, and
+    // the response says whether anything was cut off.
+    const requested = Number.parseInt(req.query.limit, 10);
+    const billLimit = Math.min(2000, Math.max(1, Number.isFinite(requested) ? requested : 500));
     const match = { branch: req.branchScope, status: { $nin: ['cancelled','draft'] }, ...dateFilter(dateFrom, dateTo, 'orderDate') };
 
     // Bill-wise profit: revenue - (qty * purchase rate from stock)
@@ -333,10 +352,43 @@ router.get('/profit', requirePermission('reports.sales'), async (req, res) => {
           dealerName: { $first: { $ifNull: ['$dealerName', '$customerName'] } },
           revenue: { $sum: '$items.taxableAmount' },
           estimatedCost: { $sum: { $multiply: ['$items.quantity', { $ifNull: [{ $first: '$stockInfo.purchaseRate' }, 0] }] } },
+          // Lines with no purchase rate on stock. Their cost counts as zero, so a
+          // bill made only of them would read as pure profit. Reported rather than
+          // hidden, so the reader can tell a real margin from a missing cost.
+          costMissingLines: {
+            $sum: {
+              $cond: [{ $gt: [{ $ifNull: [{ $first: '$stockInfo.purchaseRate' }, 0] }, 0] }, 0, 1],
+            },
+          },
+          // Direct selling costs already recorded on the order. Transport is the
+          // freight charge, porter/handling is the loading charge, and installation
+          // is its own line — all four were being ignored, so every bill showed a
+          // margin before the cost of actually delivering it.
+          freight: { $first: { $ifNull: ['$freightCharges', 0] } },
+          loading: { $first: { $ifNull: ['$loadingCharges', 0] } },
+          installation: { $first: { $ifNull: ['$installationCharges', 0] } },
+          otherCharges: { $first: { $ifNull: ['$otherCharges', 0] } },
         },
       },
-      { $addFields: { grossProfit: { $subtract: ['$revenue', '$estimatedCost'] } } },
-      { $sort: { orderDate: -1 } }, { $limit: 50 },
+      {
+        $addFields: {
+          directCosts: { $add: ['$freight', '$loading', '$installation', '$otherCharges'] },
+          grossProfit: { $subtract: ['$revenue', '$estimatedCost'] },
+        },
+      },
+      {
+        $addFields: {
+          netProfit: { $subtract: ['$grossProfit', '$directCosts'] },
+          netMarginPercent: {
+            $cond: [
+              { $gt: ['$revenue', 0] },
+              { $round: [{ $multiply: [{ $divide: ['$netProfit', '$revenue'] }, 100] }, 2] },
+              0,
+            ],
+          },
+        },
+      },
+      { $sort: { orderDate: -1 } }, { $limit: billLimit },
     ]);
 
     // Category margin
@@ -355,7 +407,19 @@ router.get('/profit', requirePermission('reports.sales'), async (req, res) => {
       { $sort: { revenue: -1 } }, { $limit: 15 },
     ]);
 
-    res.json({ success: true, data: { billwiseProfit: salesData, categoryMargin } });
+    // Says plainly whether the list is the whole period or only its most recent
+    // bills, so nobody reads a partial profit figure as the month's total.
+    const totalBills = await SalesOrder.countDocuments(match);
+    res.json({
+      success: true,
+      data: {
+        billwiseProfit: salesData,
+        categoryMargin,
+        totalBills,
+        truncated: totalBills > salesData.length,
+        limitApplied: billLimit,
+      },
+    });
   } catch (e) { res.status(500).json({ success: false, message: e.message }); }
 });
 

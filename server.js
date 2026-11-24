@@ -69,6 +69,8 @@ import accessPolicyRoutes from './routes/accessPolicyRoutes.js';
 import incentiveRoutes from './routes/incentiveRoutes.js';
 import targetRoutes from './routes/targetRoutes.js';
 import supportChatRoutes from './routes/supportChatRoutes.js';
+import googleReviewRoutes from './routes/googleReviewRoutes.js';
+import partnerRoutes from './routes/partnerRoutes.js';
 import branchRoutes from './routes/branchRoutes.js';
 import companyRoutes from './routes/companyRoutes.js';
 import salesExecutiveRoutes from './routes/salesExecutiveRoutes.js';
@@ -225,6 +227,8 @@ app.use('/api/v1/access-policies', accessPolicyRoutes);
 app.use('/api/v1/incentives', incentiveRoutes);
 app.use('/api/v1/targets', targetRoutes); // SE target authoring (facade over target incentive rules)
 app.use('/api/v1/support-chat', supportChatRoutes); // admin view of the dealer<->executive thread
+app.use('/api/v1/google-reviews', googleReviewRoutes); // review collection + per-review incentive
+app.use('/api/v1/partners', partnerRoutes); // channel partner commission ledger
 app.use('/api/v1/sales-executive', salesExecutiveRoutes);
 app.use('/api/v1/attendance', attendanceRoutes);
 app.use('/api/v1/performance', performanceRoutes);

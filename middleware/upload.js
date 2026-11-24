@@ -14,6 +14,10 @@ const brandUploadDirectory = path.join(uploadRoot, 'brands');
 // Category images (the card shown on the website). Separate from brands so the two can be
 // told apart on disk and either can be cleared without touching the other.
 const categoryUploadDirectory = path.join(uploadRoot, 'categories');
+// Sample photos — the evidence attached to a supplier sample before its cost is
+// approved. Public like product images: these are pictures of tiles, and serving
+// them through a gated route would buy nothing.
+export const samplePhotoDirectory = path.join(uploadRoot, 'samples');
 export const legacySupplierCreditNoteDirectory = path.join(uploadRoot, 'supplier-credit-notes');
 export const supplierCreditNoteDirectory = path.join(privateUploadRoot, 'supplier-credit-notes');
 // Candidate resumes are personal/sensitive — private-uploads, never statically served.
@@ -26,6 +30,7 @@ fs.mkdirSync(webUploadDirectory, { recursive: true });
 fs.mkdirSync(webVideoDirectory, { recursive: true });
 fs.mkdirSync(brandUploadDirectory, { recursive: true });
 fs.mkdirSync(categoryUploadDirectory, { recursive: true });
+fs.mkdirSync(samplePhotoDirectory, { recursive: true });
 fs.mkdirSync(supplierCreditNoteDirectory, { recursive: true });
 fs.mkdirSync(candidateResumeDirectory, { recursive: true });
 fs.mkdirSync(hrGeneratedDocumentDirectory, { recursive: true });
@@ -123,6 +128,15 @@ export const uploadWebImages = multer({
   limits: { fileSize: 5 * 1024 * 1024 },
 }).array('images', 10);
 
+// Sample photos — attached to a sample as evidence of what was handed over, and
+// required for a supplier sample whose cost is going for approval. Capped at six
+// so one record cannot turn into an album.
+export const uploadSamplePhotos = multer({
+  storage: storageFor(samplePhotoDirectory),
+  fileFilter,
+  limits: { fileSize: 8 * 1024 * 1024 },
+}).array('photos', 6);
+
 // Web Management — video testimonials (MP4, MOV, WEBM, AVI). Max 100 MB per file.
 // We check BOTH mimetype and file extension because browsers/OS sometimes report
 // generic mimetypes (application/octet-stream) for video files.
@@ -153,13 +167,43 @@ const creditNoteFileFilter = (_req, file, cb) => {
   const allowed = ['application/pdf', 'image/jpeg', 'image/png', 'image/webp'];
   if (allowed.includes(file.mimetype)) cb(null, true);
   else cb(new Error('Supplier credit-note evidence must be PDF, JPG, PNG, or WEBP.'), false);
-};
-
-export const uploadSupplierCreditNote = multer({
+};export const uploadSupplierCreditNote = multer({
   storage: storageFor(supplierCreditNoteDirectory),
   fileFilter: creditNoteFileFilter,
   limits: { fileSize: 8 * 1024 * 1024 },
 }).single('document');
+
+/**
+ * Bank statements for reconciliation.
+ *
+ * Stored under private-uploads because a bank statement is a complete record of
+ * an account — account number, every counterparty, every balance. It is never
+ * statically served; the download route is permission-gated.
+ *
+ * CSV and XLSX can be parsed into entries server-side. PDF is accepted and
+ * stored, but not parsed: there is no PDF text-extraction dependency in this
+ * build, and a hand-rolled extractor across the layouts of different Indian
+ * banks would silently produce wrong money. The API says so in its response
+ * rather than returning a half-parsed statement.
+ */
+export const bankStatementDirectory = path.join(privateUploadRoot, 'bank-statements');
+fs.mkdirSync(bankStatementDirectory, { recursive: true });
+
+const bankStatementFileFilter = (_req, file, cb) => {
+  const allowed = [
+    'application/pdf', 'text/csv', 'application/csv', 'application/vnd.ms-excel',
+    'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+  ];
+  const ext = path.extname(file.originalname).toLowerCase();
+  if (allowed.includes(file.mimetype) || ['.pdf', '.csv', '.xlsx', '.xls'].includes(ext)) cb(null, true);
+  else cb(new Error('Bank statement must be PDF, CSV or XLSX.'), false);
+};
+
+export const uploadBankStatement = multer({
+  storage: storageFor(bankStatementDirectory),
+  fileFilter: bankStatementFileFilter,
+  limits: { fileSize: 15 * 1024 * 1024 }, // 15MB — a year of transactions fits comfortably
+}).single('file');
 
 const resumeFileFilter = (_req, file, cb) => {
   const allowed = ['application/pdf', 'application/msword', 'application/vnd.openxmlformats-officedocument.wordprocessingml.document', 'image/jpeg', 'image/png'];

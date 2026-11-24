@@ -310,6 +310,7 @@ export async function deriveOrderPricing(options = {}) {
       boxes: finiteNonNegative(source.boxes, `items[${index}].boxes`),
       pieces: finiteNonNegative(source.pieces, `items[${index}].pieces`),
       sqft: finiteNonNegative(source.sqft, `items[${index}].sqft`),
+      mrp: finiteNonNegative(product.mrp, `products[${index}].mrp`, 0),
       rate: resolution.pricingRate,
       discount: resolution.regularDiscountPerUnit,
       discountType: 'flat',

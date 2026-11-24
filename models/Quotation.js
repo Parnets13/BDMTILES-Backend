@@ -100,6 +100,10 @@ const quotationItemSchema = new mongoose.Schema({
   // bucket could not satisfy the requested quantity at this quotation version.
   outOfStock: { type: Boolean, default: false },
   stockAtQuotation: { type: Number, default: null },
+  // Maximum retail price per unit, captured with the line so the printed
+  // quotation can show MRP alongside the negotiated rate. Stored rather than
+  // joined because a later MRP revision must not rewrite an issued document.
+  mrp: { type: Number, default: 0, min: 0 },
   rate: { type: Number, required: true, min: 0 },
   discount: { type: Number, default: 0 },
   discountType: { type: String, enum: ['flat', 'percentage'], default: 'flat' },

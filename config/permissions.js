@@ -78,6 +78,7 @@ export const AVAILABLE_PERMISSIONS = {
     { id: "quotation.retail", name: "Create Retail Quotations" },
     { id: "quotation.distributor", name: "Create Distributor Quotations" },
     { id: "quotation.builder", name: "Create Builder/Architect Quotations" },
+    { id: "quotation.cost.view", name: "See Internal Cost and Minimum Selling Rates on Quotations" },
     { id: "dealer.discounts", name: "Dealer-Specific Discounts" },
     { id: "po.management", name: "Purchase Order Management" },
     { id: "po.approve", name: "Approve Purchase Orders" },
@@ -106,6 +107,9 @@ export const AVAILABLE_PERMISSIONS = {
     { id: "stock.audit.approve", name: "Approve / Reject Physical Audits" },
     { id: "stock.audit.reverse", name: "Reverse Physical Audits" },
     { id: "dispatch.return", name: "Dispatched Goods Recovery" },
+    { id: "sample.management", name: "Issue / Return Samples" },
+    { id: "sample.accounting.approve", name: "Approve Supplier Sample Cost" },
+    { id: "sample.accounting.recover", name: "Record Sample Recovery (Credit Note / Write-off)" },
     { id: "warehouse.verification", name: "Warehouse Complaint Verification" },
   ],
   // Capabilities for the BDM Tiles Picking & Sorting mobile app. Each maps to a
@@ -202,7 +206,17 @@ export const AVAILABLE_PERMISSIONS = {
     { id: "dealer.order_request.create", name: "Create Dealer Order Requests" },
     { id: "dealer.order_request.review", name: "Review Dealer Order Requests" },
     { id: "dealer.order_request.approve", name: "Approve / Reject Dealer Order Requests" },
+    { id: "google.review.collect", name: "Collect Google Reviews" },
+    { id: "google.review.manage", name: "Manage Google Review Incentives (Reverse / Mark Paid)" },
     { id: "support.chat", name: "Support Chat" },
+  ],
+  "Channel Partners": [
+    // A partner is an external person — architect, builder, contractor — who brings
+    // business and earns a commission. The portal permission is what makes them a
+    // login rather than merely a customer type.
+    { id: "partner.portal", name: "Partner Portal Access" },
+    { id: "partner.commission.view", name: "View Partner Commissions" },
+    { id: "partner.commission.manage", name: "Record / Approve / Pay Partner Commissions" },
   ],
   "Assets": [
     { id: "asset.management", name: "Asset Management (Master / Assignment / Maintenance)" },
@@ -233,11 +247,13 @@ export const ROLE_DEFAULT_PERMISSIONS = {
     'lead.respond', 'lead.followup', 'lead.convert', 'lead.delete',
     'quotation.management',
     'quotation.dealer', 'quotation.wholesaler', 'quotation.retail', 'quotation.distributor', 'quotation.builder',
+    'quotation.cost.view',
     'sales.order.dashboard', 'sales.order.create', 'sales.order.approve',
-    'sales.order.dealer', 'quotation.wholesaler', 'sales.order.retail', 'sales.order.distributor', 'sales.order.builder',
+    'sales.order.dealer', 'sales.order.wholesaler', 'sales.order.retail', 'sales.order.distributor', 'sales.order.builder',
     'po.management', 'po.approve', 'grn.entry', 'grn.approve', 'invoice', 'payment',
     'credit.note', 'debit.note', 'recycle.bin', 'dispatch.return',
-    'stock.view', 'stock.transfer', 'stock.adjustment',
+    'stock.view', 'sample.management', 'stock.transfer', 'stock.adjustment',
+    'sample.accounting.approve', 'sample.accounting.recover',
     'stock.adjustment.create', 'stock.adjustment.submit', 'stock.adjustment.approve', 'stock.adjustment.reverse',
     'stock.audit.create', 'stock.audit.count', 'stock.audit.submit', 'stock.audit.approve', 'stock.audit.reverse', 'dispatch.return',
     'picking.management', 'sorting.management',
@@ -255,18 +271,23 @@ export const ROLE_DEFAULT_PERMISSIONS = {
     'incentive.reconciliation', 'incentive.rules.view', 'incentive.rules.manage',
     'incentive.earnings.view', 'incentive.earnings.record', 'incentive.earnings.approve', 'incentive.earnings.pay',
     'asset.management',
+    'google.review.collect', 'google.review.manage',
+    'partner.portal', 'partner.commission.view', 'partner.commission.manage',
   ],
   sub_admin: [
     'dashboard.view', 'notification.inbox', 'webmanagement.manage', 'document.management', 'task.management', 'complaint.management', 'product.master', 'category.setup',
     'dealer.master', 'dealer.assignment.manage', 'supplier.master',
-    'quotation.management', 'dealer.discounts',
+    'quotation.management', 'dealer.discounts', 'quotation.cost.view',
     'dealer.order_request.review', 'dealer.order_request.approve',
     'sales.order.dashboard', 'sales.order.create', 'sales.order.approve',
     'po.management', 'po.approve', 'grn.entry', 'grn.approve', 'invoice', 'payment',
-    'stock.view', 'stock.transfer',
+    'stock.view', 'sample.management', 'stock.transfer',
+    'sample.accounting.approve', 'sample.accounting.recover',
     'dispatch.management', 'dispatch.verify', 'delivery.management', 'delivery.view',
     'finance.management', 'dealer.ledger', 'supplier.ledger',
     'reports.sales', 'reports.purchase', 'reports.inventory',
+    'google.review.collect', 'google.review.manage',
+    'partner.portal', 'partner.commission.view', 'partner.commission.manage',
   ],
   sales_manager: [
     'dashboard.view', 'notification.inbox', 'task.management', 'complaint.management', 'product.master', 'dealer.master', 'dealer.assignment.manage', 'dealer.type', 'dealer.category',
@@ -276,11 +297,17 @@ export const ROLE_DEFAULT_PERMISSIONS = {
     // it — that stays with admin/owner.
     'dealer.employee.targets.view',
     'quotation.dealer', 'quotation.wholesaler', 'quotation.retail', 'quotation.distributor', 'quotation.builder',
+    'quotation.cost.view',
     'sales.order.dashboard', 'sales.order.create', 'sales.order.approve',
     'sales.order.dealer', 'sales.order.wholesaler', 'sales.order.retail',
     'sales.order.distributor', 'sales.order.builder',
     'dealer.discounts', 'invoice', 'payment', 'credit.note', 'dispatch.return',
     'reports.sales', 'reports.profit',
+    'google.review.collect', 'google.review.manage',
+    'partner.commission.view', 'partner.commission.manage',
+    // A sales manager hands samples to dealers and architects; that is the point
+    // of the module. Approving the supplier cost stays with purchase/admin.
+    'sample.management',
     'sales.executive.app', 'dealer.order.requests',
     'dealer.order_request.review', 'dealer.order_request.approve',
     'dealer.scheme', 'scheme.entry', 'scheme.analysis', 'claim.submission',
@@ -289,14 +316,15 @@ export const ROLE_DEFAULT_PERMISSIONS = {
     'dashboard.view', 'notification.inbox', 'task.management', 'product.master', 'products.create', 'products.update',
     'category.setup', 'supplier.master', 'price.list',
     'po.management', 'po.approve', 'grn.entry', 'grn.approve', 'invoice', 'payment', 'debit.note',
-    'stock.view', 'stock.transfer', 'stock.adjustment',
+    'stock.view', 'sample.management', 'stock.transfer', 'stock.adjustment',
+    'sample.accounting.approve', 'sample.accounting.recover',
     'stock.adjustment.create', 'stock.adjustment.submit', 'stock.adjustment.approve', 'stock.adjustment.reverse',
     'stock.audit.create', 'stock.audit.count', 'stock.audit.submit', 'stock.audit.approve', 'stock.audit.reverse', 'dispatch.return',
     'reports.purchase', 'reports.inventory',
     'supplier.scheme', 'scheme.entry', 'scheme.analysis', 'claim.submission', 'incentive.reconciliation',
   ],
   warehouse_manager: [
-    'dashboard.view', 'notification.inbox', 'task.management', 'stock.view', 'stock.transfer', 'stock.adjustment', 'dispatch.return',
+    'dashboard.view', 'notification.inbox', 'task.management', 'stock.view', 'sample.management', 'stock.transfer', 'stock.adjustment', 'dispatch.return',
     'picking.management', 'sorting.management', 'warehouse.verification',
     'dispatch.management', 'dispatch.verify', 'delivery.management', 'delivery.view', 'delivery.assignment',
     'delivery.exception',
@@ -304,7 +332,7 @@ export const ROLE_DEFAULT_PERMISSIONS = {
     'reports.inventory',
   ],
   supervisor: [
-    'dashboard.view', 'notification.inbox', 'stock.view',
+    'dashboard.view', 'notification.inbox', 'stock.view', 'sample.management',
     'picking.management', 'sorting.management',
     'dispatch.management', 'dispatch.verify',
     'delivery.view', 'delivery.assignment', 'delivery.execute', 'delivery.verify',
@@ -338,7 +366,14 @@ export const ROLE_DEFAULT_PERMISSIONS = {
     'sales.order.dealer', 'sales.order.wholesaler', 'sales.order.retail', 'sales.order.distributor', 'sales.order.builder',
     'quotation.management',
     'quotation.dealer', 'quotation.wholesaler', 'quotation.retail', 'quotation.distributor', 'quotation.builder',
+    'quotation.cost.view',
     'sales.executive.app', 'se.attendance.view', 'se.route.plan', 'se.dealer.insights',
+    // An SE is the person who actually asks the customer for the review, so this
+    // is the one role that must have it. Marking an incentive paid stays with
+    // `google.review.manage`, which no executive holds.
+    'google.review.collect',
+    // Samples go out with the executive who is visiting the dealer or architect.
+    'sample.management',
     'se.collections.view', 'se.targets.view', 'dealer.order_request.create',
     // An SE creates requests for their dealers and should be able to act on them
     // too — approve, reject, and process into a quotation / sales order — instead
@@ -355,14 +390,14 @@ export const ROLE_DEFAULT_PERMISSIONS = {
   picking_staff: [
     'dashboard.view', 'notification.inbox',
     'picking.management', 'sorting.management',
-    'stock.view',
+    'stock.view', 'sample.management',
   ],
   // Sorting + loading staff — sorts, packs, and verifies vehicle loading/dispatch.
   sorting_staff: [
     'dashboard.view', 'notification.inbox',
     'sorting.management',
     'dispatch.management', 'dispatch.verify',
-    'stock.view',
+    'stock.view', 'sample.management',
   ],
   // Store receptionist — registers walk-in enquiries, assigns SEs, manages the full lead lifecycle.
   receptionist: [
@@ -373,6 +408,11 @@ export const ROLE_DEFAULT_PERMISSIONS = {
   ],
   dealer: [
     'notification.inbox', 'dealer.order.requests', 'support.chat',
+  ],
+  // A partner holds no operational permission at all — only their own ledger.
+  // `partner.commission.view` is filtered to `partner: <own id>` server-side.
+  partner: [
+    'partner.portal', 'partner.commission.view',
   ],
 };
 
@@ -396,6 +436,9 @@ export const ROLE_INFO = {
   sorting_staff: { name: 'Sorting / Loading Staff', description: 'Sorting, packing, and vehicle loading / dispatch verification', color: '#597ef7', rank: 20 },
   receptionist: { name: 'Receptionist', description: 'Register walk-in leads, assign Sales Executives, manage lead lifecycle', color: '#06b6d4', rank: 25 },
   dealer: { name: 'Dealer (App)', description: 'Dealer portal — orders and support', color: '#73d13d', rank: 10 },
+  // An external channel partner. Deliberately the lowest rank: they see their own
+  // commission ledger and nothing else.
+  partner: { name: 'Channel Partner', description: 'External partner — own commission ledger only', color: '#08979c', rank: 5 },
 };
 
 /**
@@ -502,6 +545,7 @@ export const SENSITIVE_PERMISSIONS = {
 
   // Money and pricing
   'finance.management': 'Full access to ledgers, payments and financial records.',
+  'quotation.cost.view': 'Can see the tier base rate and the minimum selling rate behind every quotation line.',
   'dealer.discounts': 'Can set dealer-specific prices and discounts.',
   'credit.note': 'Can issue credit notes, which reduce what a dealer owes.',
   'debit.note': 'Can issue debit notes.',

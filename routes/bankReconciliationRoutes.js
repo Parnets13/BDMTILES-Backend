@@ -1,9 +1,13 @@
 import mongoose from 'mongoose';
+import fs from 'fs';
+import path from 'path';
+import ExcelJS from 'exceljs';
 import { Router } from 'express';
 import BankReconciliation from '../models/BankReconciliation.js';
 import BankAccount from '../models/BankAccount.js';
 import Payment from '../models/Payment.js';
 import { protect, requirePermission } from '../middleware/auth.js';
+import { uploadBankStatement, bankStatementDirectory } from '../middleware/upload.js';
 import { requireBranch } from '../utils/branchScope.js';
 import { generateBranchNumber } from '../utils/branchSequence.js';
 
@@ -131,6 +135,174 @@ const validateManualMatchBody = (body = {}) => {
 const router = Router();
 router.use(protect);
 router.use(requireBranch);
+
+// ── Statement upload and parsing ────────────────────────────────────────────
+// Column aliases seen across Indian bank exports. Matching is case-insensitive
+// and ignores spacing, so "Withdrawal Amt." and "withdrawal_amount" both land.
+const HEADER_ALIASES = {
+  date: ['date', 'txndate', 'transactiondate', 'valuedate', 'postdate', 'bookingdate'],
+  description: ['description', 'narration', 'particulars', 'details', 'transactiondetails', 'remarks'],
+  reference: ['reference', 'refno', 'chequeno', 'chqno', 'chqrefno', 'utr', 'instrumentid', 'referenceno'],
+  debit: ['debit', 'withdrawal', 'withdrawalamt', 'withdrawals', 'dr', 'debitamount'],
+  credit: ['credit', 'deposit', 'depositamt', 'deposits', 'cr', 'creditamount'],
+  balance: ['balance', 'closingbalance', 'runningbalance', 'balanceamt'],
+};
+
+const normalizeHeader = (value) => String(value ?? '').toLowerCase().replace(/[^a-z]/g, '');
+
+const matchHeader = (value) => {
+  const key = normalizeHeader(value);
+  if (!key) return null;
+  return Object.keys(HEADER_ALIASES).find((field) => HEADER_ALIASES[field].includes(key)) || null;
+};
+
+/**
+ * Indian bank statements are day-first. A bare "03/04/2026" therefore means
+ * 3 April, not 4 March. When the first component cannot be a day the value is
+ * re-read month-first instead of being silently rejected.
+ */
+const parseStatementDate = (value) => {
+  if (value instanceof Date && !Number.isNaN(value.getTime())) return value;
+  const text = String(value ?? '').trim();
+  if (!text) return null;
+  const parts = text.match(/^(\d{1,2})[/\-.](\d{1,2})[/\-.](\d{2,4})$/);
+  if (parts) {
+    let [, first, second, year] = parts;
+    if (year.length === 2) year = `20${year}`;
+    const dayFirst = new Date(Date.UTC(Number(year), Number(second) - 1, Number(first)));
+    if (Number(first) <= 31 && Number(second) <= 12 && !Number.isNaN(dayFirst.getTime())) return dayFirst;
+    const monthFirst = new Date(Date.UTC(Number(year), Number(first) - 1, Number(second)));
+    if (!Number.isNaN(monthFirst.getTime())) return monthFirst;
+    return null;
+  }
+  const parsed = new Date(text);
+  return Number.isNaN(parsed.getTime()) ? null : parsed;
+};
+
+/** "1,23,456.78 Cr" / "(500.00)" / "₹ 2,000" all become numbers. */
+const parseStatementAmount = (value) => {
+  if (value === null || value === undefined || value === '') return 0;
+  if (typeof value === 'number') return Number.isFinite(value) ? Math.abs(value) : 0;
+  const text = String(value).trim();
+  if (!text) return 0;
+  const negative = /^\(.*\)$/.test(text) || /\bdr\b/i.test(text);
+  const digits = text.replace(/[^0-9.\-]/g, '');
+  if (!digits || digits === '-' || digits === '.') return 0;
+  const amount = Number(digits.replace(/-/g, ''));
+  if (!Number.isFinite(amount)) return 0;
+  return negative ? -Math.abs(amount) : Math.abs(amount);
+};
+
+const cellText = (value) => {
+  if (value === null || value === undefined) return '';
+  if (value instanceof Date) return value.toISOString().slice(0, 10);
+  if (typeof value === 'object') {
+    if (value.text) return String(value.text);
+    if (value.result !== undefined) return String(value.result);
+    if (Array.isArray(value.richText)) return value.richText.map((part) => part.text || '').join('');
+    return '';
+  }
+  return String(value).trim();
+};
+
+const rowsToEntries = (rows) => {
+  let headerIndex = -1;
+  let mapping = null;
+  for (let index = 0; index < Math.min(rows.length, 30); index += 1) {
+    const candidate = {};
+    rows[index].forEach((cell, column) => {
+      const field = matchHeader(cellText(cell));
+      if (field && candidate[field] === undefined) candidate[field] = column;
+    });
+    if (candidate.date !== undefined && (candidate.debit !== undefined || candidate.credit !== undefined)) {
+      headerIndex = index;
+      mapping = candidate;
+      break;
+    }
+  }
+  if (headerIndex === -1) return [];
+
+  const entries = [];
+  for (let index = headerIndex + 1; index < rows.length; index += 1) {
+    const row = rows[index];
+    const date = parseStatementDate(row[mapping.date]);
+    if (!date) continue;
+    const debit = mapping.debit !== undefined ? parseStatementAmount(row[mapping.debit]) : 0;
+    const credit = mapping.credit !== undefined ? parseStatementAmount(row[mapping.credit]) : 0;
+    const description = mapping.description !== undefined ? cellText(row[mapping.description]) : '';
+    const reference = mapping.reference !== undefined ? cellText(row[mapping.reference]) : '';
+    if (!debit && !credit && !description) continue;
+    entries.push({
+      date: date.toISOString().slice(0, 10),
+      description: description.slice(0, 300),
+      reference: reference.slice(0, 120),
+      debit: Math.abs(debit),
+      credit: Math.abs(credit),
+      balance: mapping.balance !== undefined ? parseStatementAmount(row[mapping.balance]) : 0,
+    });
+    if (entries.length >= 5000) break;
+  }
+  return entries;
+};
+
+// POST /api/v1/bank-reconciliation/statement — upload, store and parse
+router.post('/statement', requirePermission('reconciliation'), uploadBankStatement, async (req, res) => {
+  try {
+    if (!req.file) throw routeError(422, 'Attach a bank statement file.');
+    const relativePath = `/private/bank-statements/${req.file.filename}`;
+    const extension = path.extname(req.file.originalname).toLowerCase();
+
+    if (extension === '.pdf') {
+      return res.json({
+        success: true,
+        data: {
+          statementFile: relativePath,
+          fileName: req.file.originalname,
+          entries: [],
+          parsed: false,
+          message: 'PDF stored and attached. Entries cannot be read from a PDF automatically — add them manually or upload the CSV/XLSX export instead.',
+        },
+      });
+    }
+
+    const workbook = new ExcelJS.Workbook();
+    if (extension === '.csv') await workbook.csv.readFile(req.file.path);
+    else await workbook.xlsx.readFile(req.file.path);
+    const sheet = workbook.worksheets[0];
+    if (!sheet) throw routeError(422, 'That file has no worksheet.');
+
+    const rows = [];
+    sheet.eachRow((row) => rows.push(row.values.slice(1)));
+    const entries = rowsToEntries(rows);
+
+    return res.json({
+      success: true,
+      data: {
+        statementFile: relativePath,
+        fileName: req.file.originalname,
+        entries,
+        parsed: entries.length > 0,
+        message: entries.length
+          ? `${entries.length} entries read from the statement.`
+          : 'The file was stored, but no dated debit/credit rows were recognised. Check that the export has date, debit and credit columns.',
+      },
+    });
+  } catch (error) {
+    return sendRouteError(res, error);
+  }
+});
+
+// GET /api/v1/bank-reconciliation/statement/:file — permission-gated download
+router.get('/statement/:file', requirePermission('reconciliation'), async (req, res) => {
+  try {
+    const safeName = path.basename(req.params.file);
+    const filePath = path.join(bankStatementDirectory, safeName);
+    if (!fs.existsSync(filePath)) return res.status(404).json({ success: false, message: 'Statement file not found.' });
+    return res.download(filePath);
+  } catch (error) {
+    return sendRouteError(res, error);
+  }
+});
 
 // GET /api/v1/bank-reconciliation — list
 router.get('/', requirePermission('reconciliation'), async (req, res) => {

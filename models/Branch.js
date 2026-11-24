@@ -42,6 +42,18 @@ const branchSchema = new mongoose.Schema(
       currency: { type: String, default: 'INR' },
       description: { type: String, trim: true, default: 'Incentive for collecting Google reviews' },
     },
+    // ── Delivery coverage ──────────────────────────────────────────
+    // Where the branch physically is, and how far from it the branch will deliver.
+    // The storefront answers "do you deliver to me?" from these two numbers when
+    // the customer shares a location, and falls back to the pincode whitelist when
+    // they only type a pincode. Both are optional: a branch with no coordinates
+    // simply never matches on distance, so it keeps whatever pincode coverage it
+    // had instead of losing it.
+    location: {
+      latitude: { type: Number, min: -90, max: 90, default: null },
+      longitude: { type: Number, min: -180, max: 180, default: null },
+    },
+    deliveryRadiusKm: { type: Number, min: 0, max: 500, default: 0 },
     // Companies (legal entities / GST registrations) that operate from this branch.
     // Many-to-many: one company can trade from several branches, and a branch can
     // be shared by more than one registered company.

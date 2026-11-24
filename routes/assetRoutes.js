@@ -2,9 +2,13 @@ import { Router } from 'express';
 import Asset from '../models/Asset.js';
 import Employee from '../models/Employee.js';
 import { protect, requirePermission } from '../middleware/auth.js';
+import { requireBranch } from '../utils/branchScope.js';
 
 const router = Router();
 router.use(protect);
+// Assets belong to a branch. Reads still work in the all-branches view; writes
+// need one concrete branch, which is the same rule every other module follows.
+router.use(requireBranch);
 
 // ── Auto-increment helper ────────────────────────────────────────────────────
 async function nextAssetCode() {
@@ -73,7 +77,7 @@ router.get('/stats', requirePermission('asset.management'), async (req, res) => 
 // ── GET /api/v1/assets ───────────────────────────────────────────────────────
 router.get('/', requirePermission('asset.management'), async (req, res) => {
   try {
-    const { page = 1, limit = 25, search, status, category, assignedTo } = req.query;
+    const { page = 1, limit = 25, search, status, category, assignedTo, company } = req.query;
     const p = Math.max(1, parseInt(page));
     const l = Math.min(100, parseInt(limit) || 25);
 
@@ -85,6 +89,20 @@ router.get('/', requirePermission('asset.management'), async (req, res) => {
     if (status)     filter.status = status;
     if (category)   filter.category = category;
     if (assignedTo) filter.assignedTo = assignedTo;
+    if (company)    filter.company = company;
+
+    // Branch scoping. Assets registered before the branch field existed have no
+    // branch, so they stay visible from every branch rather than vanishing from
+    // all of them. Combining through $and leaves the search $or above intact.
+    if (!req.allBranches) {
+      filter.$and = [{
+        $or: [
+          { branch: req.branchScope },
+          { branch: null },
+          { branch: { $exists: false } },
+        ],
+      }];
+    }
 
     const [data, total] = await Promise.all([
       Asset.find(filter)
@@ -93,6 +111,8 @@ router.get('/', requirePermission('asset.management'), async (req, res) => {
         .skip((p - 1) * l)
         .limit(l)
         .populate('assignedTo', 'name empId designation')
+        .populate('company', 'legalName tradeName gstin')
+        .populate('branch', 'name branchCode')
         .lean(),
       Asset.countDocuments(filter),
     ]);
@@ -110,6 +130,8 @@ router.get('/:id', requirePermission('asset.management'), async (req, res) => {
   try {
     const asset = await Asset.findById(req.params.id)
       .populate('assignedTo', 'name empId designation mobile')
+      .populate('company', 'legalName tradeName gstin')
+      .populate('branch', 'name branchCode')
       .lean();
     if (!asset) return res.status(404).json({ success: false, message: 'Asset not found.' });
     res.json({ success: true, data: asset });
@@ -123,6 +145,10 @@ router.post('/', requirePermission('asset.management'), async (req, res) => {
     const asset = await Asset.create({
       ...req.body,
       assetCode,
+      // Default the owning branch to the branch the user is working in. An
+      // explicit branch in the body wins, so an admin can register an asset
+      // against a different branch without switching context first.
+      branch: req.body.branch || req.branchId,
       currentValue: req.body.currentValue ?? req.body.purchaseCost ?? 0,
       createdBy: req.user._id,
     });

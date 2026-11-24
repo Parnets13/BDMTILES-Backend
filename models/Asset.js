@@ -76,6 +76,14 @@ const assetSchema = new mongoose.Schema(
     location:         { type: String, trim: true, default: '' },   // e.g. "Warehouse A / Floor 2"
     department:       { type: String, trim: true, default: '' },
 
+    // ── Ownership scope ──────────────────────────────────────────
+    // Which legal entity owns the asset, and which branch it sits in. Both stay
+    // optional because assets registered before these fields existed carry
+    // neither; the list treats a missing branch as "visible everywhere" until
+    // that history is backfilled, so nothing disappears from an existing view.
+    company:          { type: mongoose.Schema.Types.ObjectId, ref: 'Company' },
+    branch:           { type: mongoose.Schema.Types.ObjectId, ref: 'Branch' },
+
     // ── Assignment ───────────────────────────────────────────────
     assignedTo:       { type: mongoose.Schema.Types.ObjectId, ref: 'Employee' },
     assignedToName:   { type: String, trim: true, default: '' },   // denormalized for speed
